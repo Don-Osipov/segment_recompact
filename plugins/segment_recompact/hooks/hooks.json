@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Setup": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"${CLAUDE_PLUGIN_ROOT}\" && cargo build --release && mkdir -p bin && cp target/release/recompact bin/recompact && chmod +x bin/recompact"
+          }
+        ]
+      }
+    ]
+  }
+}

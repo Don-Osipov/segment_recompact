@@ -1,0 +1,7 @@
+# Rust build artifacts (the helper is built on install, not committed)
+target/
+plugins/segment_recompact/target/
+plugins/segment_recompact/Cargo.lock
+
+# The built binary — produced by the Setup hook / first-run build
+plugins/segment_recompact/bin/recompact

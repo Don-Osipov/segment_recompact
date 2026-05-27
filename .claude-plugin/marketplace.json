@@ -1,0 +1,16 @@
+{
+  "name": "segment-recompact",
+  "owner": {
+    "name": "Stephen Roylance"
+  },
+  "metadata": {
+    "description": "Offline, segment-wise compaction of Claude Code session transcripts."
+  },
+  "plugins": [
+    {
+      "name": "segment-recompact",
+      "source": "./plugins/segment_recompact",
+      "description": "Offline, segment-wise, structure-preserving compaction of a Claude Code session .jsonl: keeps user turns verbatim, replaces each segment's agent work with a hand-written summary, and emits a shorter resume-compatible session."
+    }
+  ]
+}
