@@ -1,6 +1,6 @@
 ---
 name: recompact
-description: Offline, segment-wise compaction of a Claude Code session .jsonl. Segments by user turn, keeps user turns verbatim, and replaces each segment's agent turns + tool results with a hand-written summary, producing a shorter resume-compatible session. Use when asked to recompact / compress / shrink a session transcript, or to experiment with better compaction.
+description: Offline, segment-wise compaction of a Claude Code session .jsonl, plus recovery of anything a past compaction removed. Segments by user turn, keeps user turns verbatim, and replaces each segment's agent turns + tool results with summaries carrying provenance back to the untouched originals. Use when asked to recompact / compress / shrink a session transcript — AND when asked to recover, rehydrate, or look up content from an earlier or compacted session ("what did the research say", "restore that elided result", "[recompact: ...］ marker", "recompact summary"), or when the current transcript contains such markers and the verbatim original would help.
 user_invocable: true
 ---
 
@@ -280,6 +280,38 @@ record counts (from the `assemble` line).
 Have the user run `claude --resume <newId>` and continue. This is the empirical validation that the
 hand-built file is actually resume-compatible — only the user can drive the interactive resume. If
 anything looks wrong, roll back per `ROLLBACK.md` (the new file is additive; deleting it is enough).
+
+## Waking up inside a compacted session (read this if you see recompact markers)
+
+If the transcript you are in contains an orientation preamble ("This transcript was compacted
+by segment_recompact"), summaries ending in `[recompact summary <key> — rehydratable]`, or
+markers like `[recompact: elided ...; rehydrate <prefix>]`, you are in a compacted twin. Rules
+of thumb:
+
+- **Rehydrate before re-deriving.** If a summary or marker covers something you need exactly
+  (an error message, a file diff, a research report, a screenshot), recover it verbatim instead
+  of re-running searches or guessing:
+  `recompact rehydrate <this-session.jsonl> <selector>` — selector is the summary's key, a
+  uuid, or the 8-char prefix from a marker. Resolution follows provenance across ALL prior
+  compaction generations to the untouched originals. Bare `rehydrate <file>` lists summaries.
+- **Find your own file**: it is the newest `.jsonl` in `~/.claude/projects/<munged-cwd>/`, or
+  run `recompact scan` there (shows sizes, lineage, and which sessions are compacted twins).
+- **Trust user text, treat summaries as summaries.** User turns are verbatim by construction;
+  synthetic summaries are honest but lossy — verify against rehydrated originals before acting
+  on a detail that matters.
+
+## Long-running autonomous loops
+
+An agent that runs long enough to fill its context can keep itself going:
+
+- Mid-session (safe anytime): `recompact continue <session-id> --threshold 100000
+  --summarize-with haiku` writes a compacted twin + lineage entry; originals are never touched.
+- Under `recompact shell`, exiting with code 143 (SIGTERM to the CLI process) hands control to
+  the wrapper, which compacts and respawns automatically — that is the intended handoff for
+  goal-driven loops, and an active /goal survives the hop.
+- Give future selves breadcrumbs: the ledger (a `"ledger"` key in summaries.json) pins standing
+  constraints near the tail; it is re-injected on every pass and superseded wholesale by a newer
+  ledger.
 
 ## Notes
 
