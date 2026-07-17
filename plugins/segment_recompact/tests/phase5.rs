@@ -185,6 +185,90 @@ fn escalation_routes_high_salience_units_to_second_model() {
 }
 
 #[test]
+fn continue_resyncs_when_session_grows_during_summarization() {
+    // Reproduces the live failure: the session grew while summaries were being written, so
+    // assemble's re-read found segments the plan never saw ("plan needs summaries for [42, 43]").
+    // The stub summarizer APPENDS a new turn to the session on its first call; the retry loop
+    // must re-sync and converge on the second attempt.
+    let dir = tmp_dir();
+    let records = vec![
+        user("u1", None, "write chapter one"),
+        assistant("a1", "u1", &format!("CHAPTER-ONE {}", "lorem ".repeat(8000))),
+        user("u2", Some("a1"), "write chapter two"),
+        assistant("a2", "u2", &format!("CHAPTER-TWO {}", "ipsum ".repeat(8000))),
+        user("u3", Some("a2"), "write chapter three"),
+        assistant("a3", "u3", &format!("CHAPTER-THREE {}", "dolor ".repeat(8000))),
+        last_prompt("a3", "write chapter three"),
+    ];
+    let src = write_session(&dir, &records);
+    // Growth payload: a fresh turn chained onto a3, with an updated last-prompt so the new
+    // records land on the active path (exactly what a live session appends).
+    let growth = [
+        json!({"type": "user", "uuid": "g1", "parentUuid": "a3", "sessionId": SESSION,
+            "timestamp": "2026-07-17T00:10:00.000Z", "userType": "external", "isSidechain": false,
+            "message": {"role": "user", "content": [{"type": "text", "text": "one more thing"}]}}),
+        json!({"type": "assistant", "uuid": "g2", "parentUuid": "g1", "sessionId": SESSION,
+            "timestamp": "2026-07-17T00:10:01.000Z", "userType": "external", "isSidechain": false,
+            "message": {"id": "msg_g2", "role": "assistant", "model": "claude-opus-4-7",
+                "type": "message", "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": "GROWTH-REPLY"}]}}),
+        json!({"type": "last-prompt", "leafUuid": "g2", "sessionId": SESSION, "lastPrompt": "one more thing"}),
+    ];
+    let growth_lines: String = growth
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap() + "\n")
+        .collect();
+    fs::write(dir.join("growth.jsonl"), growth_lines).unwrap();
+    let stub = write_stub(
+        &dir,
+        "stub-growing.sh",
+        &format!(
+            r#"#!/bin/sh
+D="$(dirname "$0")"
+if [ ! -f "$D/grown.marker" ]; then
+  touch "$D/grown.marker"
+  cat "$D/growth.jsonl" >> "{src}"
+fi
+keys=$(sed -n 's/^### UNIT //p')
+printf '{{'
+first=1
+for k in $keys; do
+  [ $first -eq 1 ] || printf ','
+  printf '"%s":"Stub summary for unit %s."' "$k" "$k"
+  first=0
+done
+printf '}}\n'
+"#,
+            src = src.to_string_lossy()
+        ),
+    );
+    let rc = cmd_continue(&[
+        src.to_string_lossy().into_owned(),
+        "--threshold".into(),
+        "2000".into(),
+        "--summarize-with".into(),
+        "stub-model".into(),
+        "--claude-bin".into(),
+        stub,
+    ]);
+    assert_eq!(rc, 0, "retry loop must converge after mid-summarize growth");
+    let latest = lineage_latest(&dir, SESSION);
+    assert_ne!(latest, SESSION);
+    let text = fs::read_to_string(dir.join(format!("{latest}.jsonl"))).unwrap();
+    assert!(!text.contains("CHAPTER-THREE lorem") && !text.contains(&"dolor ".repeat(8000)),
+        "the segment that stopped being the tail must be summarized on retry");
+    assert!(text.contains("GROWTH-REPLY"), "the grown turn is the new verbatim tail");
+    assert_eq!(
+        cmd_verify(&[
+            dir.join(format!("{latest}.jsonl")).to_string_lossy().into_owned(),
+            "--source".into(),
+            src.to_string_lossy().into_owned(),
+        ]),
+        0
+    );
+}
+
+#[test]
 fn shell_auto_cycle_with_stub_compacts_and_reports_id() {
     let dir = tmp_dir();
     // Tool-heavy compressible session so mask-mode continue actually compacts.
