@@ -1648,7 +1648,6 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
 
     // Persist explicitly-provided summaries into the cache, keyed by content hash, so the next
     // recompaction of this (continued) session reuses them for unchanged segments.
-    drop(get_summary);
     if let Some(cp) = &cache_path {
         let mut cache = cache;
         for (s, pl) in plans.iter().enumerate() {
