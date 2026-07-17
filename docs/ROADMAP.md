@@ -74,16 +74,28 @@ cites the strongest evidence behind it.
 
 ## Phase 2: iterated recompaction lifecycle
 
-- Checked invariants: extract refuses to summarize recompactSynthetic records; every pass
-  re-derives from the raw ancestor (lineage header locates it); same inputs produce byte-identical
-  output.
-- Content-hash summary cache: unchanged segments reuse their summaries, so incremental passes cost
-  LLM calls only for new segments and keep the compacted prefix byte-stable.
-- Pinned ledger (JSON): constraints, decisions, and mid-session corrections, with explicit
-  supersession entries, re-injected verbatim on every pass.
-- Promotion pass: durable facts move to companion documents at each boundary; the resume seam
-  restates the last user ask and instructs the resumed agent to verify load-bearing claims against
-  live reality before acting on them.
+- [x] Never-resummarize invariant: segments carrying recompactSynthetic (or ledger) records are
+      pinned verbatim; tested by a double-recompaction (A to B, continue, B to C) that also proves
+      multi-hop provenance: B-era summaries carried into C still point at A, new summaries point
+      at B.
+- [x] Content-hash summary cache (`assemble --cache <path>`): FNV-1a over record type + message
+      content only (envelope fields change every pass), so unchanged segments resolve their
+      summaries from the cache and incremental passes pay only for new segments.
+- [x] Pinned ledger (`"ledger"` key in summaries.json): injected just before the verbatim tail
+      (recency placement), superseded wholesale when a new ledger is provided, pinned against
+      collapse on later passes.
+- [ ] Promotion pass: durable facts move to companion documents at each boundary; the resume seam
+      restates the last user ask and instructs the resumed agent to verify load-bearing claims
+      against live reality before acting on them.
+
+## Phase 3 seed: bench/smoke.sh
+
+- [x] Repeatable headless end-to-end benchmark (~6 small-model calls): summarize-mode codeword
+      recall (the codeword exists only in the synthetic summary) and mask-mode continuity
+      (command recalled over records with elided payloads). Both scenarios seed throwaway
+      sessions, recompact, resume via `claude -p --resume --fork-session`, assert recall, and
+      clean up. This is the kernel the full Phase 3 harness (decay curves, arms, real-session
+      NAP) grows from.
 
 ## Phase 3: evaluation harness
 

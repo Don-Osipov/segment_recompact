@@ -24,9 +24,11 @@ recompact assemble  <session.jsonl> --mode mask [--keep K] [--out <path>]\n  \
 recompact verify    <assembled.jsonl> [--source <session.jsonl>]\n  \
 recompact probe     <session.jsonl>\n  \
 recompact rehydrate <compacted.jsonl> [ordinal]\n\n\
-  --keep K     number of most-recent segments kept verbatim (default 1)\n  \
-  --mode mask  no-LLM compaction: keep every record, replace old tool-result\n               \
-payloads with placeholders (errors kept verbatim, head+tail)";
+  --keep K       number of most-recent segments kept verbatim (default 1)\n  \
+  --mode mask    no-LLM compaction: keep every record, replace old tool-result\n                 \
+payloads with placeholders (errors kept verbatim, head+tail)\n  \
+  --cache <path> summary cache keyed by segment content hash: unchanged\n                 \
+segments reuse their summaries on repeated recompactions";
 
 fn usage() -> i32 {
     eprintln!("{USAGE}");
@@ -172,6 +174,30 @@ pub struct SegPlan {
     pub needs_summary: bool,
 }
 
+/// Stable identity of a segment's content across recompaction passes. Envelope fields
+/// (sessionId, parentUuid, usage) are rewritten by every assemble, so the hash covers only what
+/// the conversation actually said: record type + message content, in order. FNV-1a, hand-rolled
+/// because std's DefaultHasher is not stable across Rust versions and a cache must be.
+pub fn segment_content_hash(records: &[Value], seg: &Segment) -> String {
+    fn feed(h: &mut u64, s: &[u8]) {
+        for &b in s {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for i in std::iter::once(seg.user_idx).chain(seg.activity.iter().copied()) {
+        let r = &records[i];
+        feed(&mut h, rec_type(r).as_bytes());
+        feed(&mut h, b"\x1f");
+        if let Some(c) = content(r) {
+            feed(&mut h, serde_json::to_string(c).unwrap_or_default().as_bytes());
+        }
+        feed(&mut h, b"\x1e");
+    }
+    format!("{h:016x}")
+}
+
 /// One retention decision per segment, shared by extract and assemble so the two passes can never
 /// disagree. The last `keep` segments stay verbatim. A segment whose activity carries a compaction
 /// summary (isCompactSummary, or this tool's own recompactSynthetic) is pinned verbatim regardless
@@ -183,7 +209,9 @@ pub fn plan(records: &[Value], segs: &[Segment], keep: usize) -> Vec<SegPlan> {
         .map(|(s, seg)| {
             let tail = s + keep >= segs.len();
             let pinned = seg.activity.iter().any(|&i| {
-                truthy(&records[i], "isCompactSummary") || truthy(&records[i], "recompactSynthetic")
+                truthy(&records[i], "isCompactSummary")
+                    || truthy(&records[i], "recompactSynthetic")
+                    || truthy(&records[i], "recompactLedger")
             });
             let kept_verbatim = tail || pinned;
             let needs_summary = has_agent_activity(records, seg) && !kept_verbatim;
@@ -427,6 +455,7 @@ pub fn cmd_extract(args: &[String]) -> i32 {
             "needs_summary": plans[s].needs_summary,
             "kept_verbatim": plans[s].kept_verbatim,
             "covered_uuids": covered,
+            "content_hash": segment_content_hash(&records, seg),
             "derived_index": segment_index(&records, seg),
             "approx_tokens": approx_tokens(
                 &std::iter::once(seg.user_idx)
@@ -725,19 +754,46 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
     } else {
         json!({})
     };
+    // Summary cache keyed by segment content hash: on a repeated recompaction of a continued
+    // session, unchanged segments resolve from the cache and only new segments need fresh work.
+    let hashes: Vec<String> = segs
+        .iter()
+        .map(|sg| segment_content_hash(&records, sg))
+        .collect();
+    let cache_path = opts.get("cache").and_then(|v| v.as_str()).map(PathBuf::from);
+    let cache: Map<String, Value> = cache_path
+        .as_ref()
+        .filter(|p| p.exists())
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
     let get_summary = |idx: usize| -> Option<String> {
         summaries
             .get(idx.to_string())
             .and_then(|v| v.as_str())
             .map(String::from)
+            .or_else(|| {
+                cache
+                    .get(&hashes[idx])
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
     };
 
     // Validate: every segment that needs a summary has one (masking needs none).
+    let mut cache_hits = 0usize;
     if mode == "summarize" {
         let mut missing = Vec::new();
         for (s, p) in plans.iter().enumerate() {
-            if p.needs_summary && get_summary(s).is_none() {
-                missing.push(s);
+            if p.needs_summary {
+                if summaries.get(s.to_string()).and_then(|v| v.as_str()).is_some() {
+                    // explicit summary
+                } else if cache.get(&hashes[s]).is_some() {
+                    cache_hits += 1;
+                } else {
+                    missing.push(s);
+                }
             }
         }
         if !missing.is_empty() {
@@ -745,6 +801,16 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
             return 1;
         }
     }
+
+    // Optional ledger: standing constraints, corrections, and decisions, re-injected verbatim on
+    // every pass just before the verbatim tail (models attend best to recent content). A new
+    // ledger supersedes any earlier one wholesale; without one, earlier ledgers are carried.
+    let ledger_text = if mode == "summarize" {
+        summaries.get("ledger").and_then(|v| v.as_str()).map(String::from)
+    } else {
+        None
+    };
+    let drop_old_ledgers = ledger_text.is_some();
 
     let new_session = uuid_v4();
     let src_abs = src
@@ -774,15 +840,55 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
 
     // Head: keep only records that carry a uuid (drop ephemeral scaffolding like queue-operation).
     for &i in &head {
+        if drop_old_ledgers && truthy(&records[i], "recompactLedger") {
+            continue; // superseded by the new ledger
+        }
         if rec_uuid(&records[i]).is_some() {
             out.push(records[i].clone());
         }
     }
 
+    let tail_start = segs.len().saturating_sub(keep);
+    let mut ledger_pending = ledger_text.as_ref().map(|text| {
+        let ts = segs
+            .get(tail_start.min(segs.len().saturating_sub(1)))
+            .and_then(|sg| records[sg.user_idx].get("timestamp").cloned())
+            .unwrap_or(Value::Null);
+        json!({
+            "parentUuid": Value::Null,
+            "isSidechain": false,
+            "userType": "external",
+            "type": "assistant",
+            "uuid": uuid_v4(),
+            "timestamp": ts,
+            "sessionId": new_session,
+            "cwd": cwd,
+            "gitBranch": git_branch,
+            "version": version,
+            "recompactLedger": true,
+            "message": {
+                "id": format!("msg_recompact_{}", uuid_v4().replace('-', "")),
+                "role": "assistant",
+                "model": model,
+                "type": "message",
+                "stop_reason": "end_turn",
+                "content": [{ "type": "text", "text": format!("Standing constraints, corrections, and decisions for this session (recompact ledger; supersedes any earlier ledger):\n{text}") }]
+            }
+        })
+    });
+
     for (s, seg) in segs.iter().enumerate() {
+        if s == tail_start {
+            if let Some(l) = ledger_pending.take() {
+                out.push(l);
+            }
+        }
         out.push(records[seg.user_idx].clone());
         if plans[s].kept_verbatim {
             for &i in &seg.activity {
+                if drop_old_ledgers && truthy(&records[i], "recompactLedger") {
+                    continue;
+                }
                 if rec_uuid(&records[i]).is_some() {
                     out.push(records[i].clone());
                 }
@@ -791,6 +897,9 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
             // Mechanical lane: keep every record, elide stale tool-result payloads. Pairs stay
             // atomic (both halves kept), so the structure the Messages API validates is intact.
             for &i in &seg.activity {
+                if drop_old_ledgers && truthy(&records[i], "recompactLedger") {
+                    continue;
+                }
                 if rec_uuid(&records[i]).is_some() {
                     match mask_record(&records[i]) {
                         Masked::Unchanged => out.push(records[i].clone()),
@@ -839,6 +948,10 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
                 }
             }));
         }
+    }
+
+    if let Some(l) = ledger_pending.take() {
+        out.push(l); // keep >= segment count: the ledger still lands, at the end
     }
 
     // Drop any tool_use with no matching tool_result (e.g. an in-flight call at the tail of a live
@@ -915,13 +1028,37 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
         }
     }
 
+    // Persist explicitly-provided summaries into the cache, keyed by content hash, so the next
+    // recompaction of this (continued) session reuses them for unchanged segments.
+    drop(get_summary);
+    if let Some(cp) = &cache_path {
+        let mut cache = cache;
+        for (s, p) in plans.iter().enumerate() {
+            if p.needs_summary {
+                if let Some(text) = summaries.get(s.to_string()).and_then(|v| v.as_str()) {
+                    cache.insert(hashes[s].clone(), Value::String(text.to_string()));
+                }
+            }
+        }
+        if let Some(parent) = cp.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        if let Err(e) = fs::write(cp, serde_json::to_string_pretty(&Value::Object(cache)).unwrap())
+        {
+            eprintln!("warning: could not write summary cache {}: {e}", cp.display());
+        }
+    }
+
     eprintln!(
-        "assemble ({mode}): {} → {} records (~{} → ~{} tokens, keep last {} verbatim).\n  new sessionId: {}\n  wrote: {}",
+        "assemble ({mode}): {} → {} records (~{} → ~{} tokens, keep last {} verbatim, {} summaries from cache).\n  new sessionId: {}\n  wrote: {}",
         records.len(),
         out.len(),
         approx_tokens(&records),
         approx_tokens(&out),
         keep,
+        cache_hits,
         new_session,
         out_path.display()
     );

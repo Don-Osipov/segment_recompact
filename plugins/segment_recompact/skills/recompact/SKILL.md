@@ -141,6 +141,17 @@ over your own reading of the prose. Rubric:
 Write in first person past tense ("I read…, found…, then edited…"), as the assistant's own recap —
 because that's exactly the role the record plays on resume.
 
+Two optional extras in `summaries.json`:
+
+- **`"ledger"`**: standing constraints, corrections, and decisions that must survive every future
+  compaction ("never push to main", "the user corrected X to Y"). Assemble injects it as a pinned
+  record just before the verbatim tail; providing a new ledger on a later pass supersedes the old
+  one wholesale. Do not rely on a constraint surviving inside one segment's prose summary.
+- **`--cache <path>`** (flag on assemble): a summary cache keyed by segment content hash (the
+  worksheet shows each segment's `content_hash`). On a repeated recompaction of a continued
+  session, unchanged segments resolve from the cache automatically and only the new segments need
+  summaries. Keep one cache file per session lineage.
+
 ### Mask mode — the no-summary express lane
 
 When the goal is bulk reduction rather than narrative compression, skip Steps 2 and 3 entirely:
