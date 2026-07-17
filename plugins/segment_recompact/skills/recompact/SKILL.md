@@ -51,8 +51,14 @@ Resolve the target `.jsonl`. Sessions live at `~/.claude/projects/<munged-cwd>/<
 where `<munged-cwd>` is the working directory with `/` and `.` replaced by `-`
 (e.g. `/home/sdr/wirt` → `-home-sdr-wirt`). Accept either a full path or a `sessionId` + project.
 
-Do **not** recompact the *currently live* session you are running inside — its last turn is in
-flight. Recompact a session you've stepped away from, or one the user names.
+Recompacting the session you are running inside is safe **at a stopping point** (between turns,
+work committed or at rest): the output is a new file, and the live session keeps appending to the
+original untouched — worst case the compacted file lacks the final wrap-up exchange, which lands
+in the keep-K tail on the next pass. What you must NOT do is rely on the compacted file from
+inside the same process: your own context does not shrink; the compaction pays off at the NEXT
+resume. The wrap-up ritual: finish the stretch of work, update the ledger with today's
+corrections, run the compaction, verify, and hand the user the new id to resume next time (or let
+the autonomous loop below pick it up).
 
 Confirm with the user which session, and the `--keep K` window (default `K=1`: the last K segments
 stay verbatim for clean resume).
@@ -165,6 +171,40 @@ payloads over 500 chars with placeholders (error output stays verbatim, head+tai
 and truncates oversized `tool_use` inputs. It never rewrites text, so it cannot hallucinate.
 Verify and resume exactly as below. On tool-heavy sessions the reduction approaches summarize
 mode at zero model cost; on discussion-heavy sessions it saves little (prose is untouched).
+
+Add `--target <tokens>` to either mode and a salience-floored planner chooses per-unit
+treatments toward that budget instead of blanket application: error-bearing units never drop
+below mask, pinned records and the recent tail never move, and if the floors make the target
+unreachable the output comes in over budget with the reasons printed. `--plan` previews the
+per-unit table without writing anything.
+
+### Autonomous continuation — sessions that compact themselves
+
+The one-command loop step for long-running agents:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/bin/recompact" continue <session.jsonl | sessionId> --threshold 60000
+```
+
+`continue` resolves the newest compacted descendant via the lineage registry (a
+`.recompact-lineage.json` sidecar written next to the session files), and when that session
+exceeds the threshold it mask-compacts it toward the threshold (zero LLM calls), verifies the
+output, and prints the id to resume on stdout. Under the threshold — or when compaction cannot
+meaningfully reduce (the churn guard removes pointless descendants) — it prints the current id.
+Either way, stdout is always a resumable id, so a driver loop never needs a human:
+
+```bash
+ID=<starting-session-id>
+while more_work_remains; do
+  ID=$("${CLAUDE_PLUGIN_ROOT}/bin/recompact" continue "$ID" --threshold 60000)
+  claude -p --resume "$ID" "continue with the next task"
+done
+```
+
+The same one-liner works as a Stop hook or a scheduled job. `recompact resume <id>` does the
+lineage resolution alone (prints the newest descendant without compacting), and
+`recompact scan [dir]` lists a project's sessions with sizes, mask estimates, and which are
+superseded by a compacted descendant.
 
 ### Step 4 — Assemble
 

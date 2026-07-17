@@ -111,7 +111,7 @@ fn segment_index_derives_files_commands_errors() {
     let records = rich_session();
     let (kept, _) = select_active(records);
     let (_, segs) = segment(&kept);
-    let idx = segment_index(&kept, &segs[0]);
+    let idx = segment_index(&kept, &segs[0].activity);
     assert_eq!(idx["files"]["/src/app.rs"], json!(["read", "edited"]));
     assert_eq!(idx["commands"], json!(["cargo build"]));
     assert_eq!(idx["error_count"], 1);

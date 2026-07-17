@@ -23,12 +23,22 @@ recompact assemble  <session.jsonl> <summaries.json> [--keep K] [--out <path>]\n
 recompact assemble  <session.jsonl> --mode mask [--keep K] [--out <path>]\n  \
 recompact verify    <assembled.jsonl> [--source <session.jsonl>]\n  \
 recompact probe     <session.jsonl>\n  \
-recompact rehydrate <compacted.jsonl> [ordinal]\n\n\
+recompact rehydrate <compacted.jsonl> [ordinal]\n  \
+recompact continue  <session.jsonl | sessionId> [--threshold T] [--keep K]\n  \
+recompact resume    <session.jsonl | sessionId>\n  \
+recompact scan      [project-dir]\n\n\
   --keep K       number of most-recent segments kept verbatim (default 1)\n  \
   --mode mask    no-LLM compaction: keep every record, replace old tool-result\n                 \
 payloads with placeholders (errors kept verbatim, head+tail)\n  \
   --cache <path> summary cache keyed by segment content hash: unchanged\n                 \
-segments reuse their summaries on repeated recompactions";
+segments reuse their summaries on repeated recompactions\n  \
+  --split <tok>  split segments over this many tokens into parts at safe\n                 \
+seams, delegation boundaries first (default 20000; 0 disables).\n                 \
+Pass the same value to extract and assemble\n  \
+  --target <tok> plan per-unit treatments (verbatim/mask/summarize) toward\n                 \
+this token budget; salience floors may exceed it, with reasons\n  \
+  --plan         with --target: print the plan table and exit without\n                 \
+validating or writing anything";
 
 fn usage() -> i32 {
     eprintln!("{USAGE}");
@@ -50,12 +60,65 @@ fn content(r: &Value) -> Option<&Value> {
     r.pointer("/message/content")
 }
 
+/// Sentinel prefixes for user-channel records authored by the harness or other agents, not typed
+/// by the human: teammate messages and background-task notifications. These records carry NO
+/// distinguishing metadata (verified empirically: isMeta absent, no source field) — the sentinel
+/// prefix is the only signal. Detection is anchored at the very start of the message text and
+/// matches the exact harness framing, so a human QUOTING these phrases mid-message still
+/// classifies as genuine.
+const TEAMMATE_SENTINEL: &str = "Another Claude session sent a message:\n<teammate-message ";
+const TASK_NOTIFICATION_SENTINEL: &str = "<task-notification>";
+
+fn first_text(r: &Value) -> Option<&str> {
+    match content(r) {
+        Some(Value::String(s)) => Some(s.as_str()),
+        Some(Value::Array(a)) => a.iter().find_map(|b| {
+            if b.get("type").and_then(|v| v.as_str()) == Some("text") {
+                b.get("text").and_then(|v| v.as_str())
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    }
+}
+
+/// Agent-delivered content arriving on the user channel. In delegation-heavy sessions these are
+/// the dominant "user" mass (a single teammate report can be 40KB), yet they are agent-authored
+/// distillates, not human prompts — compressible with care, always recoverable via provenance.
+/// Returns the kind, or None for anything human-typed or unrecognized (fail-open to genuine).
+pub fn delivered_kind(r: &Value) -> Option<&'static str> {
+    if rec_type(r) != "user" || truthy(r, "isMeta") || truthy(r, "isCompactSummary") {
+        return None;
+    }
+    // A record whose content was rewritten by masking no longer carries the sentinel; the marker
+    // stamped at mask time keeps the classification stable across passes.
+    if let Some(k) = r.get("recompactDelivered").and_then(|v| v.as_str()) {
+        return Some(match k {
+            "task_notification" => "task_notification",
+            _ => "teammate_message",
+        });
+    }
+    if r.get("sourceToolAssistantUUID").is_some() {
+        return None;
+    }
+    let t = first_text(r)?;
+    if t.starts_with(TEAMMATE_SENTINEL) {
+        Some("teammate_message")
+    } else if t.starts_with(TASK_NOTIFICATION_SENTINEL) {
+        Some("task_notification")
+    } else {
+        None
+    }
+}
+
 /// A genuine human-authored user turn: a segment boundary, always kept verbatim.
 ///
-/// Fail-open on retention: any user record that is not a tool result, a meta record, or a
-/// compaction summary counts as genuine — including content shapes this tool doesn't know
-/// (image-first turns, future block types). Misclassifying a real prompt as agent activity would
-/// let a collapse silently drop it; misclassifying activity as a prompt only costs compression.
+/// Fail-open on retention: any user record that is not a tool result, a meta record, a compaction
+/// summary, or sentinel-matched delivered content counts as genuine — including content shapes
+/// this tool doesn't know (image-first turns, future block types). Misclassifying a real prompt
+/// as agent activity would let a collapse silently drop it; misclassifying activity as a prompt
+/// only costs compression.
 pub fn is_genuine_user(r: &Value) -> bool {
     if rec_type(r) != "user" {
         return false;
@@ -65,6 +128,9 @@ pub fn is_genuine_user(r: &Value) -> bool {
     }
     if r.get("sourceToolAssistantUUID").is_some() {
         return false; // tool-result record
+    }
+    if delivered_kind(r).is_some() {
+        return false; // agent-delivered content, not a human turn
     }
     match content(r) {
         Some(Value::String(_)) => true,
@@ -174,11 +240,11 @@ pub struct SegPlan {
     pub needs_summary: bool,
 }
 
-/// Stable identity of a segment's content across recompaction passes. Envelope fields
-/// (sessionId, parentUuid, usage) are rewritten by every assemble, so the hash covers only what
-/// the conversation actually said: record type + message content, in order. FNV-1a, hand-rolled
+/// Stable identity of a run of records across recompaction passes. Envelope fields (sessionId,
+/// parentUuid, usage) are rewritten by every assemble, so the hash covers only what the
+/// conversation actually said: record type + message content, in order. FNV-1a, hand-rolled
 /// because std's DefaultHasher is not stable across Rust versions and a cache must be.
-pub fn segment_content_hash(records: &[Value], seg: &Segment) -> String {
+fn content_hash_over(records: &[Value], indices: impl Iterator<Item = usize>) -> String {
     fn feed(h: &mut u64, s: &[u8]) {
         for &b in s {
             *h ^= b as u64;
@@ -186,7 +252,7 @@ pub fn segment_content_hash(records: &[Value], seg: &Segment) -> String {
         }
     }
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for i in std::iter::once(seg.user_idx).chain(seg.activity.iter().copied()) {
+    for i in indices {
         let r = &records[i];
         feed(&mut h, rec_type(r).as_bytes());
         feed(&mut h, b"\x1f");
@@ -196,6 +262,112 @@ pub fn segment_content_hash(records: &[Value], seg: &Segment) -> String {
         feed(&mut h, b"\x1e");
     }
     format!("{h:016x}")
+}
+
+pub fn segment_content_hash(records: &[Value], seg: &Segment) -> String {
+    content_hash_over(
+        records,
+        std::iter::once(seg.user_idx).chain(seg.activity.iter().copied()),
+    )
+}
+
+/// Hash of one part of a split segment. The first part carries the user turn's content (matching
+/// the whole-segment hash when a segment has a single part, so caches stay compatible).
+pub fn part_content_hash(records: &[Value], seg: &Segment, part: &[usize], first: bool) -> String {
+    if first {
+        content_hash_over(
+            records,
+            std::iter::once(seg.user_idx).chain(part.iter().copied()),
+        )
+    } else {
+        content_hash_over(records, part.iter().copied())
+    }
+}
+
+// ------------------------------------------------------------------------------------ splitting
+
+pub const DEFAULT_SPLIT_THRESHOLD: usize = 20_000;
+const DELEGATION_TOOLS: &[&str] = &["Task", "Agent", "Workflow", "Skill"];
+
+/// Split an oversized segment's activity into parts at safe seams. A seam is valid only where no
+/// tool_use is awaiting its result, so a pair can never straddle parts. Parts close early at
+/// delegation seams (a completed Task/Agent/Workflow/Skill result, or a delivered message — each
+/// ends a self-contained unit of delegated work) and otherwise once the part exceeds its budget.
+/// A segment at or under the threshold stays a single part. threshold 0 disables splitting.
+pub fn split_parts(records: &[Value], seg: &Segment, threshold: usize) -> Vec<Vec<usize>> {
+    let seg_tokens: usize = seg
+        .activity
+        .iter()
+        .map(|&i| serde_json::to_string(&records[i]).map(|s| s.len()).unwrap_or(0))
+        .sum::<usize>()
+        / 4;
+    if threshold == 0 || seg_tokens <= threshold {
+        return vec![seg.activity.clone()];
+    }
+    let part_budget = (threshold / 2).max(1);
+    let min_part = (threshold / 10).max(1);
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+    for &i in &seg.activity {
+        if let Some(blocks) = content(&records[i]).and_then(|c| c.as_array()) {
+            for b in blocks {
+                if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                    if let (Some(id), Some(name)) = (
+                        b.get("id").and_then(|v| v.as_str()),
+                        b.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        tool_names.insert(id.to_string(), name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut parts: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    let mut cur_tokens = 0usize;
+    let mut pending: HashSet<String> = HashSet::new();
+    for &i in &seg.activity {
+        let r = &records[i];
+        let mut delegation_end = delivered_kind(r).is_some();
+        if let Some(blocks) = content(r).and_then(|c| c.as_array()) {
+            for b in blocks {
+                match b.get("type").and_then(|v| v.as_str()) {
+                    Some("tool_use") => {
+                        if let Some(id) = b.get("id").and_then(|v| v.as_str()) {
+                            pending.insert(id.to_string());
+                        }
+                    }
+                    Some("tool_result") => {
+                        if let Some(id) = b.get("tool_use_id").and_then(|v| v.as_str()) {
+                            pending.remove(id);
+                            if tool_names
+                                .get(id)
+                                .is_some_and(|n| DELEGATION_TOOLS.contains(&n.as_str()))
+                            {
+                                delegation_end = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        cur.push(i);
+        cur_tokens += serde_json::to_string(r).map(|s| s.len()).unwrap_or(0) / 4;
+        let seam_ok = pending.is_empty();
+        if seam_ok
+            && ((delegation_end && cur_tokens >= min_part) || cur_tokens >= part_budget)
+        {
+            parts.push(std::mem::take(&mut cur));
+            cur_tokens = 0;
+        }
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    if parts.is_empty() {
+        parts.push(Vec::new());
+    }
+    parts
 }
 
 /// One retention decision per segment, shared by extract and assemble so the two passes can never
@@ -295,15 +467,21 @@ fn last_prompt_text(records: &[Value]) -> Option<String> {
 // --------------------------------------------------------------------------------- arg plumbing
 
 pub fn parse_opts(args: &[String]) -> (Vec<String>, Map<String, Value>) {
+    const FLAGS: &[&str] = &["plan"]; // boolean flags take no value
     let mut positional = Vec::new();
     let mut opts = Map::new();
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
         if let Some(key) = a.strip_prefix("--") {
-            let val = args.get(i + 1).cloned().unwrap_or_default();
-            opts.insert(key.to_string(), Value::String(val));
-            i += 2;
+            if FLAGS.contains(&key) {
+                opts.insert(key.to_string(), Value::Bool(true));
+                i += 1;
+            } else {
+                let val = args.get(i + 1).cloned().unwrap_or_default();
+                opts.insert(key.to_string(), Value::String(val));
+                i += 2;
+            }
         } else {
             positional.push(a.clone());
             i += 1;
@@ -317,6 +495,237 @@ fn keep_window(opts: &Map<String, Value>) -> usize {
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse().ok())
         .unwrap_or(1)
+}
+
+// --------------------------------------------------------------------------------- budget planner
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Treatment {
+    Verbatim,
+    Mask,
+    Summarize,
+}
+
+pub struct UnitPlan {
+    pub key: String,
+    pub seg: usize,
+    pub salience: f32,
+    pub treatment: Treatment,
+    /// tokens under [verbatim, mask, summarize]
+    pub cost: [usize; 3],
+    /// non-empty when a floor limits demotion ("error": never below mask)
+    pub floor: &'static str,
+}
+
+pub struct BudgetPlan {
+    pub units: Vec<UnitPlan>,
+    pub fixed_tokens: usize,
+    pub planned_total: usize,
+    pub target: usize,
+    /// Summarize units with no summary available yet — the operator's work list.
+    pub need_summaries: Vec<String>,
+}
+
+fn tokens_of(records: &[Value], indices: &[usize]) -> usize {
+    indices
+        .iter()
+        .map(|&i| serde_json::to_string(&records[i]).map(|s| s.len()).unwrap_or(0))
+        .sum::<usize>()
+        / 4
+}
+
+fn mask_tokens_of(records: &[Value], indices: &[usize]) -> usize {
+    indices
+        .iter()
+        .map(|&i| match mask_record(&records[i]) {
+            Masked::Unchanged => serde_json::to_string(&records[i]).map(|s| s.len()).unwrap_or(0),
+            Masked::Replaced(v) => serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0),
+            Masked::Dropped => 0,
+        })
+        .sum::<usize>()
+        / 4
+}
+
+fn first_word_signals_correction(text: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "no", "actually", "wait", "instead", "revert", "don't", "dont", "stop", "undo", "wrong",
+    ];
+    let first: String = text
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '\'')
+        .collect::<String>()
+        .to_lowercase();
+    MARKERS.contains(&first.as_str())
+}
+
+/// Choose a treatment per unit so the output approaches `target` tokens while keeping what
+/// matters. The budget is an objective; the floors are constraints; floors win — the output may
+/// exceed the target, and the plan says exactly why. Salience is code-derived: error density,
+/// future-file overlap (this tool knows the session's future — a live compactor never does), and
+/// correction markers in the next human turn.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_budget(
+    records: &[Value],
+    segs: &[Segment],
+    plans: &[SegPlan],
+    seg_parts: &[Vec<Vec<usize>>],
+    seg_keys: &[Vec<String>],
+    target: usize,
+    allow_summarize: bool,
+    summary_tokens: impl Fn(&str) -> Option<usize>,
+) -> BudgetPlan {
+    // Fixed cost: head + every genuine user turn + pinned/tail segments kept whole.
+    let mut fixed = 0usize;
+    for (s, seg) in segs.iter().enumerate() {
+        fixed += tokens_of(records, &[seg.user_idx]);
+        if plans[s].kept_verbatim {
+            fixed += tokens_of(records, &seg.activity);
+        }
+    }
+
+    // Per-unit file sets for the future-reference signal, then a reverse-scan suffix union.
+    let mut unit_meta: Vec<(usize, usize)> = Vec::new(); // (seg, part)
+    for (s, parts) in seg_parts.iter().enumerate() {
+        if plans[s].kept_verbatim {
+            continue;
+        }
+        for p in 0..parts.len() {
+            unit_meta.push((s, p));
+        }
+    }
+    let file_sets: Vec<HashSet<String>> = unit_meta
+        .iter()
+        .map(|&(s, p)| {
+            segment_index(records, &seg_parts[s][p])["files"]
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
+        })
+        .collect();
+    let mut later: Vec<HashSet<String>> = vec![HashSet::new(); file_sets.len()];
+    let mut acc: HashSet<String> = HashSet::new();
+    for i in (0..file_sets.len()).rev() {
+        later[i] = acc.clone();
+        acc.extend(file_sets[i].iter().cloned());
+    }
+
+    let mut units: Vec<UnitPlan> = Vec::new();
+    for (u, &(s, p)) in unit_meta.iter().enumerate() {
+        let part = &seg_parts[s][p];
+        let key = seg_keys[s][p].clone();
+        let has_error = segment_index(records, part)["error_count"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0;
+        let mut salience: f32 = 0.1;
+        let mut floor = "";
+        if has_error {
+            salience += 0.4;
+            floor = "error";
+        }
+        if !file_sets[u].is_empty() {
+            let overlap = file_sets[u].intersection(&later[u]).count() as f32
+                / file_sets[u].len() as f32;
+            salience += 0.3 * overlap;
+        }
+        if let Some(next) = segs.get(s + 1) {
+            if first_word_signals_correction(&user_text(&records[next.user_idx])) {
+                salience += 0.3;
+            }
+        }
+        let verbatim = tokens_of(records, part);
+        let mask = mask_tokens_of(records, part).min(verbatim);
+        let summary = summary_tokens(&key).unwrap_or(400).min(mask);
+        units.push(UnitPlan {
+            key,
+            seg: s,
+            salience: salience.min(1.0),
+            treatment: Treatment::Verbatim,
+            cost: [verbatim, mask, summary],
+            floor,
+        });
+    }
+
+    let mut total = fixed + units.iter().map(|u| u.cost[0]).sum::<usize>();
+    loop {
+        if total <= target {
+            break;
+        }
+        let mut best: Option<(usize, Treatment, usize, f32)> = None; // (idx, next, savings, score)
+        for (i, u) in units.iter().enumerate() {
+            let next = match u.treatment {
+                Treatment::Verbatim => Treatment::Mask,
+                Treatment::Mask if allow_summarize && u.floor != "error" => Treatment::Summarize,
+                _ => continue,
+            };
+            let cur_cost = u.cost[u.treatment as usize];
+            let next_cost = u.cost[next as usize];
+            let savings = cur_cost.saturating_sub(next_cost);
+            if savings == 0 {
+                continue;
+            }
+            let score = savings as f32 * (1.0 - u.salience);
+            if best.map_or(true, |(_, _, _, s)| score > s) {
+                best = Some((i, next, savings, score));
+            }
+        }
+        let Some((i, next, savings, _)) = best else {
+            break; // floors hold: over target and nothing left to demote
+        };
+        units[i].treatment = next;
+        total -= savings;
+    }
+
+    let need_summaries: Vec<String> = units
+        .iter()
+        .filter(|u| u.treatment == Treatment::Summarize && summary_tokens(&u.key).is_none())
+        .map(|u| u.key.clone())
+        .collect();
+    BudgetPlan {
+        units,
+        fixed_tokens: fixed,
+        planned_total: total,
+        target,
+        need_summaries,
+    }
+}
+
+fn print_budget_plan(b: &BudgetPlan) {
+    eprintln!(
+        "plan: target {} tokens, fixed {} (head + user turns + pinned/tail)",
+        b.target, b.fixed_tokens
+    );
+    eprintln!(
+        "  {:<8} {:<9} {:<10} {:>10} {:>10}  floor",
+        "unit", "salience", "treatment", "verbatim", "planned"
+    );
+    for u in &b.units {
+        eprintln!(
+            "  {:<8} {:<9.2} {:<10} {:>10} {:>10}  {}",
+            u.key,
+            u.salience,
+            format!("{:?}", u.treatment).to_lowercase(),
+            u.cost[0],
+            u.cost[u.treatment as usize],
+            u.floor
+        );
+    }
+    if b.planned_total > b.target {
+        eprintln!(
+            "plan: total {} tokens, {} OVER target — floors and fixed cost hold; this is the price of retention",
+            b.planned_total,
+            b.planned_total - b.target
+        );
+    } else {
+        eprintln!(
+            "plan: total {} tokens (target {})",
+            b.planned_total, b.target
+        );
+    }
+    if !b.need_summaries.is_empty() {
+        eprintln!("plan: provide summaries for {:?}", b.need_summaries);
+    }
 }
 
 // ----------------------------------------------------------------------------------- subcommand: extract
@@ -334,19 +743,23 @@ pub fn cmd_extract(args: &[String]) -> i32 {
         .unwrap_or_else(|| PathBuf::from("work/segments.json"));
     let keep = keep_window(&opts);
 
+    let split_threshold = opts
+        .get("split")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SPLIT_THRESHOLD);
+
     let loaded = load_jsonl(&src);
     let total_in_file = loaded.len();
     let (records, off_path) = select_active(loaded);
     let (head, segs) = segment(&records);
     let plans = plan(&records, &segs, keep);
 
+    let mut needs_keys: Vec<String> = Vec::new();
     let mut seg_json = Vec::new();
     for (s, seg) in segs.iter().enumerate() {
-        // Render activity for Claude to read. Two passes: first map tool_use ids to names so each
-        // result can be labeled with the tool that produced it, then render with mechanical
-        // elision: statuses instead of payloads for empty and duplicate results, head+tail
-        // truncation so trailing errors survive, char counts so the summarizer can see how much
-        // it is not seeing, and a larger budget for errors (they are load-bearing verbatim).
+        // Map tool_use ids to names segment-wide so each result can be labeled with the tool
+        // that produced it (pairs never straddle parts, but the map is cheap to build once).
         let mut tool_names: HashMap<String, String> = HashMap::new();
         for &i in &seg.activity {
             if let Some(blocks) = content(&records[i]).and_then(|c| c.as_array()) {
@@ -363,16 +776,130 @@ pub fn cmd_extract(args: &[String]) -> i32 {
             }
         }
         let mut seen_results: HashSet<String> = HashSet::new();
-        let mut activity = Vec::new();
-        let mut covered = vec![records[seg.user_idx]
-            .get("uuid")
-            .cloned()
-            .unwrap_or(Value::Null)];
-        for &i in &seg.activity {
-            let r = &records[i];
-            if let Some(u) = rec_uuid(r) {
-                covered.push(Value::String(u.to_string()));
+        let parts = split_parts(&records, seg, split_threshold);
+        let split = parts.len() > 1;
+
+        let mut parts_json: Vec<Value> = Vec::new();
+        for (p, part) in parts.iter().enumerate() {
+            let mut activity = Vec::new();
+            let mut covered: Vec<Value> = Vec::new();
+            if p == 0 {
+                covered.push(
+                    records[seg.user_idx]
+                        .get("uuid")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
             }
+            for &i in part {
+                if let Some(u) = rec_uuid(&records[i]) {
+                    covered.push(Value::String(u.to_string()));
+                }
+                activity.extend(render_record(&records[i], &tool_names, &mut seen_results));
+            }
+            let key = if split { format!("{s}.{p}") } else { s.to_string() };
+            parts_json.push(json!({
+                "key": key,
+                "covered_uuids": covered,
+                "content_hash": part_content_hash(&records, seg, part, p == 0),
+                "approx_tokens": approx_tokens(
+                    &part.iter().map(|&i| records[i].clone()).collect::<Vec<_>>()
+                ),
+                "activity": activity,
+            }));
+        }
+        if plans[s].needs_summary {
+            for pj in &parts_json {
+                needs_keys.push(pj["key"].as_str().unwrap_or_default().to_string());
+            }
+        }
+
+        let mut seg_obj = json!({
+            "index": s,
+            "user_text": user_text(&records[seg.user_idx]),
+            "has_agent_activity": has_agent_activity(&records, seg),
+            "needs_summary": plans[s].needs_summary,
+            "kept_verbatim": plans[s].kept_verbatim,
+            "content_hash": segment_content_hash(&records, seg),
+            "derived_index": segment_index(&records, &seg.activity),
+            "approx_tokens": approx_tokens(
+                &std::iter::once(seg.user_idx)
+                    .chain(seg.activity.iter().copied())
+                    .map(|i| records[i].clone())
+                    .collect::<Vec<_>>()
+            ),
+        });
+        if split {
+            seg_obj["parts"] = Value::Array(parts_json);
+        } else if let Some(single) = parts_json.pop() {
+            seg_obj["covered_uuids"] = single["covered_uuids"].clone();
+            seg_obj["activity"] = single["activity"].clone();
+        }
+        seg_json.push(seg_obj);
+    }
+
+    let session_id = records
+        .iter()
+        .find_map(|r| r.get("sessionId").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let leaf = records
+        .iter()
+        .rev()
+        .find_map(|r| r.get("leafUuid").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+
+    let doc = json!({
+        "source": src.canonicalize().unwrap_or(src.clone()).to_string_lossy(),
+        "original_session_id": session_id,
+        "leaf_uuid": leaf,
+        "total_records": records.len(),
+        "off_path_dropped": off_path,
+        "head_record_count": head.len(),
+        "approx_tokens_total": approx_tokens(&records),
+        "keep_verbatim_last": keep,
+        "split_threshold": split_threshold,
+        "segments_needing_summary": needs_keys,
+        "segments": seg_json,
+    });
+
+    if let Some(parent) = out.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
+    if let Err(e) = fs::write(&out, serde_json::to_string_pretty(&doc).unwrap()) {
+        eprintln!("error: cannot write {}: {e}", out.display());
+        return 1;
+    }
+
+    eprintln!(
+        "extract: {} records in file, {} on active path ({} off-path dropped) → {} segments ({} head, ~{} tokens). Summaries needed for {:?}. Worksheet: {}",
+        total_in_file,
+        records.len(),
+        off_path,
+        segs.len(),
+        head.len(),
+        approx_tokens(&records),
+        needs_keys,
+        out.display()
+    );
+    0
+}
+
+/// Render one record into worksheet activity items, with mechanical elision: statuses instead of
+/// payloads for empty and duplicate results, head+tail truncation so trailing errors survive,
+/// char counts so the summarizer can see how much it is not seeing, and a larger budget for
+/// errors (they are load-bearing verbatim).
+fn render_record(
+    r: &Value,
+    tool_names: &HashMap<String, String>,
+    seen_results: &mut HashSet<String>,
+) -> Vec<Value> {
+    let mut activity = Vec::new();
+    {
+        {
             match rec_type(r) {
                 "assistant" => {
                     if let Some(blocks) = content(r).and_then(|c| c.as_array()) {
@@ -403,6 +930,16 @@ pub fn cmd_extract(args: &[String]) -> i32 {
                         activity.push(json!({
                             "kind": "compact_summary",
                             "text": truncate(&user_text(r), 4000)
+                        }));
+                    } else if let Some(kind) = delivered_kind(r) {
+                        // Agent-delivered reports are distillates: give the summarizer a generous
+                        // window so their key findings can be carried into the summary.
+                        let text = first_text(r).unwrap_or("");
+                        activity.push(json!({
+                            "kind": "delivered_message",
+                            "delivered": kind,
+                            "chars": text.chars().count(),
+                            "text": truncate_head_tail(text, 8000, 0.7)
                         }));
                     } else if let Some(blocks) = content(r).and_then(|c| c.as_array()) {
                         for b in blocks {
@@ -447,79 +984,8 @@ pub fn cmd_extract(args: &[String]) -> i32 {
                 _ => {}
             }
         }
-
-        seg_json.push(json!({
-            "index": s,
-            "user_text": user_text(&records[seg.user_idx]),
-            "has_agent_activity": has_agent_activity(&records, seg),
-            "needs_summary": plans[s].needs_summary,
-            "kept_verbatim": plans[s].kept_verbatim,
-            "covered_uuids": covered,
-            "content_hash": segment_content_hash(&records, seg),
-            "derived_index": segment_index(&records, seg),
-            "approx_tokens": approx_tokens(
-                &std::iter::once(seg.user_idx)
-                    .chain(seg.activity.iter().copied())
-                    .map(|i| records[i].clone())
-                    .collect::<Vec<_>>()
-            ),
-            "activity": activity,
-        }));
     }
-
-    let session_id = records
-        .iter()
-        .find_map(|r| r.get("sessionId").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string();
-    let leaf = records
-        .iter()
-        .rev()
-        .find_map(|r| r.get("leafUuid").and_then(|v| v.as_str()))
-        .unwrap_or("")
-        .to_string();
-
-    let needs: Vec<usize> = seg_json
-        .iter()
-        .filter(|s| s["needs_summary"].as_bool() == Some(true))
-        .map(|s| s["index"].as_u64().unwrap() as usize)
-        .collect();
-
-    let doc = json!({
-        "source": src.canonicalize().unwrap_or(src.clone()).to_string_lossy(),
-        "original_session_id": session_id,
-        "leaf_uuid": leaf,
-        "total_records": records.len(),
-        "off_path_dropped": off_path,
-        "head_record_count": head.len(),
-        "approx_tokens_total": approx_tokens(&records),
-        "keep_verbatim_last": keep,
-        "segments_needing_summary": needs,
-        "segments": seg_json,
-    });
-
-    if let Some(parent) = out.parent() {
-        if !parent.as_os_str().is_empty() {
-            let _ = fs::create_dir_all(parent);
-        }
-    }
-    if let Err(e) = fs::write(&out, serde_json::to_string_pretty(&doc).unwrap()) {
-        eprintln!("error: cannot write {}: {e}", out.display());
-        return 1;
-    }
-
-    eprintln!(
-        "extract: {} records in file, {} on active path ({} off-path dropped) → {} segments ({} head, ~{} tokens). Summaries needed for segments {:?}. Worksheet: {}",
-        total_in_file,
-        records.len(),
-        off_path,
-        segs.len(),
-        head.len(),
-        approx_tokens(&records),
-        needs,
-        out.display()
-    );
-    0
+    activity
 }
 
 // ------------------------------------------------------------------------------------- masking
@@ -602,6 +1068,27 @@ pub fn mask_record(r: &Value) -> Masked {
             }
         }
     }
+    // Delivered content: task notifications are pure ceremony once processed; oversized teammate
+    // reports keep a head+tail window (they are distillates, so the gist matters) and remain
+    // fully recoverable from the untouched original.
+    if let Some(kind) = delivered_kind(r) {
+        let text = first_text(r).unwrap_or("").to_string();
+        let chars = text.chars().count();
+        let replacement = match kind {
+            "task_notification" => Some("[recompact: task notification elided]".to_string()),
+            "teammate_message" if chars > 4000 => Some(truncate_head_tail(&text, 4000, 0.6)),
+            _ => None,
+        };
+        if let Some(newtext) = replacement {
+            if let Some(msg) = m.pointer_mut("/message").and_then(|v| v.as_object_mut()) {
+                msg.insert("content".into(), Value::String(newtext));
+                changed = true;
+            }
+            if let Some(obj) = m.as_object_mut() {
+                obj.insert("recompactDelivered".into(), Value::String(kind.to_string()));
+            }
+        }
+    }
     // Claude Code duplicates every tool result in a top-level toolUseResult field (transcript-UI
     // metadata, never part of the API message); for bulky results the duplicate costs as much as
     // the payload itself.
@@ -630,7 +1117,7 @@ pub fn mask_record(r: &Value) -> Masked {
 /// Code-derived facts about a segment: which files were touched and how, what ran, what failed.
 /// Deterministic (no model call), so it can be regenerated from raw on every pass without drift,
 /// and it cannot forget a file path the way prose summarization measurably does.
-pub fn segment_index(records: &[Value], seg: &Segment) -> Value {
+pub fn segment_index(records: &[Value], activity: &[usize]) -> Value {
     use std::collections::BTreeMap;
     fn push_role(files: &mut BTreeMap<String, Vec<&'static str>>, path: &str, role: &'static str) {
         let roles = files.entry(path.to_string()).or_default();
@@ -642,7 +1129,7 @@ pub fn segment_index(records: &[Value], seg: &Segment) -> Value {
     let mut commands: Vec<String> = Vec::new();
     let mut tool_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut error_count = 0usize;
-    for &i in &seg.activity {
+    for &i in activity {
         if let Some(blocks) = content(&records[i]).and_then(|c| c.as_array()) {
             for b in blocks {
                 match b.get("type").and_then(|v| v.as_str()) {
@@ -713,6 +1200,18 @@ pub fn uuid_v4() -> String {
 }
 
 pub fn cmd_assemble(args: &[String]) -> i32 {
+    match run_assemble(args) {
+        Ok(Some((id, _))) => {
+            println!("{id}"); // stdout: the new sessionId, for scripting / `claude --resume`
+            0
+        }
+        Ok(None) => 0, // --plan preview
+        Err(rc) => rc,
+    }
+}
+
+/// Core of assemble, returning the new session id and output path (None for --plan previews).
+fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     let (pos, opts) = parse_opts(args);
     let mode = opts
         .get("mode")
@@ -720,17 +1219,31 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
         .unwrap_or("summarize");
     if !matches!(mode, "summarize" | "mask") {
         eprintln!("error: unknown --mode {mode} (expected summarize or mask)");
-        return 2;
+        return Err(2);
     }
     if pos.is_empty() || (mode == "summarize" && pos.len() < 2) {
-        return usage();
+        return Err(usage());
     }
     if mode == "mask" && pos.len() >= 2 {
         eprintln!("error: --mode mask takes no summaries file (masking is mechanical)");
-        return 2;
+        return Err(2);
     }
     let src = PathBuf::from(&pos[0]);
     let keep = keep_window(&opts);
+    let split_threshold = opts
+        .get("split")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SPLIT_THRESHOLD);
+    let target = opts
+        .get("target")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<usize>().ok());
+    let plan_only = opts.get("plan").and_then(|v| v.as_bool()).unwrap_or(false);
+    if plan_only && target.is_none() {
+        eprintln!("error: --plan requires --target <tokens>");
+        return Err(2);
+    }
 
     let loaded = load_jsonl(&src);
     let (records, _off_path) = select_active(loaded);
@@ -742,24 +1255,38 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
         let mut s = String::new();
         if let Err(e) = fs::File::open(&summaries_path).and_then(|mut f| f.read_to_string(&mut s)) {
             eprintln!("error: cannot read {}: {e}", summaries_path.display());
-            return 1;
+            return Err(1);
         }
         match serde_json::from_str(&s) {
             Ok(v) => v,
             Err(e) => {
                 eprintln!("error: {} is not valid JSON: {e}", summaries_path.display());
-                return 1;
+                return Err(1);
             }
         }
     } else {
         json!({})
     };
-    // Summary cache keyed by segment content hash: on a repeated recompaction of a continued
-    // session, unchanged segments resolve from the cache and only new segments need fresh work.
-    let hashes: Vec<String> = segs
+    // Summary cache keyed by content hash: on a repeated recompaction of a continued session,
+    // unchanged segments (or parts of split segments) resolve from the cache and only new
+    // material needs fresh work.
+    let seg_parts: Vec<Vec<Vec<usize>>> = segs
         .iter()
-        .map(|sg| segment_content_hash(&records, sg))
+        .map(|sg| split_parts(&records, sg, split_threshold))
         .collect();
+    let mut key_hashes: HashMap<String, String> = HashMap::new();
+    let mut seg_keys: Vec<Vec<String>> = Vec::new();
+    for (s, seg) in segs.iter().enumerate() {
+        let parts = &seg_parts[s];
+        let split = parts.len() > 1;
+        let mut keys = Vec::new();
+        for (p, part) in parts.iter().enumerate() {
+            let key = if split { format!("{s}.{p}") } else { s.to_string() };
+            key_hashes.insert(key.clone(), part_content_hash(&records, seg, part, p == 0));
+            keys.push(key);
+        }
+        seg_keys.push(keys);
+    }
     let cache_path = opts.get("cache").and_then(|v| v.as_str()).map(PathBuf::from);
     let cache: Map<String, Value> = cache_path
         .as_ref()
@@ -768,37 +1295,70 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-    let get_summary = |idx: usize| -> Option<String> {
+    let get_summary = |key: &str| -> Option<String> {
         summaries
-            .get(idx.to_string())
+            .get(key)
             .and_then(|v| v.as_str())
             .map(String::from)
             .or_else(|| {
-                cache
-                    .get(&hashes[idx])
+                key_hashes
+                    .get(key)
+                    .and_then(|h| cache.get(h))
                     .and_then(|v| v.as_str())
                     .map(String::from)
             })
     };
 
-    // Validate: every segment that needs a summary has one (masking needs none).
+    // With --target, the planner decides per-unit treatments; the budget is an objective, the
+    // salience floors are constraints, and floors win.
+    let budget: Option<BudgetPlan> = target.map(|t| {
+        plan_budget(
+            &records,
+            &segs,
+            &plans,
+            &seg_parts,
+            &seg_keys,
+            t,
+            mode == "summarize",
+            |key| get_summary(key).map(|s| s.len() / 4 + 60),
+        )
+    });
+    if plan_only {
+        print_budget_plan(budget.as_ref().expect("checked above"));
+        return Ok(None); // preview only: nothing validated, nothing written
+    }
+    let treatments: Option<HashMap<String, Treatment>> = budget
+        .as_ref()
+        .map(|b| b.units.iter().map(|u| (u.key.clone(), u.treatment)).collect());
+
+    // Validate: every segment (or part) that needs a summary has one (masking needs none).
     let mut cache_hits = 0usize;
-    if mode == "summarize" {
-        let mut missing = Vec::new();
+    if let Some(b) = &budget {
+        if !b.need_summaries.is_empty() {
+            eprintln!(
+                "error: the --target plan needs summaries for {:?}; run with --plan to preview, then provide them",
+                b.need_summaries
+            );
+            return Err(1);
+        }
+    } else if mode == "summarize" {
+        let mut missing: Vec<String> = Vec::new();
         for (s, p) in plans.iter().enumerate() {
             if p.needs_summary {
-                if summaries.get(s.to_string()).and_then(|v| v.as_str()).is_some() {
-                    // explicit summary
-                } else if cache.get(&hashes[s]).is_some() {
-                    cache_hits += 1;
-                } else {
-                    missing.push(s);
+                for key in &seg_keys[s] {
+                    if summaries.get(key).and_then(|v| v.as_str()).is_some() {
+                        // explicit summary
+                    } else if key_hashes.get(key).and_then(|h| cache.get(h)).is_some() {
+                        cache_hits += 1;
+                    } else {
+                        missing.push(key.clone());
+                    }
                 }
             }
         }
         if !missing.is_empty() {
-            eprintln!("error: missing summaries for segments {missing:?} in {}", pos[1]);
-            return 1;
+            eprintln!("error: missing summaries for {missing:?} in {}", pos[1]);
+            return Err(1);
         }
     }
 
@@ -835,6 +1395,53 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
         .and_then(|v| v.as_str())
         .unwrap_or("claude-opus-4-7")
         .to_string();
+
+    // Shared builder for synthetic summary records (classic mode and budget-planned units).
+    let make_synthetic = |seg: &Segment, part: &[usize], key: &str, first: bool, summary: String| -> Value {
+        let ts = records[seg.user_idx]
+            .get("timestamp")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let mut covered: Vec<Value> = Vec::new();
+        if first {
+            if let Some(u) = rec_uuid(&records[seg.user_idx]) {
+                covered.push(Value::String(u.to_string()));
+            }
+        }
+        for &i in part {
+            if let Some(u) = rec_uuid(&records[i]) {
+                covered.push(Value::String(u.to_string()));
+            }
+        }
+        json!({
+            "parentUuid": Value::Null,            // fixed up in the rechain pass
+            "isSidechain": false,
+            "userType": "external",
+            "type": "assistant",
+            "uuid": uuid_v4(),
+            "timestamp": ts,
+            "sessionId": new_session,
+            "cwd": cwd,
+            "gitBranch": git_branch,
+            "version": version,
+            "recompactSynthetic": true,           // marks this as a compaction summary, not a real turn
+            "recompactProvenance": {
+                "source": src_abs,
+                "sourceSessionId": orig_session_id,
+                "part": key,
+                "coveredUuids": covered
+            },
+            "recompactIndex": segment_index(&records, part),
+            "message": {
+                "id": format!("msg_recompact_{}", uuid_v4().replace('-', "")),
+                "role": "assistant",
+                "model": model,
+                "type": "message",
+                "stop_reason": "end_turn",
+                "content": [{ "type": "text", "text": summary }]
+            }
+        })
+    };
 
     let mut out: Vec<Value> = Vec::new();
 
@@ -893,6 +1500,40 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
                     out.push(records[i].clone());
                 }
             }
+        } else if let Some(tr) = &treatments {
+            // Budget-planned emission: each unit gets exactly the treatment the plan chose.
+            for (p, part) in seg_parts[s].iter().enumerate() {
+                let key = &seg_keys[s][p];
+                match tr.get(key.as_str()).copied().unwrap_or(Treatment::Verbatim) {
+                    Treatment::Verbatim => {
+                        for &i in part {
+                            if drop_old_ledgers && truthy(&records[i], "recompactLedger") {
+                                continue;
+                            }
+                            if rec_uuid(&records[i]).is_some() {
+                                out.push(records[i].clone());
+                            }
+                        }
+                    }
+                    Treatment::Mask => {
+                        for &i in part {
+                            if drop_old_ledgers && truthy(&records[i], "recompactLedger") {
+                                continue;
+                            }
+                            if rec_uuid(&records[i]).is_some() {
+                                match mask_record(&records[i]) {
+                                    Masked::Unchanged => out.push(records[i].clone()),
+                                    Masked::Replaced(v) => out.push(v),
+                                    Masked::Dropped => {}
+                                }
+                            }
+                        }
+                    }
+                    Treatment::Summarize => {
+                        out.push(make_synthetic(seg, part, key, p == 0, get_summary(key).unwrap()));
+                    }
+                }
+            }
         } else if plans[s].needs_summary && mode == "mask" {
             // Mechanical lane: keep every record, elide stale tool-result payloads. Pairs stay
             // atomic (both halves kept), so the structure the Messages API validates is intact.
@@ -909,44 +1550,13 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
                 }
             }
         } else if plans[s].needs_summary {
-            let ts = records[seg.user_idx]
-                .get("timestamp")
-                .cloned()
-                .unwrap_or(Value::Null);
-            // Provenance makes the compaction reversible: the summary carries pointers to the
-            // exact raw records it replaced, so `rehydrate` (or any future agent) can recover the
-            // verbatim originals from the untouched source transcript.
-            let covered: Vec<Value> = std::iter::once(seg.user_idx)
-                .chain(seg.activity.iter().copied())
-                .filter_map(|i| rec_uuid(&records[i]).map(|u| Value::String(u.to_string())))
-                .collect();
-            out.push(json!({
-                "parentUuid": Value::Null,            // fixed up in the rechain pass
-                "isSidechain": false,
-                "userType": "external",
-                "type": "assistant",
-                "uuid": uuid_v4(),
-                "timestamp": ts,
-                "sessionId": new_session,
-                "cwd": cwd,
-                "gitBranch": git_branch,
-                "version": version,
-                "recompactSynthetic": true,           // marks this as a compaction summary, not a real turn
-                "recompactProvenance": {
-                    "source": src_abs,
-                    "sourceSessionId": orig_session_id,
-                    "coveredUuids": covered
-                },
-                "recompactIndex": segment_index(&records, seg),
-                "message": {
-                    "id": format!("msg_recompact_{}", uuid_v4().replace('-', "")),
-                    "role": "assistant",
-                    "model": model,
-                    "type": "message",
-                    "stop_reason": "end_turn",
-                    "content": [{ "type": "text", "text": get_summary(s).unwrap() }]
-                }
-            }));
+            // One synthetic record per part (oversized segments split at delegation seams), each
+            // carrying provenance to the exact raw records it replaced, so `rehydrate` (or any
+            // future agent) can recover the verbatim originals from the untouched source.
+            for (p, part) in seg_parts[s].iter().enumerate() {
+                let key = &seg_keys[s][p];
+                out.push(make_synthetic(seg, part, key, p == 0, get_summary(key).unwrap()));
+            }
         }
     }
 
@@ -1008,7 +1618,7 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
             "error: refusing to overwrite existing file {}",
             out_path.display()
         );
-        return 1;
+        return Err(1);
     }
     let mut f = match fs::OpenOptions::new()
         .write(true)
@@ -1018,13 +1628,13 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
         Ok(f) => f,
         Err(e) => {
             eprintln!("error: cannot create {}: {e}", out_path.display());
-            return 1;
+            return Err(1);
         }
     };
     for r in &out {
         if let Err(e) = writeln!(f, "{}", serde_json::to_string(r).unwrap()) {
             eprintln!("error: write failed: {e}");
-            return 1;
+            return Err(1);
         }
     }
 
@@ -1033,10 +1643,14 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
     drop(get_summary);
     if let Some(cp) = &cache_path {
         let mut cache = cache;
-        for (s, p) in plans.iter().enumerate() {
-            if p.needs_summary {
-                if let Some(text) = summaries.get(s.to_string()).and_then(|v| v.as_str()) {
-                    cache.insert(hashes[s].clone(), Value::String(text.to_string()));
+        for (s, pl) in plans.iter().enumerate() {
+            if pl.needs_summary {
+                for key in &seg_keys[s] {
+                    if let Some(text) = summaries.get(key).and_then(|v| v.as_str()) {
+                        if let Some(h) = key_hashes.get(key) {
+                            cache.insert(h.clone(), Value::String(text.to_string()));
+                        }
+                    }
                 }
             }
         }
@@ -1062,8 +1676,13 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
         new_session,
         out_path.display()
     );
-    println!("{new_session}"); // stdout: the new sessionId, for scripting / `claude --resume`
-    0
+    // Record lineage next to the sessions themselves, so resolution needs no global state.
+    if !orig_session_id.is_empty() {
+        if let Some(dir) = out_path.parent() {
+            lineage_record(dir, &orig_session_id, &new_session, &out_path);
+        }
+    }
+    Ok(Some((new_session, out_path)))
 }
 
 fn field_str(records: &[Value], key: &str) -> Value {
@@ -1108,6 +1727,293 @@ pub fn sanitize_tool_pairs(out: &mut Vec<Value>) {
         }
     }
     out.retain(|r| !r.get("__drop").and_then(|v| v.as_bool()).unwrap_or(false));
+}
+
+// ------------------------------------------------------------------- lineage, continue, resume, scan
+
+fn lineage_path_for(dir: &Path) -> PathBuf {
+    dir.join(".recompact-lineage.json")
+}
+
+fn lineage_load(dir: &Path) -> Map<String, Value> {
+    fs::read_to_string(lineage_path_for(dir))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record child -> parent lineage next to the session files themselves (create-new sidecar; no
+/// global state), so any process in the project can resolve "the newest compacted descendant".
+pub fn lineage_record(dir: &Path, parent: &str, child: &str, output: &Path) {
+    let mut m = lineage_load(dir);
+    m.insert(
+        child.to_string(),
+        json!({
+            "parent": parent,
+            "output": output.to_string_lossy(),
+            "at": now_secs(),
+        }),
+    );
+    if let Err(e) = fs::write(
+        lineage_path_for(dir),
+        serde_json::to_string_pretty(&Value::Object(m)).unwrap(),
+    ) {
+        eprintln!(
+            "warning: could not write lineage registry {}: {e}",
+            lineage_path_for(dir).display()
+        );
+    }
+}
+
+/// Remove a lineage entry (used when its output file is deleted, e.g. by the churn guard) so
+/// resolution can never route to a session that no longer exists.
+pub fn lineage_remove(dir: &Path, child: &str) {
+    let mut m = lineage_load(dir);
+    if m.remove(child).is_some() {
+        let _ = fs::write(
+            lineage_path_for(dir),
+            serde_json::to_string_pretty(&Value::Object(m)).unwrap(),
+        );
+    }
+}
+
+/// Follow the lineage from a session id to its newest compacted descendant. Returns the input id
+/// unchanged when it has no descendants (identity resolution keeps this composable).
+pub fn lineage_latest(dir: &Path, start: &str) -> String {
+    let m = lineage_load(dir);
+    let mut cur = start.to_string();
+    for _ in 0..1000 {
+        let next = m
+            .iter()
+            .filter(|(_, v)| v.get("parent").and_then(|p| p.as_str()) == Some(cur.as_str()))
+            .max_by_key(|(_, v)| v.get("at").and_then(|a| a.as_u64()).unwrap_or(0))
+            .map(|(k, _)| k.clone());
+        match next {
+            Some(n) if n != cur => cur = n,
+            _ => break,
+        }
+    }
+    cur
+}
+
+fn project_dir_from_cwd() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let munged: String = cwd
+        .to_string_lossy()
+        .chars()
+        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .collect();
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    Some(PathBuf::from(home).join(".claude/projects").join(munged))
+}
+
+/// Resolve a `<session.jsonl path | sessionId>` argument to (project dir, session id).
+fn resolve_session_arg(arg: &str) -> Result<(PathBuf, String), i32> {
+    let given = PathBuf::from(arg);
+    if given.exists() {
+        let dir = given
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .to_path_buf();
+        let id = given
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Ok((dir, id))
+    } else {
+        let Some(dir) = project_dir_from_cwd() else {
+            eprintln!("error: cannot derive the project dir from the cwd");
+            return Err(1);
+        };
+        if !dir.exists() {
+            eprintln!(
+                "error: {arg} is not a file, and no project dir exists at {}",
+                dir.display()
+            );
+            return Err(1);
+        }
+        Ok((dir, arg.to_string()))
+    }
+}
+
+/// Print the newest compacted descendant of a session — the id to `claude --resume`.
+pub fn cmd_resume(args: &[String]) -> i32 {
+    let (pos, _opts) = parse_opts(args);
+    if pos.is_empty() {
+        return usage();
+    }
+    let (dir, id) = match resolve_session_arg(&pos[0]) {
+        Ok(v) => v,
+        Err(rc) => return rc,
+    };
+    let latest = lineage_latest(&dir, &id);
+    eprintln!("resume with: claude --resume {latest}");
+    println!("{latest}");
+    0
+}
+
+/// The autonomous continuation step: resolve the newest descendant, and when it exceeds the token
+/// threshold, mask-compact it (zero LLM calls, budget-planned toward the threshold), verify, and
+/// print the id to resume. Under threshold, or when compaction cannot meaningfully reduce, prints
+/// the current id — so a driver loop can always do:
+///   ID=$(recompact continue "$ID"); claude -p --resume "$ID" "next step"
+pub fn cmd_continue(args: &[String]) -> i32 {
+    let (pos, opts) = parse_opts(args);
+    if pos.is_empty() {
+        return usage();
+    }
+    let threshold: usize = opts
+        .get("threshold")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60_000);
+    let (dir, start_id) = match resolve_session_arg(&pos[0]) {
+        Ok(v) => v,
+        Err(rc) => return rc,
+    };
+    let latest = lineage_latest(&dir, &start_id);
+    let latest_file = dir.join(format!("{latest}.jsonl"));
+    if !latest_file.exists() {
+        eprintln!("error: session file not found: {}", latest_file.display());
+        return 1;
+    }
+    let (active, _) = select_active(load_jsonl(&latest_file));
+    let tokens = approx_tokens(&active);
+    if tokens <= threshold {
+        eprintln!("continue: ~{tokens} tokens ≤ threshold {threshold}; nothing to compact");
+        println!("{latest}");
+        return 0;
+    }
+
+    let mut a_args: Vec<String> = vec![
+        latest_file.to_string_lossy().into_owned(),
+        "--mode".into(),
+        "mask".into(),
+        "--target".into(),
+        threshold.to_string(),
+    ];
+    for flag in ["keep", "split"] {
+        if let Some(v) = opts.get(flag).and_then(|v| v.as_str()) {
+            a_args.push(format!("--{flag}"));
+            a_args.push(v.to_string());
+        }
+    }
+    let (new_id, new_file) = match run_assemble(&a_args) {
+        Ok(Some(v)) => v,
+        Ok(None) => unreachable!("continue never passes --plan"),
+        Err(rc) => return rc,
+    };
+    let v = cmd_verify(&[
+        new_file.to_string_lossy().into_owned(),
+        "--source".into(),
+        latest_file.to_string_lossy().into_owned(),
+    ]);
+    if v != 0 {
+        let _ = fs::remove_file(&new_file);
+        lineage_remove(&dir, &new_id);
+        eprintln!(
+            "continue: verification FAILED; removed {} — resuming the previous id is safe",
+            new_file.display()
+        );
+        println!("{latest}");
+        return 1;
+    }
+    // Churn guard: a file that is already mostly incompressible must not spawn descendants every
+    // loop iteration.
+    let (na, _) = select_active(load_jsonl(&new_file));
+    let ntokens = approx_tokens(&na);
+    if ntokens * 100 >= tokens * 95 {
+        let _ = fs::remove_file(&new_file);
+        lineage_remove(&dir, &new_id);
+        eprintln!("continue: no meaningful reduction (~{tokens} → ~{ntokens}); keeping {latest}");
+        println!("{latest}");
+        return 0;
+    }
+    eprintln!("continue: ~{tokens} → ~{ntokens} tokens; resume with: claude --resume {new_id}");
+    println!("{new_id}");
+    0
+}
+
+/// Discovery: what is in this project dir, how big, how compressible, and which sessions are
+/// already compacted descendants of something else.
+pub fn cmd_scan(args: &[String]) -> i32 {
+    let (pos, _opts) = parse_opts(args);
+    let dir = match pos.first() {
+        Some(p) => PathBuf::from(p),
+        None => match project_dir_from_cwd() {
+            Some(d) => d,
+            None => {
+                eprintln!("error: cannot derive the project dir from the cwd");
+                return 1;
+            }
+        },
+    };
+    if !dir.is_dir() {
+        eprintln!("error: {} is not a directory", dir.display());
+        return 1;
+    }
+    let lineage = lineage_load(&dir);
+    let superseded: HashSet<&str> = lineage
+        .values()
+        .filter_map(|v| v.get("parent").and_then(|p| p.as_str()))
+        .collect();
+
+    let mut rows: Vec<(usize, usize, String)> = Vec::new(); // (active_tokens, mask_est, line)
+    let Ok(entries) = fs::read_dir(&dir) else {
+        eprintln!("error: cannot read {}", dir.display());
+        return 1;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let id = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let (active, _) = select_active(load_jsonl(&path));
+        let tokens = approx_tokens(&active);
+        let indices: Vec<usize> = (0..active.len()).collect();
+        let mask_est = mask_tokens_of(&active, &indices);
+        let genuine = active.iter().filter(|r| is_genuine_user(r)).count();
+        let delivered = active.iter().filter(|r| delivered_kind(r).is_some()).count();
+        let mut flags: Vec<&str> = Vec::new();
+        if active.iter().any(|r| truthy(r, "recompactSynthetic") || truthy(r, "recompactMasked")) {
+            flags.push("compacted");
+        }
+        if superseded.contains(id.as_str()) {
+            flags.push("superseded");
+        }
+        let line = format!(
+            "  {:<38} ~{:>8} tok  mask→~{:>8}  turns={:<3} delivered={:<3} {}",
+            truncate(&id, 38),
+            tokens,
+            mask_est,
+            genuine,
+            delivered,
+            flags.join(",")
+        );
+        rows.push((tokens, mask_est, line));
+    }
+    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    eprintln!("scan: {} ({} sessions)", dir.display(), rows.len());
+    for (_, _, line) in &rows {
+        eprintln!("{line}");
+    }
+    eprintln!("  (superseded sessions have a newer compacted descendant; `recompact resume <id>` resolves it)");
+    0
 }
 
 // ----------------------------------------------------------------------------------- subcommand: probe
@@ -1211,6 +2117,19 @@ pub fn cmd_probe(args: &[String]) -> i32 {
         off_path
     );
     eprintln!("  genuine user turns (active path): {genuine_users}");
+    let (mut teammate, mut notif) = (0usize, 0usize);
+    for r in &active {
+        match delivered_kind(r) {
+            Some("teammate_message") => teammate += 1,
+            Some("task_notification") => notif += 1,
+            _ => {}
+        }
+    }
+    if teammate + notif > 0 {
+        eprintln!(
+            "  delivered content (agent-authored, compressible): {teammate} teammate messages, {notif} task notifications"
+        );
+    }
 
     let mut warnings = 0;
     if !unknown_types.is_empty() {
