@@ -1804,13 +1804,18 @@ pub fn lineage_latest(dir: &Path, start: &str) -> String {
     cur
 }
 
+/// Claude Code names a project dir after the cwd with every non-alphanumeric character replaced
+/// by '-' (verified: `Sideshift_webapp` becomes `Sideshift-webapp`, `/.claude-worktrees/x`
+/// becomes `--claude-worktrees-x`).
+pub fn munge_project_path(path: &str) -> String {
+    path.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
 fn project_dir_from_cwd() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
-    let munged: String = cwd
-        .to_string_lossy()
-        .chars()
-        .map(|c| if c == '/' || c == '.' { '-' } else { c })
-        .collect();
+    let munged = munge_project_path(&cwd.to_string_lossy());
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()?;

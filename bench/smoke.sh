@@ -19,9 +19,10 @@ command -v jq >/dev/null || { echo "SKIP: jq not found"; exit 2; }
 
 note() { echo "[$1] $2"; }
 
-# Claude Code maps a session to a project dir derived from the cwd ('/' and '.' become '-').
-# A fresh dir under $HOME avoids the /var -> /private/var symlink mismatch mktemp would cause.
-project_dir_for() { echo "$HOME/.claude/projects/$(echo "$1" | sed 's/[\/.]/-/g')"; }
+# Claude Code maps a session to a project dir derived from the cwd (every non-alphanumeric
+# character becomes '-'). A fresh dir under $HOME avoids the /var -> /private/var symlink
+# mismatch mktemp would cause.
+project_dir_for() { echo "$HOME/.claude/projects/$(echo "$1" | sed 's/[^a-zA-Z0-9]/-/g')"; }
 
 cleanup_dirs=()
 cleanup() { for d in "${cleanup_dirs[@]:-}"; do rm -rf "$d"; done; }
