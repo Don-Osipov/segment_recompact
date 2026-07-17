@@ -76,6 +76,16 @@ a paper; a tool you run without thinking, and a lifecycle that lets a session li
       adopt the live head on exit (bridge-session ids), compact over threshold, respawn, with
       active goals surviving compaction and re-engaged by kick-prompt (both behaviors verified
       live before implementation). `--goal` arms a fresh goal; `--auto` for unattended cycling.
+- [x] Post-adoption verification: `verify` splits a twin at its assembly boundary (the first
+      last-prompt record) and checks the assembled prefix strictly, reporting post-resume growth
+      informationally; the `--source` fidelity check distinguishes trailing source growth the
+      assembly never saw (session teardown, continued use — tolerated with a note) from holes in
+      the middle of what it did see (still a hard failure), using kept + coveredUuids provenance
+      as the knowledge boundary. Found and fixed via live adoption of the tool on its own
+      build session.
+- [x] Rehydrate addressing matches provenance: selectors are a part key (exactly what
+      `recompactProvenance.part` advertises), a listing ordinal, or a covered record uuid
+      (returns that single verbatim record); unknown selectors list the known part keys.
 - [ ] Stop-hook / scheduled-job packaging for the continue loop (today it is a documented
       one-liner; a shipped hook config would make it turnkey).
 
