@@ -144,14 +144,11 @@ new sessionId into `ROLLBACK.md`.
 SRC=<session.jsonl>; NEW=~/.claude/projects/${PROJ}/<newId>.jsonl
 # 0. non-mutation: original byte-identical (it never opened for write, but prove it)
 md5sum "$SRC"   # compare against the value you captured pre-run
-# 1. structure: every line parses
-jq -e . "$NEW" >/dev/null && echo "json OK"
-# 2. one sessionId; chain root→leaf unbroken; ends on assistant/last-prompt, not mid-tool-call
-jq -r 'select(.sessionId)|.sessionId' "$NEW" | sort -u
-jq -rc '.type' "$NEW" | tail -3
-# 3. no dangling tool_use (see the validator pattern in this skill's notes / verify run)
-# 4. user turns preserved verbatim: the set of genuine user-turn texts must be identical
-for f in "$SRC" "$NEW"; do jq -rc 'select(.type=="user" and (.message.content|type=="array") and .message.content[0].type=="text" and (has("sourceToolAssistantUUID")|not) and (.isMeta!=true)) | .message.content[0].text' "$f" | md5sum; done
+# 1. structural checks + user-turn fidelity, all in one pass:
+#    single sessionId, linear parent chain, no dangling tool_use / orphan tool_result,
+#    usage stripped, last-prompt tail points at leaf, user turns identical to the
+#    source's ACTIVE PATH
+"${CLAUDE_PLUGIN_ROOT}/bin/recompact" verify "$NEW" --source "$SRC"
 ```
 
 Spot-check 2–3 summaries against the following user turn for fidelity. Report before/after token and
@@ -165,6 +162,12 @@ anything looks wrong, roll back per `ROLLBACK.md` (the new file is additive; del
 
 ## Notes
 
+- **Only the active path is processed.** Session files are trees: retries/rewinds leave abandoned
+  branches, and an auto-compaction starts a fresh chain root, leaving pre-boundary history
+  unreachable on resume. `extract` walks the leaf's parent chain and reports how many off-path
+  records it dropped — on a session that auto-compacted, most of the file can be off-path, which
+  is correct, not a bug. A segment carrying an `isCompactSummary` record is pinned verbatim
+  (never hand-summarized).
 - **Resume compatibility is empirically validated, not documented.** The output uses only normal
   record types (no reverse-engineered `compact_boundary`). Re-verify after a Claude Code version bump.
 - The synthetic summary record is tagged `recompactSynthetic: true` so a compacted session is
