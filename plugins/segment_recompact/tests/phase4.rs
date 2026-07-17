@@ -91,6 +91,18 @@ fn jsonl_count(dir: &PathBuf) -> usize {
 // ---------------------------------------------------------------------------------------- tests
 
 #[test]
+fn project_path_munging_matches_claude_code() {
+    assert_eq!(
+        munge_project_path("/Users/don/Documents/cs/sideshift/Sideshift_webapp"),
+        "-Users-don-Documents-cs-sideshift-Sideshift-webapp"
+    );
+    assert_eq!(
+        munge_project_path("/Users/don/x/.claude-worktrees/users-cone.v2"),
+        "-Users-don-x--claude-worktrees-users-cone-v2"
+    );
+}
+
+#[test]
 fn continue_under_threshold_is_identity() {
     let dir = tmp_dir();
     let src = write_compressible_session(&dir);
