@@ -24,9 +24,12 @@ recompact assemble  <session.jsonl> --mode mask [--keep K] [--out <path>]\n  \
 recompact verify    <assembled.jsonl> [--source <session.jsonl>]\n  \
 recompact probe     <session.jsonl>\n  \
 recompact rehydrate <compacted.jsonl> [ordinal]\n  \
-recompact continue  <session.jsonl | sessionId> [--threshold T] [--keep K]\n  \
+recompact continue  <session.jsonl | sessionId> [--threshold T] [--keep K]\n                      \
+[--summarize-with M [--escalate-with M2] [--escalate-above S]]\n  \
+recompact shell     [sessionId] [--threshold T] [--goal G] [--auto]\n                      \
+[--summarize-with M ...] (continuous self-compacting session)\n  \
 recompact resume    <session.jsonl | sessionId>\n  \
-recompact scan      [project-dir]\n\n\
+recompact scan      [project-dir] [--estimate]\n\n\
   --keep K       number of most-recent segments kept verbatim (default 1)\n  \
   --mode mask    no-LLM compaction: keep every record, replace old tool-result\n                 \
 payloads with placeholders (errors kept verbatim, head+tail)\n  \
@@ -467,7 +470,7 @@ fn last_prompt_text(records: &[Value]) -> Option<String> {
 // --------------------------------------------------------------------------------- arg plumbing
 
 pub fn parse_opts(args: &[String]) -> (Vec<String>, Map<String, Value>) {
-    const FLAGS: &[&str] = &["plan"]; // boolean flags take no value
+    const FLAGS: &[&str] = &["plan", "auto", "estimate"]; // boolean flags take no value
     let mut positional = Vec::new();
     let mut opts = Map::new();
     let mut i = 0;
@@ -655,7 +658,12 @@ pub fn plan_budget(
         let mut best: Option<(usize, Treatment, usize, f32)> = None; // (idx, next, savings, score)
         for (i, u) in units.iter().enumerate() {
             let next = match u.treatment {
-                Treatment::Verbatim => Treatment::Mask,
+                // Pure-prose units mask to zero savings; they may skip straight to Summarize,
+                // or the ladder would strand them at Verbatim forever.
+                Treatment::Verbatim if u.cost[1] < u.cost[0] => Treatment::Mask,
+                Treatment::Verbatim if allow_summarize && u.floor != "error" => {
+                    Treatment::Summarize
+                }
                 Treatment::Mask if allow_summarize && u.floor != "error" => Treatment::Summarize,
                 _ => continue,
             };
@@ -1868,57 +1876,523 @@ pub fn cmd_resume(args: &[String]) -> i32 {
     0
 }
 
-/// The autonomous continuation step: resolve the newest descendant, and when it exceeds the token
-/// threshold, mask-compact it (zero LLM calls, budget-planned toward the threshold), verify, and
-/// print the id to resume. Under threshold, or when compaction cannot meaningfully reduce, prints
-/// the current id — so a driver loop can always do:
-///   ID=$(recompact continue "$ID"); claude -p --resume "$ID" "next step"
-pub fn cmd_continue(args: &[String]) -> i32 {
-    let (pos, opts) = parse_opts(args);
-    if pos.is_empty() {
-        return usage();
+/// Newest session file in a project dir. Interactive resumes mint a new bridge-session id
+/// (verified live), so after an interactive stint the live head must be re-discovered from disk
+/// rather than assumed stable.
+pub fn newest_session(dir: &Path) -> Option<String> {
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    let entries = fs::read_dir(dir).ok()?;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let Ok(md) = e.metadata() else { continue };
+        let Ok(t) = md.modified() else { continue };
+        if best.as_ref().map_or(true, |(bt, _)| t > *bt) {
+            best = Some((t, stem));
+        }
     }
-    let threshold: usize = opts
-        .get("threshold")
+    best.map(|(_, id)| id)
+}
+
+/// Does the transcript carry an active goal? The goal evaluator writes a goal_status attachment
+/// after each turn; the latest one's `met` flag is the live state (verified empirically: this is
+/// where goal state persists, and it survives both resume and compaction). Resume does NOT start
+/// a turn on its own, so an active goal needs a kick-prompt to re-engage.
+pub fn has_active_goal(records: &[Value]) -> bool {
+    records
+        .iter()
+        .rev()
+        .find_map(|r| {
+            if r.pointer("/attachment/type").and_then(|v| v.as_str()) == Some("goal_status") {
+                Some(
+                    r.pointer("/attachment/met")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true),
+                )
+            } else {
+                None
+            }
+        })
+        .map(|met| !met)
+        .unwrap_or(false)
+}
+
+// --------------------------------------------------------------------------- headless summarizer
+
+/// Units (segments split into parts) with keys and content hashes: the shared shape the planner,
+/// cache, and summarizer all key on.
+pub struct Units {
+    pub segs: Vec<Segment>,
+    pub plans: Vec<SegPlan>,
+    pub seg_parts: Vec<Vec<Vec<usize>>>,
+    pub seg_keys: Vec<Vec<String>>,
+    pub key_hashes: HashMap<String, String>,
+}
+
+pub fn build_units(records: &[Value], keep: usize, split: usize) -> Units {
+    let (_, segs) = segment(records);
+    let plans = plan(records, &segs, keep);
+    let seg_parts: Vec<Vec<Vec<usize>>> = segs
+        .iter()
+        .map(|sg| split_parts(records, sg, split))
+        .collect();
+    let mut key_hashes = HashMap::new();
+    let mut seg_keys = Vec::new();
+    for (s, seg) in segs.iter().enumerate() {
+        let parts = &seg_parts[s];
+        let is_split = parts.len() > 1;
+        let mut keys = Vec::new();
+        for (p, part) in parts.iter().enumerate() {
+            let key = if is_split { format!("{s}.{p}") } else { s.to_string() };
+            key_hashes.insert(key.clone(), part_content_hash(records, seg, part, p == 0));
+            keys.push(key);
+        }
+        seg_keys.push(keys);
+    }
+    Units {
+        segs,
+        plans,
+        seg_parts,
+        seg_keys,
+        key_hashes,
+    }
+}
+
+pub const DIGEST_CAP: usize = 8000;
+
+/// Compact text rendering of one unit for the headless summarizer: the user ask plus the
+/// mechanically pre-elided activity, dense enough for a cheap model to write a faithful recap.
+pub fn unit_digest(records: &[Value], seg: &Segment, part: &[usize]) -> String {
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+    for &i in &seg.activity {
+        if let Some(blocks) = records[i]
+            .pointer("/message/content")
+            .and_then(|c| c.as_array())
+        {
+            for b in blocks {
+                if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                    if let (Some(id), Some(name)) = (
+                        b.get("id").and_then(|v| v.as_str()),
+                        b.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        tool_names.insert(id.to_string(), name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut lines = vec![format!(
+        "USER ASKED: {}",
+        truncate(&user_text(&records[seg.user_idx]), 600)
+    )];
+    for &i in part {
+        for a in render_record(&records[i], &tool_names, &mut seen) {
+            let kind = a["kind"].as_str().unwrap_or("");
+            let line = match kind {
+                "assistant_text" => Some(format!(
+                    "ASSISTANT: {}",
+                    truncate(a["text"].as_str().unwrap_or(""), 900)
+                )),
+                "tool_use" => Some(format!(
+                    "TOOL {} {}",
+                    a["name"].as_str().unwrap_or("?"),
+                    truncate(&a["input"].to_string(), 150)
+                )),
+                "tool_result" => Some(format!(
+                    "RESULT[{},{}]: {}",
+                    a["status"].as_str().unwrap_or("?"),
+                    a["chars"].as_u64().unwrap_or(0),
+                    truncate(a["result"].as_str().unwrap_or(""), 250)
+                )),
+                "delivered_message" => Some(format!(
+                    "AGENT-REPORT({}): {}",
+                    a["delivered"].as_str().unwrap_or("?"),
+                    truncate(a["text"].as_str().unwrap_or(""), 700)
+                )),
+                "compact_summary" => Some(format!(
+                    "COMPACT-SUMMARY: {}",
+                    truncate(a["text"].as_str().unwrap_or(""), 400)
+                )),
+                "system" => Some(format!(
+                    "SYSTEM: {}",
+                    truncate(a["text"].as_str().unwrap_or(""), 200)
+                )),
+                _ => None,
+            };
+            if let Some(l) = line {
+                lines.push(l);
+            }
+        }
+    }
+    truncate(&lines.join("\n"), DIGEST_CAP)
+}
+
+pub const SUMMARIZER_RUBRIC: &str = "You are compacting a Claude Code session transcript. For EACH unit below, write the replacement summary in first person past tense, as the assistant's own recap. Preserve exactly: decisions and their reasons, rejected approaches, discovered values/names/numbers/ids (quote them verbatim), errors and their outcomes, file paths. State success only where the activity shows it verified; mark observed-but-unverified as such. 3 to 6 sentences per unit. Return ONLY a JSON object mapping each unit key to its summary string.";
+
+const BATCH_MAX_UNITS: usize = 10;
+const BATCH_MAX_CHARS: usize = 120_000;
+const SUMMARIZE_WAVES: usize = 3;
+
+pub struct SummarizeCfg {
+    pub bin: String,
+    pub model: String,
+    pub escalate_with: Option<String>,
+    pub escalate_above: f32,
+}
+
+struct BatchJob {
+    model: String,
+    keys: Vec<String>,
+    prompt: String,
+}
+
+/// One headless call, run from an empty temp cwd with no MCP servers so per-call overhead is a
+/// few seconds and zero side processes (the naive per-unit version from the prototype spawned a
+/// project's whole MCP fleet per call).
+fn call_claude_stdin(bin: &str, model: &str, prompt: &str) -> Result<String, String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let tmp = std::env::temp_dir().join(format!("recompact-sum-{}", uuid_v4()));
+    let _ = fs::create_dir_all(&tmp);
+    let mut child = Command::new(bin)
+        .current_dir(&tmp)
+        .args(["-p", "--model", model, "--strict-mcp-config"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("cannot spawn {bin}: {e}"))?;
+    {
+        let mut stdin = child.stdin.take().expect("piped stdin");
+        stdin
+            .write_all(prompt.as_bytes())
+            .map_err(|e| e.to_string())?;
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let _ = fs::remove_dir_all(&tmp);
+    if !out.status.success() {
+        return Err(format!("{bin} exited {}", out.status));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn extract_json_object(s: &str) -> Option<Map<String, Value>> {
+    let start = s.find('{')?;
+    let end = s.rfind('}')?;
+    serde_json::from_str::<Value>(&s[start..=end])
+        .ok()?
+        .as_object()
+        .cloned()
+}
+
+fn batch_prompt(keys: &[String], body: &str) -> String {
+    format!(
+        "{SUMMARIZER_RUBRIC}\nThe JSON keys must be exactly {} — the bare identifiers, nothing else.\n{body}",
+        serde_json::to_string(keys).unwrap_or_default()
+    )
+}
+
+fn make_batches(units: &[&(String, f32, String)], model: &str) -> Vec<BatchJob> {
+    let mut jobs = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
+    let mut body = String::new();
+    for (k, _, d) in units {
+        let block = format!("\n### UNIT {k}\n{d}\n");
+        if !keys.is_empty()
+            && (keys.len() >= BATCH_MAX_UNITS || body.len() + block.len() > BATCH_MAX_CHARS)
+        {
+            let prompt = batch_prompt(&keys, &body);
+            jobs.push(BatchJob {
+                model: model.to_string(),
+                keys: std::mem::take(&mut keys),
+                prompt,
+            });
+            body.clear();
+        }
+        keys.push(k.clone());
+        body.push_str(&block);
+    }
+    if !keys.is_empty() {
+        let prompt = batch_prompt(&keys, &body);
+        jobs.push(BatchJob {
+            model: model.to_string(),
+            keys,
+            prompt,
+        });
+    }
+    jobs
+}
+
+/// Models sometimes echo the marker into the key ("UNIT 3.1" for "3.1"); match tolerantly.
+fn lookup_summary<'a>(obj: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
+    if let Some(s) = obj.get(k).and_then(|v| v.as_str()) {
+        return Some(s);
+    }
+    for (name, v) in obj {
+        let t = name.trim().trim_start_matches('#').trim();
+        let t = t
+            .strip_prefix("UNIT")
+            .or_else(|| t.strip_prefix("unit"))
+            .map(str::trim)
+            .unwrap_or(t);
+        if t == k {
+            return v.as_str();
+        }
+    }
+    None
+}
+
+/// Summarize (key, salience, digest) units headlessly: contiguous batches so consecutive units
+/// share narrative context, salience-routed escalation to a stronger model for decision-bearing
+/// units, waves of concurrent calls, one retry round for stragglers. Returns key -> summary.
+pub fn headless_summarize(
+    units: &[(String, f32, String)],
+    cfg: &SummarizeCfg,
+) -> Result<HashMap<String, String>, String> {
+    let mut result: HashMap<String, String> = HashMap::new();
+    for _round in 0..2 {
+        let remaining: Vec<&(String, f32, String)> = units
+            .iter()
+            .filter(|(k, _, _)| !result.contains_key(k))
+            .collect();
+        if remaining.is_empty() {
+            break;
+        }
+        let mut hot: Vec<&(String, f32, String)> = Vec::new();
+        let mut cold: Vec<&(String, f32, String)> = Vec::new();
+        for &u in &remaining {
+            if cfg.escalate_with.is_some() && u.1 >= cfg.escalate_above {
+                hot.push(u);
+            } else {
+                cold.push(u);
+            }
+        }
+        let mut jobs = make_batches(&cold, &cfg.model);
+        jobs.extend(make_batches(
+            &hot,
+            cfg.escalate_with.as_deref().unwrap_or(&cfg.model),
+        ));
+        for wave in jobs.chunks(SUMMARIZE_WAVES) {
+            let outs: Vec<(Vec<String>, Result<String, String>)> = std::thread::scope(|sc| {
+                let handles: Vec<_> = wave
+                    .iter()
+                    .map(|j| {
+                        let bin = cfg.bin.clone();
+                        let model = j.model.clone();
+                        let prompt = j.prompt.clone();
+                        let keys = j.keys.clone();
+                        sc.spawn(move || (keys, call_claude_stdin(&bin, &model, &prompt)))
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            for (keys, out) in outs {
+                match out {
+                    Ok(text) => {
+                        if let Some(obj) = extract_json_object(&text) {
+                            for k in keys {
+                                if let Some(s) = lookup_summary(&obj, &k) {
+                                    if !s.trim().is_empty() {
+                                        result.insert(k, s.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => eprintln!("summarize: batch failed: {e}"),
+                }
+            }
+        }
+    }
+    let missing: Vec<&str> = units
+        .iter()
+        .map(|(k, _, _)| k.as_str())
+        .filter(|k| !result.contains_key(*k))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!("missing summaries after retry: {missing:?}"));
+    }
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------- continue (shared core)
+
+pub struct ContinueOpts {
+    pub threshold: usize,
+    pub keep: Option<String>,
+    pub split: Option<String>,
+    pub summarize: Option<SummarizeCfg>,
+}
+
+pub fn summarize_cfg_from_opts(opts: &Map<String, Value>) -> Option<SummarizeCfg> {
+    opts.get("summarize-with")
         .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(60_000);
-    let (dir, start_id) = match resolve_session_arg(&pos[0]) {
-        Ok(v) => v,
-        Err(rc) => return rc,
-    };
-    let latest = lineage_latest(&dir, &start_id);
+        .map(|m| SummarizeCfg {
+            bin: opts
+                .get("claude-bin")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| std::env::var("RECOMPACT_CLAUDE_BIN").ok())
+                .unwrap_or_else(|| "claude".into()),
+            model: m.to_string(),
+            escalate_with: opts
+                .get("escalate-with")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            escalate_above: opts
+                .get("escalate-above")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.4),
+        })
+}
+
+/// Core continuation step, shared by `continue` and `shell`: resolve the newest compacted
+/// descendant; when over threshold, compact toward it (mask-only, or the full ladder when a
+/// summarizer is configured: plan, summarize the missing units headlessly into the per-project
+/// cache, assemble); verify with rollback; churn-guard. Always returns a resumable id, plus an
+/// exit code for the CLI.
+pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String, i32) {
+    let latest = lineage_latest(dir, start_id);
     let latest_file = dir.join(format!("{latest}.jsonl"));
     if !latest_file.exists() {
         eprintln!("error: session file not found: {}", latest_file.display());
-        return 1;
+        return (start_id.to_string(), 1);
     }
     let (active, _) = select_active(load_jsonl(&latest_file));
     let tokens = approx_tokens(&active);
-    if tokens <= threshold {
-        eprintln!("continue: ~{tokens} tokens ≤ threshold {threshold}; nothing to compact");
-        println!("{latest}");
-        return 0;
+    if tokens <= o.threshold {
+        eprintln!(
+            "continue: ~{tokens} tokens ≤ threshold {}; nothing to compact",
+            o.threshold
+        );
+        return (latest, 0);
+    }
+    let keep: usize = o.keep.as_deref().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let split: usize = o
+        .split
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SPLIT_THRESHOLD);
+    let cache_path = dir.join(".recompact-summary-cache.json");
+
+    // Full-ladder pre-pass: find the units the budget plan wants summarized, fill the cache.
+    let mut sums_path: Option<PathBuf> = None;
+    if let Some(cfg) = &o.summarize {
+        let u = build_units(&active, keep, split);
+        let cache: Map<String, Value> = fs::read_to_string(&cache_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        let b = plan_budget(
+            &active,
+            &u.segs,
+            &u.plans,
+            &u.seg_parts,
+            &u.seg_keys,
+            o.threshold,
+            true,
+            |key| {
+                u.key_hashes
+                    .get(key)
+                    .and_then(|h| cache.get(h))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.len() / 4 + 60)
+            },
+        );
+        let mut work: Vec<(String, f32, String)> = Vec::new();
+        for unit in &b.units {
+            if unit.treatment == Treatment::Summarize {
+                let h = &u.key_hashes[&unit.key];
+                if !cache.contains_key(h) {
+                    let p: usize = unit
+                        .key
+                        .split('.')
+                        .nth(1)
+                        .and_then(|x| x.parse().ok())
+                        .unwrap_or(0);
+                    let seg = &u.segs[unit.seg];
+                    let part = &u.seg_parts[unit.seg][p];
+                    work.push((
+                        unit.key.clone(),
+                        unit.salience,
+                        unit_digest(&active, seg, part),
+                    ));
+                }
+            }
+        }
+        if !work.is_empty() {
+            eprintln!(
+                "continue: summarizing {} unit(s) with {}{}",
+                work.len(),
+                cfg.model,
+                cfg.escalate_with
+                    .as_deref()
+                    .map(|m| format!(" (escalating salience ≥ {} to {m})", cfg.escalate_above))
+                    .unwrap_or_default()
+            );
+            let sums = match headless_summarize(&work, cfg) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("continue: summarize failed: {e}");
+                    return (latest, 1);
+                }
+            };
+            let mut cache = cache;
+            for (k, text) in &sums {
+                if let Some(h) = u.key_hashes.get(k) {
+                    cache.insert(h.clone(), Value::String(text.clone()));
+                }
+            }
+            if fs::write(
+                &cache_path,
+                serde_json::to_string_pretty(&Value::Object(cache)).unwrap(),
+            )
+            .is_err()
+            {
+                eprintln!("continue: cannot write summary cache");
+                return (latest, 1);
+            }
+        }
+        let sp = std::env::temp_dir().join(format!("recompact-empty-{}.json", uuid_v4()));
+        let _ = fs::write(&sp, "{}");
+        sums_path = Some(sp);
     }
 
-    let mut a_args: Vec<String> = vec![
-        latest_file.to_string_lossy().into_owned(),
-        "--mode".into(),
-        "mask".into(),
-        "--target".into(),
-        threshold.to_string(),
-    ];
-    for flag in ["keep", "split"] {
-        if let Some(v) = opts.get(flag).and_then(|v| v.as_str()) {
+    let mut a_args: Vec<String> = vec![latest_file.to_string_lossy().into_owned()];
+    if let Some(sp) = &sums_path {
+        a_args.push(sp.to_string_lossy().into_owned());
+        a_args.push("--mode".into());
+        a_args.push("summarize".into());
+        a_args.push("--cache".into());
+        a_args.push(cache_path.to_string_lossy().into_owned());
+    } else {
+        a_args.push("--mode".into());
+        a_args.push("mask".into());
+    }
+    a_args.push("--target".into());
+    a_args.push(o.threshold.to_string());
+    for (flag, v) in [("keep", &o.keep), ("split", &o.split)] {
+        if let Some(v) = v {
             a_args.push(format!("--{flag}"));
-            a_args.push(v.to_string());
+            a_args.push(v.clone());
         }
     }
     let (new_id, new_file) = match run_assemble(&a_args) {
         Ok(Some(v)) => v,
         Ok(None) => unreachable!("continue never passes --plan"),
-        Err(rc) => return rc,
+        Err(rc) => return (latest, rc),
     };
+    if let Some(sp) = &sums_path {
+        let _ = fs::remove_file(sp);
+    }
     let v = cmd_verify(&[
         new_file.to_string_lossy().into_owned(),
         "--source".into(),
@@ -1926,13 +2400,12 @@ pub fn cmd_continue(args: &[String]) -> i32 {
     ]);
     if v != 0 {
         let _ = fs::remove_file(&new_file);
-        lineage_remove(&dir, &new_id);
+        lineage_remove(dir, &new_id);
         eprintln!(
             "continue: verification FAILED; removed {} — resuming the previous id is safe",
             new_file.display()
         );
-        println!("{latest}");
-        return 1;
+        return (latest, 1);
     }
     // Churn guard: a file that is already mostly incompressible must not spawn descendants every
     // loop iteration.
@@ -1940,20 +2413,159 @@ pub fn cmd_continue(args: &[String]) -> i32 {
     let ntokens = approx_tokens(&na);
     if ntokens * 100 >= tokens * 95 {
         let _ = fs::remove_file(&new_file);
-        lineage_remove(&dir, &new_id);
+        lineage_remove(dir, &new_id);
         eprintln!("continue: no meaningful reduction (~{tokens} → ~{ntokens}); keeping {latest}");
-        println!("{latest}");
-        return 0;
+        return (latest, 0);
     }
     eprintln!("continue: ~{tokens} → ~{ntokens} tokens; resume with: claude --resume {new_id}");
-    println!("{new_id}");
+    (new_id, 0)
+}
+
+/// The autonomous continuation step, CLI form. Stdout is always a resumable id, so a driver loop
+/// can do: ID=$(recompact continue "$ID"); claude -p --resume "$ID" "next step".
+pub fn cmd_continue(args: &[String]) -> i32 {
+    let (pos, opts) = parse_opts(args);
+    if pos.is_empty() {
+        return usage();
+    }
+    let (dir, start_id) = match resolve_session_arg(&pos[0]) {
+        Ok(v) => v,
+        Err(rc) => return rc,
+    };
+    let o = ContinueOpts {
+        threshold: opts
+            .get("threshold")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60_000),
+        keep: opts.get("keep").and_then(|v| v.as_str()).map(String::from),
+        split: opts.get("split").and_then(|v| v.as_str()).map(String::from),
+        summarize: summarize_cfg_from_opts(&opts),
+    };
+    let (id, rc) = continue_session(&dir, &start_id, &o);
+    println!("{id}");
+    rc
+}
+
+// ----------------------------------------------------------------------------- subcommand: shell
+
+/// One continuous self-compacting session at the terminal: spawn claude interactively (inherited
+/// stdio), and when it exits, adopt the live head (interactive resume mints new bridge ids),
+/// compact if over threshold, and respawn. An active goal is re-engaged with a kick-prompt (a
+/// resumed goal does not start a turn on its own); --goal arms one on the first spawn.
+pub fn cmd_shell(args: &[String]) -> i32 {
+    let (pos, opts) = parse_opts(args);
+    let dir = match opts.get("dir").and_then(|v| v.as_str()) {
+        Some(d) => PathBuf::from(d),
+        None => match project_dir_from_cwd() {
+            Some(d) => d,
+            None => {
+                eprintln!("error: cannot derive the project dir from the cwd");
+                return 1;
+            }
+        },
+    };
+    let _ = fs::create_dir_all(&dir);
+    let mut id: Option<String> = pos.first().cloned();
+    let auto = opts.get("auto").and_then(|v| v.as_bool()).unwrap_or(false);
+    let max_cycles: usize = opts
+        .get("max-cycles")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let goal = opts.get("goal").and_then(|v| v.as_str()).map(String::from);
+    let kick = opts
+        .get("kick")
+        .and_then(|v| v.as_str())
+        .unwrap_or("continue")
+        .to_string();
+    let bin = opts
+        .get("claude-bin")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| std::env::var("RECOMPACT_CLAUDE_BIN").ok())
+        .unwrap_or_else(|| "claude".into());
+    let copts = ContinueOpts {
+        threshold: opts
+            .get("threshold")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60_000),
+        keep: opts.get("keep").and_then(|v| v.as_str()).map(String::from),
+        split: opts.get("split").and_then(|v| v.as_str()).map(String::from),
+        summarize: summarize_cfg_from_opts(&opts),
+    };
+    let mut first = true;
+    let mut cycles = 0usize;
+    loop {
+        cycles += 1;
+        if max_cycles > 0 && cycles > max_cycles {
+            break;
+        }
+        let mut cmd = std::process::Command::new(&bin);
+        if let Some(cur) = id.clone() {
+            let (next, rc) = continue_session(&dir, &cur, &copts);
+            if rc != 0 {
+                eprintln!("shell: continue reported an error; resuming {next}");
+            } else if next != cur {
+                eprintln!("shell: compacted {cur} -> {next}");
+            }
+            id = Some(next.clone());
+            cmd.arg("--resume").arg(&next);
+            if first && goal.is_some() {
+                cmd.arg(format!("/goal {}", goal.clone().unwrap()));
+            } else if has_active_goal(&load_jsonl(&dir.join(format!("{next}.jsonl")))) {
+                cmd.arg(&kick);
+            }
+        } else if let Some(g) = &goal {
+            cmd.arg(format!("/goal {g}"));
+        }
+        first = false;
+        match cmd.status() {
+            Ok(st) => {
+                if !st.success() {
+                    eprintln!("shell: claude exited with {st}");
+                }
+            }
+            Err(e) => {
+                eprintln!("shell: cannot spawn {bin}: {e}");
+                return 1;
+            }
+        }
+        if let Some(live) = newest_session(&dir) {
+            if id.as_deref() != Some(live.as_str()) {
+                eprintln!(
+                    "shell: live head moved {} -> {live}",
+                    id.as_deref().unwrap_or("<none>")
+                );
+                id = Some(live);
+            }
+        }
+        if !auto {
+            eprintln!(
+                "shell: session {} ended. Enter = compact+respawn, q = quit",
+                id.as_deref().unwrap_or("<none>")
+            );
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                break;
+            }
+            if line.trim() == "q" {
+                break;
+            }
+        }
+    }
+    if let Some(i) = &id {
+        println!("{i}");
+    }
     0
 }
 
 /// Discovery: what is in this project dir, how big, how compressible, and which sessions are
 /// already compacted descendants of something else.
 pub fn cmd_scan(args: &[String]) -> i32 {
-    let (pos, _opts) = parse_opts(args);
+    let (pos, opts) = parse_opts(args);
+    let estimate = opts.get("estimate").and_then(|v| v.as_bool()).unwrap_or(false);
     let dir = match pos.first() {
         Some(p) => PathBuf::from(p),
         None => match project_dir_from_cwd() {
@@ -1974,7 +2586,7 @@ pub fn cmd_scan(args: &[String]) -> i32 {
         .filter_map(|v| v.get("parent").and_then(|p| p.as_str()))
         .collect();
 
-    let mut rows: Vec<(usize, usize, String)> = Vec::new(); // (active_tokens, mask_est, line)
+    let mut rows: Vec<(usize, String)> = Vec::new(); // (active_tokens, line)
     let Ok(entries) = fs::read_dir(&dir) else {
         eprintln!("error: cannot read {}", dir.display());
         return 1;
@@ -1990,8 +2602,14 @@ pub fn cmd_scan(args: &[String]) -> i32 {
             .unwrap_or_default();
         let (active, _) = select_active(load_jsonl(&path));
         let tokens = approx_tokens(&active);
-        let indices: Vec<usize> = (0..active.len()).collect();
-        let mask_est = mask_tokens_of(&active, &indices);
+        // The mask estimate re-serializes every record; on big projects that is the slow part,
+        // so it is opt-in via --estimate.
+        let mask_est = if estimate {
+            let indices: Vec<usize> = (0..active.len()).collect();
+            format!("{:>8}", mask_tokens_of(&active, &indices))
+        } else {
+            "       -".to_string()
+        };
         let genuine = active.iter().filter(|r| is_genuine_user(r)).count();
         let delivered = active.iter().filter(|r| delivered_kind(r).is_some()).count();
         let mut flags: Vec<&str> = Vec::new();
@@ -2002,7 +2620,7 @@ pub fn cmd_scan(args: &[String]) -> i32 {
             flags.push("superseded");
         }
         let line = format!(
-            "  {:<38} ~{:>8} tok  mask→~{:>8}  turns={:<3} delivered={:<3} {}",
+            "  {:<38} ~{:>8} tok  mask→~{}  turns={:<3} delivered={:<3} {}",
             truncate(&id, 38),
             tokens,
             mask_est,
@@ -2010,11 +2628,11 @@ pub fn cmd_scan(args: &[String]) -> i32 {
             delivered,
             flags.join(",")
         );
-        rows.push((tokens, mask_est, line));
+        rows.push((tokens, line));
     }
     rows.sort_by(|a, b| b.0.cmp(&a.0));
     eprintln!("scan: {} ({} sessions)", dir.display(), rows.len());
-    for (_, _, line) in &rows {
+    for (_, line) in &rows {
         eprintln!("{line}");
     }
     eprintln!("  (superseded sessions have a newer compacted descendant; `recompact resume <id>` resolves it)");

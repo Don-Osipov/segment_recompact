@@ -66,10 +66,18 @@ a paper; a tool you run without thinking, and a lifecycle that lets a session li
 - [ ] Promotion pass: durable facts flow to companion documents at each boundary; the resume seam
       restates the last ask and instructs verification of load-bearing claims against live
       reality.
+- [x] Summarize-mode automation: `continue --summarize-with <model>` runs the full ladder
+      autonomously — the budget planner picks the units masking cannot shrink, a headless
+      summarizer fills them in contiguous batches (no MCP servers, content-hash cached, tolerant
+      key matching), with `--escalate-with`/`--escalate-above` routing high-salience units to a
+      stronger model. Live-verified against real haiku on a prose-heavy session masking could
+      not reduce.
+- [x] `recompact shell`: one continuous session at the terminal — spawn interactive claude,
+      adopt the live head on exit (bridge-session ids), compact over threshold, respawn, with
+      active goals surviving compaction and re-engaged by kick-prompt (both behaviors verified
+      live before implementation). `--goal` arms a fresh goal; `--auto` for unattended cycling.
 - [ ] Stop-hook / scheduled-job packaging for the continue loop (today it is a documented
       one-liner; a shipped hook config would make it turnkey).
-- [ ] Summarize-mode automation for the loop: today the autonomous path is mask-only; a headless
-      summarizer pass (cheap model, hardened rubric) would let the loop use the full ladder.
 
 ## Track C: confidence
 

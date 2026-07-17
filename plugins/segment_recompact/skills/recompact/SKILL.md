@@ -201,10 +201,38 @@ while more_work_remains; do
 done
 ```
 
-The same one-liner works as a Stop hook or a scheduled job. `recompact resume <id>` does the
-lineage resolution alone (prints the newest descendant without compacting), and
-`recompact scan [dir]` lists a project's sessions with sizes, mask estimates, and which are
-superseded by a compacted descendant.
+The same one-liner works as a Stop hook or a scheduled job. Mask-only compaction has a floor:
+prose-heavy sessions (research, long discussions, delegated-agent reports) may stay above the
+resume window. Add a summarizer and the loop gets the full ladder:
+
+```bash
+recompact continue <id> --threshold 60000 --summarize-with haiku \
+  [--escalate-with sonnet --escalate-above 0.4]
+```
+
+The budget planner decides which units masking cannot shrink; those are summarized headlessly in
+contiguous batches (about 10 units per call, run from an empty directory with no MCP servers, so
+calls are cheap and spawn nothing), under the same epistemic rubric as manual summaries, cached
+by content hash so repeat passes only pay for new material. `--escalate-with` routes
+high-salience units (errors, corrections, decision-bearing) to a stronger model.
+
+`recompact resume <id>` does the lineage resolution alone (prints the newest descendant without
+compacting), and `recompact scan [dir]` lists a project's sessions (add `--estimate` for mask
+estimates; the default stays fast).
+
+### recompact shell — one continuous session at the terminal
+
+```bash
+recompact shell [sessionId] [--threshold 60000] [--goal "condition"] [--summarize-with haiku]
+```
+
+`shell` wraps the interactive CLI in the continue loop: it spawns `claude --resume` with your
+terminal attached, and each time the session exits it adopts the live head (interactive resume
+mints a new bridge-session id), compacts if over threshold, and respawns. An active `/goal`
+survives compaction (goal state lives in goal_status records and is preserved) and is re-engaged
+automatically with a kick-prompt, because a resumed goal does not start a turn on its own.
+`--goal` arms one on the first spawn; `--auto` cycles without the confirmation prompt. From the
+chair it is one session that never fills up.
 
 ### Step 4 — Assemble
 
