@@ -23,7 +23,7 @@ recompact assemble  <session.jsonl> <summaries.json> [--keep K] [--out <path>]\n
 recompact assemble  <session.jsonl> --mode mask [--keep K] [--out <path>]\n  \
 recompact verify    <assembled.jsonl> [--source <session.jsonl>]\n  \
 recompact probe     <session.jsonl>\n  \
-recompact rehydrate <compacted.jsonl> [part-key | ordinal | uuid]\n  \
+recompact rehydrate <compacted.jsonl> [part-key | ordinal | uuid | uuid-prefix>=8]\n  \
 recompact continue  <session.jsonl | sessionId> [--threshold T] [--keep K]\n                      \
 [--summarize-with M [--escalate-with M2] [--escalate-above S]]\n  \
 recompact shell     [sessionId] [--threshold T] [--goal G] [--auto]\n                      \
@@ -1095,6 +1095,11 @@ pub enum Masked {
 pub fn mask_record(r: &Value) -> Masked {
     let mut m = r.clone();
     let mut changed = false;
+    // Model-visible selector for every marker this function writes: the envelope uuid is never
+    // shown at inference time, so a resumed model can only ask for what the marker itself names.
+    let sel = rec_uuid(r)
+        .map(|u| u.get(..8).unwrap_or(u).to_string())
+        .unwrap_or_default();
     if let Some(blocks) = m.pointer_mut("/message/content").and_then(|c| c.as_array_mut()) {
         let before = blocks.len();
         blocks.retain(|b| {
@@ -1123,7 +1128,7 @@ pub fn mask_record(r: &Value) -> Masked {
                                     .map(|s| s.len())
                                     .unwrap_or(0);
                                 if n > IMAGE_EST_CHARS {
-                                    *e = json!({"type": "text", "text": format!("[recompact: image elided (~{} KB); the original session file retains it]", n / 1024)});
+                                    *e = json!({"type": "text", "text": format!("[recompact: image elided (~{} KB); rehydrate {sel} to recover it]", n / 1024)});
                                     changed = true;
                                 }
                             }
@@ -1141,7 +1146,7 @@ pub fn mask_record(r: &Value) -> Masked {
                         if chars <= MASK_RESULT_MIN {
                             continue; // short results stay verbatim; a placeholder would not be smaller
                         }
-                        format!("[recompact: elided {chars}-char result; the original session file retains it verbatim]")
+                        format!("[recompact: elided {chars}-char result; rehydrate {sel} to recover it]")
                     };
                     if let Some(obj) = b.as_object_mut() {
                         obj.insert("content".into(), Value::String(replacement));
@@ -1167,7 +1172,7 @@ pub fn mask_record(r: &Value) -> Masked {
                         .map(|s| s.len())
                         .unwrap_or(0);
                     if n > IMAGE_EST_CHARS {
-                        *b = json!({"type": "text", "text": format!("[recompact: image elided (~{} KB); the original session file retains it]", n / 1024)});
+                        *b = json!({"type": "text", "text": format!("[recompact: image elided (~{} KB); rehydrate {sel} to recover it]", n / 1024)});
                         changed = true;
                     }
                 }
@@ -1228,6 +1233,9 @@ pub fn mask_record(r: &Value) -> Masked {
 pub fn elide_images(r: &Value) -> Option<Value> {
     let mut m = r.clone();
     let mut count = 0usize;
+    let sel = rec_uuid(r)
+        .map(|u| u.get(..8).unwrap_or(u).to_string())
+        .unwrap_or_default();
     if let Some(blocks) = m.pointer_mut("/message/content").and_then(|c| c.as_array_mut()) {
         for b in blocks.iter_mut() {
             if b.get("type").and_then(|v| v.as_str()) == Some("image") {
@@ -1237,7 +1245,7 @@ pub fn elide_images(r: &Value) -> Option<Value> {
                     .map(|s| s.len())
                     .unwrap_or(0);
                 if n > IMAGE_EST_CHARS {
-                    *b = json!({"type": "text", "text": format!("[recompact: image elided (~{} KB); rehydrate from the original session to recover it]", n / 1024)});
+                    *b = json!({"type": "text", "text": format!("[recompact: image elided (~{} KB); rehydrate {sel} to recover it]", n / 1024)});
                     count += 1;
                 }
             }
@@ -1387,7 +1395,10 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         && target.is_some();
 
     let loaded = load_jsonl(&src);
-    let (records, _off_path) = select_active(loaded);
+    let (mut records, _off_path) = select_active(loaded);
+    // Old orientation preambles are pure boilerplate for the PREVIOUS generation; strip them
+    // wholesale and mint a fresh one below (unlike the ledger, whose content is user-meaningful).
+    records.retain(|r| !truthy(r, "recompactPreamble"));
     let (head, segs) = segment(&records);
     let plans = plan_ex(&records, &segs, keep, epochs_on);
 
@@ -1585,10 +1596,64 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
                 "model": model,
                 "type": "message",
                 "stop_reason": "end_turn",
-                "content": [{ "type": "text", "text": summary }]
+                // The footer is the summary's model-visible selector: uuids and part keys live in
+                // the record envelope, which is never shown at inference time, so without this a
+                // resumed model cannot address the summary it is reading.
+                "content": [{ "type": "text", "text": format!("{summary}\n[recompact summary {key} — rehydratable]") }]
             }
         })
     };
+
+    // Orientation preamble: the one paragraph every model resumed into this file is guaranteed
+    // to see. Everything else about the compaction (uuids, provenance, part keys) is envelope
+    // metadata invisible at inference time — this record is where a fresh agent learns that
+    // summaries are summaries, that elisions are recoverable, and which commands do it.
+    let project_dir = src
+        .canonicalize()
+        .unwrap_or(src.clone())
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let preamble_text = format!(
+        "This transcript was compacted by segment_recompact; you may be a fresh session resumed \
+         into it. How to read it:\n\
+         - Assistant blocks recapping past work in past tense are compaction SUMMARIES of real \
+         turns; each ends with \"[recompact summary <key> — rehydratable]\".\n\
+         - Markers like \"[recompact: elided ...; rehydrate <prefix>]\" are mechanically removed \
+         payloads (bulky tool results, old screenshots). Nothing is lost: originals live in \
+         untouched source transcripts.\n\
+         - Recover anything verbatim before re-deriving or re-searching it: run \
+         `recompact rehydrate {new_session}.jsonl <selector>` in {project_dir} — the selector is \
+         a summary key or a uuid prefix from a marker; resolution follows provenance across all \
+         compaction generations. Bare `recompact rehydrate <file>` lists every summary.\n\
+         - `recompact scan` shows this project's sessions, sizes, and lineage. If this session \
+         grows large, `recompact continue <session-id> --summarize-with haiku` compacts it \
+         (writes a fresh twin; originals are never modified). Under `recompact shell`, exiting \
+         with code 143 (SIGTERM) triggers automatic recompact-and-respawn.\n\
+         Source session: {orig_session_id}."
+    );
+    let preamble_pending = json!({
+        "parentUuid": Value::Null,
+        "isSidechain": false,
+        "userType": "external",
+        "type": "assistant",
+        "uuid": uuid_v4(),
+        "timestamp": records.first().and_then(|r| r.get("timestamp")).cloned().unwrap_or(Value::Null),
+        "sessionId": new_session,
+        "cwd": cwd,
+        "gitBranch": git_branch,
+        "version": version,
+        "recompactPreamble": true,
+        "message": {
+            "id": format!("msg_recompact_{}", uuid_v4().replace('-', "")),
+            "role": "assistant",
+            "model": model,
+            "type": "message",
+            "stop_reason": "end_turn",
+            "content": [{ "type": "text", "text": preamble_text }]
+        }
+    });
+    let mut preamble_pending = Some(preamble_pending);
 
     let mut out: Vec<Value> = Vec::new();
 
@@ -1646,6 +1711,9 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
             }
         } else {
             out.push(records[seg.user_idx].clone());
+        }
+        if let Some(p) = preamble_pending.take() {
+            out.push(p); // right after the first user turn: guaranteed early, valid chain position
         }
         if plans[s].kept_verbatim {
             for &i in &seg.activity {
@@ -1716,8 +1784,36 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         }
     }
 
+    if let Some(p) = preamble_pending.take() {
+        out.push(p); // no segments at all (head-only file): the preamble still lands
+    }
     if let Some(l) = ledger_pending.take() {
         out.push(l); // keep >= segment count: the ledger still lands, at the end
+    }
+
+    // Summaries inherited from older generations predate the model-visible footer; annotate them
+    // at emission so every summary in the output names its selector. Idempotent and additive —
+    // the summary prose itself is never rewritten.
+    for r in out.iter_mut() {
+        if !truthy(r, "recompactSynthetic") {
+            continue;
+        }
+        let key = r
+            .pointer("/recompactProvenance/part")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if let (Some(key), Some(text)) = (
+            key,
+            r.pointer_mut("/message/content/0/text").and_then(|v| {
+                let s = v.as_str().map(str::to_string);
+                s.map(|s| (v, s))
+            }),
+        ) {
+            let (slot, s) = text;
+            if !s.contains("[recompact summary ") {
+                *slot = Value::String(format!("{s}\n[recompact summary {key} — rehydratable]"));
+            }
+        }
     }
 
     // Drop any tool_use with no matching tool_result (e.g. an in-flight call at the tail of a live
@@ -3244,6 +3340,12 @@ fn provenance_files(
     order
 }
 
+/// Selector-to-uuid matching: exact, or a prefix of at least 8 chars — the length markers embed,
+/// since a full uuid is model-visible only when a marker chooses to carry it.
+fn uuid_matches(u: &str, sel: &str) -> bool {
+    u == sel || (sel.len() >= 8 && u.starts_with(sel))
+}
+
 /// The best available copy of one record: a ground-truth copy from anywhere in the provenance
 /// graph, else the least-degraded copy seen (masked beats absent).
 fn ground_truth_by_uuid(
@@ -3254,7 +3356,7 @@ fn ground_truth_by_uuid(
     let mut fallback: Option<Value> = None;
     let mut scan = |records: &[Value], fallback: &mut Option<Value>| -> Option<Value> {
         for r in records {
-            if rec_uuid(r) == Some(uuid) {
+            if rec_uuid(r).is_some_and(|u| uuid_matches(u, uuid)) {
                 if is_ground(r) {
                     return Some(r.clone());
                 }
@@ -3336,9 +3438,10 @@ pub fn rehydrate_select(compacted: &[Value], selector: &str) -> Result<Vec<Value
         synths.iter().find(|r| part_of(r).as_deref() == Some(selector))
     {
         Some(hit)
-    } else if let Ok(n) = selector.parse::<usize>() {
+    } else if let Ok(n) = selector.parse::<usize>().ok().filter(|_| selector.len() < 8).ok_or(()) {
         // A numeric selector can also be an unsplit segment's part key (part "3"), handled above;
-        // here it is the listing ordinal.
+        // here it is the listing ordinal. Eight-plus digits is never an ordinal — it falls
+        // through to uuid-prefix matching (markers embed 8-char prefixes, which can be all-digit).
         match synths.get(n) {
             Some(r) => Some(r),
             None => {
@@ -3364,9 +3467,12 @@ pub fn rehydrate_select(compacted: &[Value], selector: &str) -> Result<Vec<Value
         return Ok(recovered);
     }
 
-    // Uuid selector: the record may live any number of generations back — search the whole
-    // provenance graph, not just this file's own summaries.
-    if selector.len() >= 32 {
+    // Uuid selector (full or >=8-char prefix, as embedded in elision markers): the record may
+    // live any number of generations back — search the whole provenance graph, not just this
+    // file's own summaries.
+    let uuidish = selector.len() >= 8
+        && selector.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    if uuidish {
         if let Some(hit) = ground_truth_by_uuid(selector, compacted, &mut cache) {
             if truthy(&hit, "recompactSynthetic") {
                 return Ok(expand_synthetic(&hit, &mut cache, REHYDRATE_MAX_DEPTH));

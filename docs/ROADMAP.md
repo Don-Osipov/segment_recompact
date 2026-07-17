@@ -108,6 +108,16 @@ a paper; a tool you run without thinking, and a lifecycle that lets a session li
       compares text and ignores markers); images inside tool results get the same treatment in
       the mask lane. Live result on the stalled session: 4.5MB → 2.2MB on disk, 13 stale
       screenshots elided, recent ones kept, verify green.
+- [x] Agent legibility: everything a fresh model needs is model-VISIBLE. The record envelope
+      (uuids, part keys, provenance) is never shown at inference time, so a session resumed into
+      a twin could not even address the markers it was reading. Now: an orientation preamble
+      record (regenerated each assembly, stripped from prior generations) teaches the reading
+      rules and the exact recovery commands with real paths; every summary ends with
+      "[recompact summary <key> — rehydratable]" (inherited footer-less summaries are annotated
+      at emission, idempotently); every elision marker embeds an 8-char uuid prefix; rehydrate
+      accepts uuid prefixes (>=8 hex chars) so a marker's selector is directly actionable; the
+      skill triggers on recovery-flavored asks and documents waking-up-inside-a-twin and
+      autonomous-loop patterns.
 - [ ] Stop-hook / scheduled-job packaging for the continue loop (today it is a documented
       one-liner; a shipped hook config would make it turnkey).
 
