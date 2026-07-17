@@ -18,9 +18,11 @@ use serde_json::{json, Map, Value};
 pub const TOOL_RESULT_TRUNC: usize = 1500;
 
 pub const USAGE: &str = "usage:\n  \
-recompact extract  <session.jsonl> [--out work/segments.json] [--keep K]\n  \
-recompact assemble <session.jsonl> <summaries.json> [--keep K] [--out <path>]\n  \
-recompact verify   <assembled.jsonl> [--source <session.jsonl>]\n\n\
+recompact extract   <session.jsonl> [--out work/segments.json] [--keep K]\n  \
+recompact assemble  <session.jsonl> <summaries.json> [--keep K] [--out <path>]\n  \
+recompact verify    <assembled.jsonl> [--source <session.jsonl>]\n  \
+recompact probe     <session.jsonl>\n  \
+recompact rehydrate <compacted.jsonl> [ordinal]\n\n\
   --keep K  number of most-recent segments kept verbatim (default 1)";
 
 fn usage() -> i32 {
@@ -169,18 +171,17 @@ pub struct SegPlan {
 
 /// One retention decision per segment, shared by extract and assemble so the two passes can never
 /// disagree. The last `keep` segments stay verbatim. A segment whose activity carries a compaction
-/// summary (isCompactSummary) is pinned verbatim regardless of age: that record is the only
-/// surviving carrier of everything before its boundary, and a hand-written summary of a summary is
-/// exactly the recursive loss this tool exists to avoid.
+/// summary (isCompactSummary, or this tool's own recompactSynthetic) is pinned verbatim regardless
+/// of age: those records are the only surviving carriers of what they replaced, and a hand-written
+/// summary of a summary is exactly the recursive loss this tool exists to avoid.
 pub fn plan(records: &[Value], segs: &[Segment], keep: usize) -> Vec<SegPlan> {
     segs.iter()
         .enumerate()
         .map(|(s, seg)| {
             let tail = s + keep >= segs.len();
-            let pinned = seg
-                .activity
-                .iter()
-                .any(|&i| truthy(&records[i], "isCompactSummary"));
+            let pinned = seg.activity.iter().any(|&i| {
+                truthy(&records[i], "isCompactSummary") || truthy(&records[i], "recompactSynthetic")
+            });
             let kept_verbatim = tail || pinned;
             let needs_summary = has_agent_activity(records, seg) && !kept_verbatim;
             SegPlan {
@@ -235,6 +236,20 @@ pub fn truncate(s: &str, n: usize) -> String {
         let head: String = s.chars().take(n).collect();
         format!("{head}…[+{} chars]", count - n)
     }
+}
+
+/// Head+tail truncation: build failures and assertion errors cluster at the END of output, so a
+/// pure-head cut loses exactly the load-bearing lines. Ratio is documented, not ad hoc.
+pub fn truncate_head_tail(s: &str, n: usize, head_ratio: f32) -> String {
+    let count = s.chars().count();
+    if count <= n {
+        return s.to_string();
+    }
+    let head_n = (n as f32 * head_ratio) as usize;
+    let tail_n = n.saturating_sub(head_n);
+    let head: String = s.chars().take(head_n).collect();
+    let tail: String = s.chars().skip(count - tail_n).collect();
+    format!("{head}\n…[{} chars elided]…\n{tail}", count - n)
 }
 
 fn last_prompt_text(records: &[Value]) -> Option<String> {
@@ -296,7 +311,27 @@ pub fn cmd_extract(args: &[String]) -> i32 {
 
     let mut seg_json = Vec::new();
     for (s, seg) in segs.iter().enumerate() {
-        // Render activity for Claude to read.
+        // Render activity for Claude to read. Two passes: first map tool_use ids to names so each
+        // result can be labeled with the tool that produced it, then render with mechanical
+        // elision: statuses instead of payloads for empty and duplicate results, head+tail
+        // truncation so trailing errors survive, char counts so the summarizer can see how much
+        // it is not seeing, and a larger budget for errors (they are load-bearing verbatim).
+        let mut tool_names: HashMap<String, String> = HashMap::new();
+        for &i in &seg.activity {
+            if let Some(blocks) = content(&records[i]).and_then(|c| c.as_array()) {
+                for b in blocks {
+                    if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                        if let (Some(id), Some(name)) = (
+                            b.get("id").and_then(|v| v.as_str()),
+                            b.get("name").and_then(|v| v.as_str()),
+                        ) {
+                            tool_names.insert(id.to_string(), name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let mut seen_results: HashSet<String> = HashSet::new();
         let mut activity = Vec::new();
         let mut covered = vec![records[seg.user_idx]
             .get("uuid")
@@ -342,10 +377,33 @@ pub fn cmd_extract(args: &[String]) -> i32 {
                         for b in blocks {
                             if b.get("type").and_then(|v| v.as_str()) == Some("tool_result") {
                                 let text = tool_result_text(b);
+                                let is_error =
+                                    b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                                let tool = b
+                                    .get("tool_use_id")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|id| tool_names.get(id).cloned())
+                                    .unwrap_or_default();
+                                let chars = text.chars().count();
+                                let (status, rendered) = if is_error {
+                                    ("error", truncate_head_tail(&text, 4000, 0.5))
+                                } else if text.trim().is_empty() {
+                                    ("empty", "[empty result]".to_string())
+                                } else if !seen_results.insert(format!("{tool}\u{0}{text}")) {
+                                    (
+                                        "duplicate",
+                                        "[identical to an earlier result in this segment]"
+                                            .to_string(),
+                                    )
+                                } else {
+                                    ("ok", truncate_head_tail(&text, TOOL_RESULT_TRUNC, 0.6))
+                                };
                                 activity.push(json!({
                                     "kind": "tool_result",
-                                    "is_error": b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
-                                    "result": truncate(&text, TOOL_RESULT_TRUNC)
+                                    "tool": tool,
+                                    "status": status,
+                                    "chars": chars,
+                                    "result": rendered
                                 }));
                             }
                         }
@@ -366,6 +424,7 @@ pub fn cmd_extract(args: &[String]) -> i32 {
             "needs_summary": plans[s].needs_summary,
             "kept_verbatim": plans[s].kept_verbatim,
             "covered_uuids": covered,
+            "derived_index": segment_index(&records, seg),
             "approx_tokens": approx_tokens(
                 &std::iter::once(seg.user_idx)
                     .chain(seg.activity.iter().copied())
@@ -429,6 +488,66 @@ pub fn cmd_extract(args: &[String]) -> i32 {
         out.display()
     );
     0
+}
+
+/// Code-derived facts about a segment: which files were touched and how, what ran, what failed.
+/// Deterministic (no model call), so it can be regenerated from raw on every pass without drift,
+/// and it cannot forget a file path the way prose summarization measurably does.
+pub fn segment_index(records: &[Value], seg: &Segment) -> Value {
+    use std::collections::BTreeMap;
+    fn push_role(files: &mut BTreeMap<String, Vec<&'static str>>, path: &str, role: &'static str) {
+        let roles = files.entry(path.to_string()).or_default();
+        if !roles.contains(&role) {
+            roles.push(role);
+        }
+    }
+    let mut files: BTreeMap<String, Vec<&'static str>> = BTreeMap::new();
+    let mut commands: Vec<String> = Vec::new();
+    let mut tool_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut error_count = 0usize;
+    for &i in &seg.activity {
+        if let Some(blocks) = content(&records[i]).and_then(|c| c.as_array()) {
+            for b in blocks {
+                match b.get("type").and_then(|v| v.as_str()) {
+                    Some("tool_use") => {
+                        let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        *tool_counts.entry(name.to_string()).or_default() += 1;
+                        let input = b.get("input");
+                        let path = input
+                            .and_then(|i| i.get("file_path").or_else(|| i.get("notebook_path")))
+                            .and_then(|v| v.as_str());
+                        match (name, path) {
+                            ("Read", Some(p)) => push_role(&mut files, p, "read"),
+                            ("Edit", Some(p)) | ("NotebookEdit", Some(p)) => {
+                                push_role(&mut files, p, "edited")
+                            }
+                            ("Write", Some(p)) => push_role(&mut files, p, "written"),
+                            _ => {}
+                        }
+                        if name == "Bash" {
+                            if let Some(c) =
+                                input.and_then(|i| i.get("command")).and_then(|v| v.as_str())
+                            {
+                                commands.push(truncate(c, 200));
+                            }
+                        }
+                    }
+                    Some("tool_result") => {
+                        if b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            error_count += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    json!({
+        "files": files,
+        "commands": commands,
+        "tool_counts": tool_counts,
+        "error_count": error_count,
+    })
 }
 
 fn tool_result_text(block: &Value) -> String {
@@ -507,6 +626,16 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
     }
 
     let new_session = uuid_v4();
+    let src_abs = src
+        .canonicalize()
+        .unwrap_or(src.clone())
+        .to_string_lossy()
+        .into_owned();
+    let orig_session_id = records
+        .iter()
+        .find_map(|r| r.get("sessionId").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
 
     // Carry-over envelope fields, pulled from the source.
     let cwd = field_str(&records, "cwd");
@@ -542,6 +671,13 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
                 .get("timestamp")
                 .cloned()
                 .unwrap_or(Value::Null);
+            // Provenance makes the compaction reversible: the summary carries pointers to the
+            // exact raw records it replaced, so `rehydrate` (or any future agent) can recover the
+            // verbatim originals from the untouched source transcript.
+            let covered: Vec<Value> = std::iter::once(seg.user_idx)
+                .chain(seg.activity.iter().copied())
+                .filter_map(|i| rec_uuid(&records[i]).map(|u| Value::String(u.to_string())))
+                .collect();
             out.push(json!({
                 "parentUuid": Value::Null,            // fixed up in the rechain pass
                 "isSidechain": false,
@@ -554,6 +690,12 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
                 "gitBranch": git_branch,
                 "version": version,
                 "recompactSynthetic": true,           // marks this as a compaction summary, not a real turn
+                "recompactProvenance": {
+                    "source": src_abs,
+                    "sourceSessionId": orig_session_id,
+                    "coveredUuids": covered
+                },
+                "recompactIndex": segment_index(&records, seg),
                 "message": {
                     "id": format!("msg_recompact_{}", uuid_v4().replace('-', "")),
                     "role": "assistant",
@@ -696,6 +838,226 @@ pub fn sanitize_tool_pairs(out: &mut Vec<Value>) {
         }
     }
     out.retain(|r| !r.get("__drop").and_then(|v| v.as_bool()).unwrap_or(false));
+}
+
+// ----------------------------------------------------------------------------------- subcommand: probe
+
+const KNOWN_RECORD_TYPES: &[&str] = &[
+    "user",
+    "assistant",
+    "system",
+    "summary",
+    "last-prompt",
+    "attachment",
+    "mode",
+    "permission-mode",
+    "bridge-session",
+    "ai-title",
+    "file-history-snapshot",
+    "file-history-delta",
+    "pr-link",
+    "queue-operation",
+    "custom-title",
+    "agent-name",
+    "relocated",
+    "worktree-state",
+];
+const KNOWN_BLOCK_TYPES: &[&str] = &[
+    "text",
+    "thinking",
+    "redacted_thinking",
+    "tool_use",
+    "tool_result",
+    "image",
+    "document",
+    "fallback",
+    "server_tool_use",
+    "web_search_tool_result",
+];
+
+/// Schema drift alarm. The `.jsonl` format is reverse-engineered and undocumented; run probe after
+/// a Claude Code update, before any surgery. Unknown record/block types are warnings (the tool
+/// fails open on retention, so unknowns are kept, not lost); a session we cannot even segment is a
+/// hard failure.
+pub fn cmd_probe(args: &[String]) -> i32 {
+    use std::collections::BTreeMap;
+    let (pos, _opts) = parse_opts(args);
+    if pos.is_empty() {
+        return usage();
+    }
+    let path = PathBuf::from(&pos[0]);
+    let records = load_jsonl(&path);
+    let with_uuid = records.iter().filter(|r| rec_uuid(r).is_some()).count();
+
+    let mut type_hist: BTreeMap<String, usize> = BTreeMap::new();
+    for r in &records {
+        *type_hist.entry(rec_type(r).to_string()).or_default() += 1;
+    }
+    let unknown_types: Vec<&String> = type_hist
+        .keys()
+        .filter(|t| !KNOWN_RECORD_TYPES.contains(&t.as_str()))
+        .collect();
+
+    let mut block_hist: BTreeMap<String, usize> = BTreeMap::new();
+    for r in &records {
+        if let Some(blocks) = content(r).and_then(|c| c.as_array()) {
+            for b in blocks {
+                if let Some(t) = b.get("type").and_then(|v| v.as_str()) {
+                    *block_hist.entry(t.to_string()).or_default() += 1;
+                }
+            }
+        }
+    }
+    let unknown_blocks: Vec<&String> = block_hist
+        .keys()
+        .filter(|t| !KNOWN_BLOCK_TYPES.contains(&t.as_str()))
+        .collect();
+
+    let leaf_from_last_prompt = records
+        .iter()
+        .rev()
+        .find(|r| rec_type(r) == "last-prompt")
+        .and_then(|r| r.get("leafUuid").and_then(|v| v.as_str()))
+        .map(|u| records.iter().any(|r| rec_uuid(r) == Some(u)))
+        .unwrap_or(false);
+
+    let (active, off_path) = select_active(records.clone());
+    let (_, segs) = segment(&active);
+    let genuine_users = segs.len();
+
+    eprintln!("probe: {}", path.display());
+    eprintln!("  records: {} ({} with uuid)", records.len(), with_uuid);
+    let fmt_hist = |h: &BTreeMap<String, usize>| {
+        h.iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    eprintln!("  record types: {}", fmt_hist(&type_hist));
+    eprintln!("  content blocks: {}", fmt_hist(&block_hist));
+    eprintln!(
+        "  active path: {} records, {} off-path",
+        active.len(),
+        off_path
+    );
+    eprintln!("  genuine user turns (active path): {genuine_users}");
+
+    let mut warnings = 0;
+    if !unknown_types.is_empty() {
+        eprintln!("  warning: unknown record types {unknown_types:?} (kept verbatim, but re-verify surgery)");
+        warnings += 1;
+    }
+    if !unknown_blocks.is_empty() {
+        eprintln!("  warning: unknown content block types {unknown_blocks:?}");
+        warnings += 1;
+    }
+    if !leaf_from_last_prompt {
+        eprintln!("  warning: no resolvable last-prompt leafUuid; active path falls back to the last uuid record");
+        warnings += 1;
+    }
+
+    let mut hard = 0;
+    if with_uuid == 0 {
+        eprintln!("  FAIL: no records carry a uuid; this does not look like a session transcript");
+        hard += 1;
+    }
+    if genuine_users == 0 {
+        eprintln!("  FAIL: no genuine user turns found on the active path");
+        hard += 1;
+    }
+
+    if hard > 0 {
+        eprintln!("probe: FAILED ({hard} hard failure(s), {warnings} warning(s))");
+        1
+    } else if warnings > 0 {
+        eprintln!("probe: OK with {warnings} warning(s) — possible format drift, proceed with care");
+        0
+    } else {
+        eprintln!("probe: OK, no drift indicators");
+        0
+    }
+}
+
+// ----------------------------------------------------------------------------------- subcommand: rehydrate
+
+/// Recover the verbatim raw records behind a synthetic summary, from the untouched original
+/// transcript. Without an ordinal, lists the summaries. With one, dumps the covered records as
+/// raw JSONL on stdout.
+pub fn cmd_rehydrate(args: &[String]) -> i32 {
+    let (pos, _opts) = parse_opts(args);
+    if pos.is_empty() {
+        return usage();
+    }
+    let compacted = load_jsonl(Path::new(&pos[0]));
+    let synths: Vec<&Value> = compacted
+        .iter()
+        .filter(|r| truthy(r, "recompactSynthetic"))
+        .collect();
+
+    if pos.len() < 2 {
+        eprintln!("{} synthetic summaries:", synths.len());
+        for (n, r) in synths.iter().enumerate() {
+            let text = r
+                .pointer("/message/content/0/text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let covered = r
+                .pointer("/recompactProvenance/coveredUuids")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            eprintln!(
+                "  [{n}] covers {covered} records: {}",
+                truncate(&text.replace('\n', " "), 100)
+            );
+        }
+        if synths.iter().any(|r| r.get("recompactProvenance").is_none()) {
+            eprintln!("note: some summaries lack provenance (assembled by an older version)");
+        }
+        return 0;
+    }
+
+    let Ok(n) = pos[1].parse::<usize>() else {
+        return usage();
+    };
+    let Some(rec) = synths.get(n) else {
+        eprintln!("error: no synthetic summary [{n}] (have {})", synths.len());
+        return 1;
+    };
+    let Some(prov) = rec.get("recompactProvenance") else {
+        eprintln!("error: summary [{n}] has no provenance (assembled by an older version)");
+        return 1;
+    };
+    let src = PathBuf::from(prov.get("source").and_then(|v| v.as_str()).unwrap_or(""));
+    if !src.exists() {
+        eprintln!(
+            "error: original transcript not found at {} (moved or deleted?)",
+            src.display()
+        );
+        return 1;
+    }
+    let want: HashSet<&str> = prov
+        .get("coveredUuids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|u| u.as_str()).collect())
+        .unwrap_or_default();
+    let source = load_jsonl(&src);
+    let mut printed = 0;
+    for r in &source {
+        if rec_uuid(r).is_some_and(|u| want.contains(u)) {
+            println!("{}", serde_json::to_string(r).unwrap());
+            printed += 1;
+        }
+    }
+    eprintln!(
+        "rehydrate: {printed} of {} covered records recovered from {}",
+        want.len(),
+        src.display()
+    );
+    if printed == 0 {
+        return 1;
+    }
+    0
 }
 
 // ----------------------------------------------------------------------------------- subcommand: verify

@@ -3,7 +3,7 @@
 use std::env;
 use std::process::exit;
 
-use recompact::{cmd_assemble, cmd_extract, cmd_verify, USAGE};
+use recompact::{cmd_assemble, cmd_extract, cmd_probe, cmd_rehydrate, cmd_verify, USAGE};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -15,6 +15,8 @@ fn main() {
         "extract" => cmd_extract(&args[2..]),
         "assemble" => cmd_assemble(&args[2..]),
         "verify" => cmd_verify(&args[2..]),
+        "probe" => cmd_probe(&args[2..]),
+        "rehydrate" => cmd_rehydrate(&args[2..]),
         _ => {
             eprintln!("{USAGE}");
             2

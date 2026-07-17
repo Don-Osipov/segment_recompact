@@ -40,22 +40,30 @@ cites the strongest evidence behind it.
 - [x] `verify` subcommand: chain integrity, tool-pair atomicity, usage stripping, tail validity,
       verbatim user-turn fidelity against the source's active path.
 - [x] lib/bin split with integration tests over synthetic sessions; portable UUID generation; CI.
-- [ ] `probe` subcommand: schema sanity-check for a session file, so Claude Code format drift fails
-      loudly before any surgery.
-- [ ] Prebuilt release binaries.
+- [x] `probe` subcommand: schema sanity-check for a session file, so Claude Code format drift fails
+      loudly before any surgery. Validated against 1,713 local sessions (zero parse failures; the
+      39 hard failures are genuine user-less session stubs).
+- [x] Release workflow: binaries for macOS arm64/x64 and Linux x64 on tag push.
 
 ## Phase 1: three-lane compression engine
 
-- Mechanical lane (no LLM, runs first): elide zero-value results with fixed placeholders (empty
-  greps, timeouts), dedupe identical tool calls, drop errored-call inputs keeping error text
-  verbatim, drop superseded file reads, head+tail truncation at a documented ratio.
-- Deterministic index lane (code, not model): files touched with role, commands run, errors hit,
-  exit codes; regenerated fresh from raw on every pass.
-- Narrative lane (LLM, smallest job): continuity prose plus structured fields for decisions and
-  rejected alternatives, verbatim key-phrase quoting, mandatory epistemic grading. The worksheet
-  carries exit/truncation/error status per tool result so the summarizer cannot miss them.
-- Provenance and rehydration: synthetic records embed {rawSource, uuids, lineRange};
-  `recompact rehydrate <session> <segment>` returns the verbatim original.
+- [x] Mechanical lane in the worksheet: statuses instead of payloads for empty and duplicate
+      results, head+tail truncation (0.6 head ratio) so trailing errors survive, char counts,
+      larger verbatim budget for errors, tool names on every result.
+- [x] Deterministic index lane (code, not model): files touched with role, commands run, tool
+      counts, error count; in the worksheet as `derived_index` and embedded in synthetic records
+      as `recompactIndex`; regenerated fresh from raw on every pass.
+- [x] Provenance and rehydration: synthetic records embed
+      `recompactProvenance {source, sourceSessionId, coveredUuids}`;
+      `recompact rehydrate <compacted.jsonl> [ordinal]` lists summaries or dumps the verbatim
+      originals from the untouched source.
+- [x] Iteration invariant (early Phase 2 pull-forward): segments carrying a `recompactSynthetic`
+      record are pinned verbatim, so a second pass can never summarize a summary.
+- [ ] Superseded-file-read elision and errored-call input dropping in the assembled output.
+- [ ] Narrative lane rubric: structured fields for decisions and rejected alternatives, verbatim
+      key-phrase quoting, mandatory epistemic grading in SKILL.md.
+- [ ] Mask mode: a no-LLM compaction mode that keeps assistant text verbatim and replaces old
+      tool_result contents with placeholders (pairs stay atomic).
 
 ## Phase 2: iterated recompaction lifecycle
 
