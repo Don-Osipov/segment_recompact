@@ -2178,6 +2178,12 @@ pub fn headless_summarize(
             &hot,
             cfg.escalate_with.as_deref().unwrap_or(&cfg.model),
         ));
+        eprintln!(
+            "summarize: {} unit(s) in {} batch(es), {} at a time",
+            remaining.len(),
+            jobs.len(),
+            SUMMARIZE_WAVES
+        );
         for wave in jobs.chunks(SUMMARIZE_WAVES) {
             let outs: Vec<(Vec<String>, Result<String, String>)> = std::thread::scope(|sc| {
                 let handles: Vec<_> = wave
@@ -2208,6 +2214,7 @@ pub fn headless_summarize(
                     Err(e) => eprintln!("summarize: batch failed: {e}"),
                 }
             }
+            eprintln!("summarize: {}/{} units done", result.len(), units.len());
         }
     }
     let missing: Vec<&str> = units
