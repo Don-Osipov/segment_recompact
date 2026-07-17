@@ -2262,24 +2262,21 @@ pub fn summarize_cfg_from_opts(opts: &Map<String, Value>) -> Option<SummarizeCfg
 
 /// Core continuation step, shared by `continue` and `shell`: resolve the newest compacted
 /// descendant; when over threshold, compact toward it (mask-only, or the full ladder when a
-/// summarizer is configured: plan, summarize the missing units headlessly into the per-project
-/// cache, assemble); verify with rollback; churn-guard. Always returns a resumable id, plus an
-/// exit code for the CLI.
+/// summarizer is configured); verify with rollback; churn-guard.
+///
+/// A LIVE session can grow while summaries are being written, shifting segment keys between the
+/// planning snapshot and assemble's re-read (observed in production: "plan needs summaries for
+/// [42, 43]" after minutes of summarizing). So the plan → summarize → assemble → verify cycle
+/// RETRIES, re-syncing to the file's current state on each attempt; the content-hash cache makes
+/// all previously-summarized material free, so a retry only pays for the turns that appeared in
+/// the gap. Converges as soon as the source pauses growing for one cycle. Always returns a
+/// resumable id, plus an exit code for the CLI.
 pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String, i32) {
     let latest = lineage_latest(dir, start_id);
     let latest_file = dir.join(format!("{latest}.jsonl"));
     if !latest_file.exists() {
         eprintln!("error: session file not found: {}", latest_file.display());
         return (start_id.to_string(), 1);
-    }
-    let (active, _) = select_active(load_jsonl(&latest_file));
-    let tokens = approx_tokens(&active);
-    if tokens <= o.threshold {
-        eprintln!(
-            "continue: ~{tokens} tokens ≤ threshold {}; nothing to compact",
-            o.threshold
-        );
-        return (latest, 0);
     }
     let keep: usize = o.keep.as_deref().and_then(|s| s.parse().ok()).unwrap_or(1);
     let split: usize = o
@@ -2289,143 +2286,176 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
         .unwrap_or(DEFAULT_SPLIT_THRESHOLD);
     let cache_path = dir.join(".recompact-summary-cache.json");
 
-    // Full-ladder pre-pass: find the units the budget plan wants summarized, fill the cache.
-    let mut sums_path: Option<PathBuf> = None;
-    if let Some(cfg) = &o.summarize {
-        let u = build_units(&active, keep, split);
-        let cache: Map<String, Value> = fs::read_to_string(&cache_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
-        let b = plan_budget(
-            &active,
-            &u.segs,
-            &u.plans,
-            &u.seg_parts,
-            &u.seg_keys,
-            o.threshold,
-            true,
-            |key| {
-                u.key_hashes
-                    .get(key)
-                    .and_then(|h| cache.get(h))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.len() / 4 + 60)
-            },
-        );
-        let mut work: Vec<(String, f32, String)> = Vec::new();
-        for unit in &b.units {
-            if unit.treatment == Treatment::Summarize {
-                let h = &u.key_hashes[&unit.key];
-                if !cache.contains_key(h) {
-                    let p: usize = unit
-                        .key
-                        .split('.')
-                        .nth(1)
-                        .and_then(|x| x.parse().ok())
-                        .unwrap_or(0);
-                    let seg = &u.segs[unit.seg];
-                    let part = &u.seg_parts[unit.seg][p];
-                    work.push((
-                        unit.key.clone(),
-                        unit.salience,
-                        unit_digest(&active, seg, part),
-                    ));
+    const ATTEMPTS: usize = 3;
+    for attempt in 1..=ATTEMPTS {
+        let (active, _) = select_active(load_jsonl(&latest_file));
+        let tokens = approx_tokens(&active);
+        if tokens <= o.threshold {
+            eprintln!(
+                "continue: ~{tokens} tokens ≤ threshold {}; nothing to compact",
+                o.threshold
+            );
+            return (latest, 0);
+        }
+
+        // Full-ladder pre-pass: find the units the budget plan wants summarized, fill the cache.
+        let mut sums_path: Option<PathBuf> = None;
+        if let Some(cfg) = &o.summarize {
+            let u = build_units(&active, keep, split);
+            let cache: Map<String, Value> = fs::read_to_string(&cache_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            let b = plan_budget(
+                &active,
+                &u.segs,
+                &u.plans,
+                &u.seg_parts,
+                &u.seg_keys,
+                o.threshold,
+                true,
+                |key| {
+                    u.key_hashes
+                        .get(key)
+                        .and_then(|h| cache.get(h))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.len() / 4 + 60)
+                },
+            );
+            let mut work: Vec<(String, f32, String)> = Vec::new();
+            for unit in &b.units {
+                if unit.treatment == Treatment::Summarize {
+                    let h = &u.key_hashes[&unit.key];
+                    if !cache.contains_key(h) {
+                        let p: usize = unit
+                            .key
+                            .split('.')
+                            .nth(1)
+                            .and_then(|x| x.parse().ok())
+                            .unwrap_or(0);
+                        let seg = &u.segs[unit.seg];
+                        let part = &u.seg_parts[unit.seg][p];
+                        work.push((
+                            unit.key.clone(),
+                            unit.salience,
+                            unit_digest(&active, seg, part),
+                        ));
+                    }
                 }
             }
-        }
-        if !work.is_empty() {
-            eprintln!(
-                "continue: summarizing {} unit(s) with {}{}",
-                work.len(),
-                cfg.model,
-                cfg.escalate_with
-                    .as_deref()
-                    .map(|m| format!(" (escalating salience ≥ {} to {m})", cfg.escalate_above))
-                    .unwrap_or_default()
-            );
-            let sums = match headless_summarize(&work, cfg) {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("continue: summarize failed: {e}");
+            if !work.is_empty() {
+                eprintln!(
+                    "continue: summarizing {} unit(s) with {}{}",
+                    work.len(),
+                    cfg.model,
+                    cfg.escalate_with
+                        .as_deref()
+                        .map(|m| format!(" (escalating salience ≥ {} to {m})", cfg.escalate_above))
+                        .unwrap_or_default()
+                );
+                let sums = match headless_summarize(&work, cfg) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("continue: summarize failed: {e}");
+                        return (latest, 1);
+                    }
+                };
+                let mut cache = cache;
+                for (k, text) in &sums {
+                    if let Some(h) = u.key_hashes.get(k) {
+                        cache.insert(h.clone(), Value::String(text.clone()));
+                    }
+                }
+                if fs::write(
+                    &cache_path,
+                    serde_json::to_string_pretty(&Value::Object(cache)).unwrap(),
+                )
+                .is_err()
+                {
+                    eprintln!("continue: cannot write summary cache");
                     return (latest, 1);
                 }
-            };
-            let mut cache = cache;
-            for (k, text) in &sums {
-                if let Some(h) = u.key_hashes.get(k) {
-                    cache.insert(h.clone(), Value::String(text.clone()));
-                }
             }
-            if fs::write(
-                &cache_path,
-                serde_json::to_string_pretty(&Value::Object(cache)).unwrap(),
-            )
-            .is_err()
-            {
-                eprintln!("continue: cannot write summary cache");
-                return (latest, 1);
-            }
+            let sp = std::env::temp_dir().join(format!("recompact-empty-{}.json", uuid_v4()));
+            let _ = fs::write(&sp, "{}");
+            sums_path = Some(sp);
         }
-        let sp = std::env::temp_dir().join(format!("recompact-empty-{}.json", uuid_v4()));
-        let _ = fs::write(&sp, "{}");
-        sums_path = Some(sp);
-    }
 
-    let mut a_args: Vec<String> = vec![latest_file.to_string_lossy().into_owned()];
-    if let Some(sp) = &sums_path {
-        a_args.push(sp.to_string_lossy().into_owned());
-        a_args.push("--mode".into());
-        a_args.push("summarize".into());
-        a_args.push("--cache".into());
-        a_args.push(cache_path.to_string_lossy().into_owned());
-    } else {
-        a_args.push("--mode".into());
-        a_args.push("mask".into());
-    }
-    a_args.push("--target".into());
-    a_args.push(o.threshold.to_string());
-    for (flag, v) in [("keep", &o.keep), ("split", &o.split)] {
-        if let Some(v) = v {
-            a_args.push(format!("--{flag}"));
-            a_args.push(v.clone());
+        let mut a_args: Vec<String> = vec![latest_file.to_string_lossy().into_owned()];
+        if let Some(sp) = &sums_path {
+            a_args.push(sp.to_string_lossy().into_owned());
+            a_args.push("--mode".into());
+            a_args.push("summarize".into());
+            a_args.push("--cache".into());
+            a_args.push(cache_path.to_string_lossy().into_owned());
+        } else {
+            a_args.push("--mode".into());
+            a_args.push("mask".into());
         }
+        a_args.push("--target".into());
+        a_args.push(o.threshold.to_string());
+        for (flag, v) in [("keep", &o.keep), ("split", &o.split)] {
+            if let Some(v) = v {
+                a_args.push(format!("--{flag}"));
+                a_args.push(v.clone());
+            }
+        }
+        let assembled = run_assemble(&a_args);
+        if let Some(sp) = &sums_path {
+            let _ = fs::remove_file(sp);
+        }
+        let (new_id, new_file) = match assembled {
+            Ok(Some(v)) => v,
+            Ok(None) => unreachable!("continue never passes --plan"),
+            Err(rc) => {
+                if attempt < ATTEMPTS {
+                    eprintln!(
+                        "continue: source changed during compaction; re-syncing (attempt {}/{ATTEMPTS})",
+                        attempt + 1
+                    );
+                    continue;
+                }
+                return (latest, rc);
+            }
+        };
+        let v = cmd_verify(&[
+            new_file.to_string_lossy().into_owned(),
+            "--source".into(),
+            latest_file.to_string_lossy().into_owned(),
+        ]);
+        if v != 0 {
+            let _ = fs::remove_file(&new_file);
+            lineage_remove(dir, &new_id);
+            if attempt < ATTEMPTS {
+                // A new human turn landing between assemble and verify fails the fidelity check;
+                // that is the same race, so re-sync rather than give up.
+                eprintln!(
+                    "continue: verification mismatch (source changed?); re-syncing (attempt {}/{ATTEMPTS})",
+                    attempt + 1
+                );
+                continue;
+            }
+            eprintln!(
+                "continue: verification FAILED; removed {} — resuming the previous id is safe",
+                new_file.display()
+            );
+            return (latest, 1);
+        }
+        // Churn guard: a file that is already mostly incompressible must not spawn descendants
+        // every loop iteration.
+        let (na, _) = select_active(load_jsonl(&new_file));
+        let ntokens = approx_tokens(&na);
+        if ntokens * 100 >= tokens * 95 {
+            let _ = fs::remove_file(&new_file);
+            lineage_remove(dir, &new_id);
+            eprintln!("continue: no meaningful reduction (~{tokens} → ~{ntokens}); keeping {latest}");
+            return (latest, 0);
+        }
+        eprintln!("continue: ~{tokens} → ~{ntokens} tokens; resume with: claude --resume {new_id}");
+        return (new_id, 0);
     }
-    let (new_id, new_file) = match run_assemble(&a_args) {
-        Ok(Some(v)) => v,
-        Ok(None) => unreachable!("continue never passes --plan"),
-        Err(rc) => return (latest, rc),
-    };
-    if let Some(sp) = &sums_path {
-        let _ = fs::remove_file(sp);
-    }
-    let v = cmd_verify(&[
-        new_file.to_string_lossy().into_owned(),
-        "--source".into(),
-        latest_file.to_string_lossy().into_owned(),
-    ]);
-    if v != 0 {
-        let _ = fs::remove_file(&new_file);
-        lineage_remove(dir, &new_id);
-        eprintln!(
-            "continue: verification FAILED; removed {} — resuming the previous id is safe",
-            new_file.display()
-        );
-        return (latest, 1);
-    }
-    // Churn guard: a file that is already mostly incompressible must not spawn descendants every
-    // loop iteration.
-    let (na, _) = select_active(load_jsonl(&new_file));
-    let ntokens = approx_tokens(&na);
-    if ntokens * 100 >= tokens * 95 {
-        let _ = fs::remove_file(&new_file);
-        lineage_remove(dir, &new_id);
-        eprintln!("continue: no meaningful reduction (~{tokens} → ~{ntokens}); keeping {latest}");
-        return (latest, 0);
-    }
-    eprintln!("continue: ~{tokens} → ~{ntokens} tokens; resume with: claude --resume {new_id}");
-    (new_id, 0)
+    (latest, 1)
 }
 
 /// The autonomous continuation step, CLI form. Stdout is always a resumable id, so a driver loop
