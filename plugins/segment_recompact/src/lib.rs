@@ -3193,19 +3193,145 @@ pub fn cmd_probe(args: &[String]) -> i32 {
 ///   - a part key exactly matching `recompactProvenance.part` (what provenance advertises)
 ///   - a plain 0-based ordinal into the synthetic records (the `rehydrate` listing's [n])
 ///   - a record uuid found in some summary's coveredUuids — returns just that one record
+/// How deep rehydration may follow provenance chains. Generations accumulate one hop per
+/// recompaction cycle; ten covers months of daily cycles while still bounding a pointer loop.
+const REHYDRATE_MAX_DEPTH: usize = 10;
+
+/// A record is ground truth when it is neither synthetic nor a mechanically reduced copy.
+fn is_ground(r: &Value) -> bool {
+    !truthy(r, "recompactSynthetic")
+        && !truthy(r, "recompactMasked")
+        && r.get("recompactImagesElided").is_none()
+}
+
+fn synth_sources(records: &[Value]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for r in records {
+        if let Some(s) = r.pointer("/recompactProvenance/source").and_then(|v| v.as_str()) {
+            let p = PathBuf::from(s);
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Every transcript reachable from `start` through synthetic provenance pointers, BFS order
+/// (nearest generation first). Missing files are skipped: rehydration degrades to the nearest
+/// surviving copy rather than failing outright.
+fn provenance_files(
+    start: &[Value],
+    cache: &mut HashMap<PathBuf, Vec<Value>>,
+) -> Vec<PathBuf> {
+    let mut order: Vec<PathBuf> = Vec::new();
+    let mut frontier: Vec<PathBuf> = synth_sources(start);
+    let mut i = 0;
+    while i < frontier.len() {
+        let p = frontier[i].clone();
+        i += 1;
+        if order.contains(&p) || !p.exists() {
+            continue;
+        }
+        cache.entry(p.clone()).or_insert_with(|| load_jsonl(&p));
+        order.push(p.clone());
+        for next in synth_sources(&cache[&p]) {
+            if !order.contains(&next) && !frontier.contains(&next) {
+                frontier.push(next);
+            }
+        }
+    }
+    order
+}
+
+/// The best available copy of one record: a ground-truth copy from anywhere in the provenance
+/// graph, else the least-degraded copy seen (masked beats absent).
+fn ground_truth_by_uuid(
+    uuid: &str,
+    start: &[Value],
+    cache: &mut HashMap<PathBuf, Vec<Value>>,
+) -> Option<Value> {
+    let mut fallback: Option<Value> = None;
+    let mut scan = |records: &[Value], fallback: &mut Option<Value>| -> Option<Value> {
+        for r in records {
+            if rec_uuid(r) == Some(uuid) {
+                if is_ground(r) {
+                    return Some(r.clone());
+                }
+                if fallback.is_none() {
+                    *fallback = Some(r.clone());
+                }
+            }
+        }
+        None
+    };
+    if let Some(hit) = scan(start, &mut fallback) {
+        return Some(hit);
+    }
+    for f in provenance_files(start, cache) {
+        let records = cache[&f].clone();
+        if let Some(hit) = scan(&records, &mut fallback) {
+            return Some(hit);
+        }
+    }
+    fallback
+}
+
+/// Expand one synthetic to the raw records it stands for, following nested synthetics and
+/// swapping masked copies for clean ones where the provenance graph still has them.
+fn expand_synthetic(
+    rec: &Value,
+    cache: &mut HashMap<PathBuf, Vec<Value>>,
+    depth: usize,
+) -> Vec<Value> {
+    if depth == 0 {
+        return vec![rec.clone()];
+    }
+    let src = match rec.pointer("/recompactProvenance/source").and_then(|v| v.as_str()) {
+        Some(s) => PathBuf::from(s),
+        None => return vec![rec.clone()],
+    };
+    if !src.exists() {
+        return vec![rec.clone()]; // deleted transcript: the summary itself is the best copy left
+    }
+    cache.entry(src.clone()).or_insert_with(|| load_jsonl(&src));
+    let covered: Vec<String> = rec
+        .pointer("/recompactProvenance/coveredUuids")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|u| u.as_str()).map(str::to_string).collect())
+        .unwrap_or_default();
+    let source_records = cache[&src].clone();
+    let mut out = Vec::new();
+    for r in &source_records {
+        let Some(u) = rec_uuid(r) else { continue };
+        if !covered.iter().any(|c| c == u) {
+            continue;
+        }
+        if truthy(r, "recompactSynthetic") {
+            out.extend(expand_synthetic(r, cache, depth - 1));
+        } else if !is_ground(r) {
+            let u = u.to_string();
+            out.push(ground_truth_by_uuid(&u, &source_records, cache).unwrap_or_else(|| r.clone()));
+        } else {
+            out.push(r.clone());
+        }
+    }
+    out
+}
+
 pub fn rehydrate_select(compacted: &[Value], selector: &str) -> Result<Vec<Value>, String> {
     let synths: Vec<&Value> = compacted
         .iter()
         .filter(|r| truthy(r, "recompactSynthetic"))
         .collect();
-    let prov_of = |r: &Value| r.get("recompactProvenance").cloned();
     let part_of = |r: &Value| {
         r.pointer("/recompactProvenance/part")
             .and_then(|v| v.as_str())
             .map(str::to_string)
     };
+    let mut cache: HashMap<PathBuf, Vec<Value>> = HashMap::new();
 
-    let mut single_uuid: Option<String> = None;
+    // Part-key / ordinal selectors address this file's own summaries.
     let chosen: Option<&Value> = if let Some(hit) =
         synths.iter().find(|r| part_of(r).as_deref() == Some(selector))
     {
@@ -3222,53 +3348,41 @@ pub fn rehydrate_select(compacted: &[Value], selector: &str) -> Result<Vec<Value
                 ))
             }
         }
-    } else if selector.len() >= 32 {
-        let hit = synths.iter().find(|r| {
-            r.pointer("/recompactProvenance/coveredUuids")
-                .and_then(|v| v.as_array())
-                .is_some_and(|a| a.iter().any(|u| u.as_str() == Some(selector)))
-        });
-        single_uuid = Some(selector.to_string());
-        hit.copied()
     } else {
         None
     };
-    let Some(rec) = chosen else {
-        let known: Vec<String> = synths.iter().filter_map(|r| part_of(r)).collect();
+    if let Some(rec) = chosen {
+        if rec.get("recompactProvenance").is_none() {
+            return Err("summary has no provenance (assembled by an older version)".into());
+        }
+        let recovered = expand_synthetic(rec, &mut cache, REHYDRATE_MAX_DEPTH);
+        if recovered.len() == 1 && !is_ground(&recovered[0]) {
+            return Err(format!(
+                "original transcript not found for part {selector:?} (moved or deleted?)"
+            ));
+        }
+        return Ok(recovered);
+    }
+
+    // Uuid selector: the record may live any number of generations back — search the whole
+    // provenance graph, not just this file's own summaries.
+    if selector.len() >= 32 {
+        if let Some(hit) = ground_truth_by_uuid(selector, compacted, &mut cache) {
+            if truthy(&hit, "recompactSynthetic") {
+                return Ok(expand_synthetic(&hit, &mut cache, REHYDRATE_MAX_DEPTH));
+            }
+            return Ok(vec![hit]);
+        }
+        let searched = provenance_files(compacted, &mut cache).len();
         return Err(format!(
-            "selector {selector:?} matches no part key, ordinal, or covered uuid; known part keys: {known:?}"
-        ));
-    };
-    let Some(prov) = prov_of(rec) else {
-        return Err("summary has no provenance (assembled by an older version)".into());
-    };
-    let src = PathBuf::from(prov.get("source").and_then(|v| v.as_str()).unwrap_or(""));
-    if !src.exists() {
-        return Err(format!(
-            "original transcript not found at {} (moved or deleted?)",
-            src.display()
+            "uuid {selector:?} not found in this file or any of the {searched} transcript(s) reachable through provenance"
         ));
     }
-    let want: HashSet<&str> = match &single_uuid {
-        Some(u) => std::iter::once(u.as_str()).collect(),
-        None => prov
-            .get("coveredUuids")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|u| u.as_str()).collect())
-            .unwrap_or_default(),
-    };
-    let recovered: Vec<Value> = load_jsonl(&src)
-        .into_iter()
-        .filter(|r| rec_uuid(r).is_some_and(|u| want.contains(u)))
-        .collect();
-    if recovered.is_empty() {
-        return Err(format!(
-            "0 of {} covered records found in {}",
-            want.len(),
-            src.display()
-        ));
-    }
-    Ok(recovered)
+
+    let known: Vec<String> = synths.iter().filter_map(|r| part_of(r)).collect();
+    Err(format!(
+        "selector {selector:?} matches no part key, ordinal, or covered uuid; known part keys: {known:?}"
+    ))
 }
 
 pub fn cmd_rehydrate(args: &[String]) -> i32 {
