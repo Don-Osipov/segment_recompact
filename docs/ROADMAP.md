@@ -99,6 +99,15 @@ a paper; a tool you run without thinking, and a lifecycle that lets a session li
       size bounded across unlimited cycles. Known limitation: a part mixing synthetic and real
       records stays pinned this cycle (it consolidates once fully synthetic in a later cycle);
       the epoch record's derived index is not yet merged from the covered units' indexes.
+- [x] Image-aware compaction. Found live: three ~600KB screenshots pinned in user turns made a
+      session read as ~616k tokens (base64 counted as text at 4 chars/token — ~150k phantom
+      tokens per image), so continue reported "no meaningful reduction" and the loop stalled.
+      Token estimation now counts every embedded image at flat visual weight (~1.6k tokens,
+      matching how the API bills tiles, not bytes); user turns outside the keep tail have image
+      bytes replaced with rehydratable markers (user TEXT stays verbatim — the fidelity check
+      compares text and ignores markers); images inside tool results get the same treatment in
+      the mask lane. Live result on the stalled session: 4.5MB → 2.2MB on disk, 13 stale
+      screenshots elided, recent ones kept, verify green.
 - [ ] Stop-hook / scheduled-job packaging for the continue loop (today it is a documented
       one-liner; a shipped hook config would make it turnkey).
 
