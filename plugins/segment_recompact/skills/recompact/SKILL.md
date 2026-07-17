@@ -112,20 +112,59 @@ in `summaries.json` as a map from the segment's index (string) to the summary te
 ```
 
 Each summary replaces that segment's entire agent turn — so it must let the *following* user turn
-still make sense. Rubric:
+still make sense. The worksheet helps: every tool result carries a `tool` name, a `status`
+(`ok` / `error` / `empty` / `duplicate`), and a `chars` count, and each segment carries a
+code-derived `derived_index` (files touched with roles, commands run, error count) you can trust
+over your own reading of the prose. Rubric:
 
 - **State what the agent did and the outcome** in a few sentences.
 - **Preserve the non-recoverable**: errors hit + how resolved, decisions + rationale, values/answers
   discovered, build/test results (pass/fail + which), anything the next user turn reacts to.
+- **Record rejected alternatives, not just the winner**: "tried X, failed because Y, chose Z". A
+  resumed session that does not know X failed will try X again.
+- **Grade every claim epistemically**: *verified* (an exit code or test output in the worksheet
+  proves it), *observed* (text appeared in a truncated or interrupted stream), or *claimed* (the
+  agent said so without evidence). A result whose `status` is `error`, or whose output was cut off
+  by a timeout or kill, must NEVER be summarized as a confirmed success; write what was observed
+  and that completion is unverified.
+- **Quote key phrases verbatim** for the load-bearing specifics (exact error text, exact values,
+  exact names); paraphrase is where drift starts.
 - **Reference recoverable state by pointer, not content**: "edited `src/foo.rs` (added `bar`)", not
-  the diff; inline a file's content only if that specific value mattered to the thread.
-- **Drop**: superseded reads, verbose successful output, dead-end exploration, duplicate listings.
+  the diff; inline a file's content only if that specific value mattered to the thread. Take file
+  paths from `derived_index`, which cannot have missed one.
+- **Drop**: superseded reads, verbose successful output, dead-end exploration, duplicate listings
+  (the worksheet has already elided `empty` and `duplicate` results for you).
 - **Keep the connective tissue**: if the next user turn says "now the other one," the summary must
   make "the other one" resolvable.
 - **Stay faithful**: never claim a success that didn't happen; preserve uncertainty the agent had.
 
 Write in first person past tense ("I read…, found…, then edited…"), as the assistant's own recap —
 because that's exactly the role the record plays on resume.
+
+Two optional extras in `summaries.json`:
+
+- **`"ledger"`**: standing constraints, corrections, and decisions that must survive every future
+  compaction ("never push to main", "the user corrected X to Y"). Assemble injects it as a pinned
+  record just before the verbatim tail; providing a new ledger on a later pass supersedes the old
+  one wholesale. Do not rely on a constraint surviving inside one segment's prose summary.
+- **`--cache <path>`** (flag on assemble): a summary cache keyed by segment content hash (the
+  worksheet shows each segment's `content_hash`). On a repeated recompaction of a continued
+  session, unchanged segments resolve from the cache automatically and only the new segments need
+  summaries. Keep one cache file per session lineage.
+
+### Mask mode — the no-summary express lane
+
+When the goal is bulk reduction rather than narrative compression, skip Steps 2 and 3 entirely:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/bin/recompact" assemble <session.jsonl> --mode mask --keep 1
+```
+
+Masking keeps every record and all assistant prose verbatim; it only replaces stale tool-result
+payloads over 500 chars with placeholders (error output stays verbatim, head+tail to 2000 chars)
+and truncates oversized `tool_use` inputs. It never rewrites text, so it cannot hallucinate.
+Verify and resume exactly as below. On tool-heavy sessions the reduction approaches summarize
+mode at zero model cost; on discussion-heavy sessions it saves little (prose is untouched).
 
 ### Step 4 — Assemble
 
@@ -144,14 +183,11 @@ new sessionId into `ROLLBACK.md`.
 SRC=<session.jsonl>; NEW=~/.claude/projects/${PROJ}/<newId>.jsonl
 # 0. non-mutation: original byte-identical (it never opened for write, but prove it)
 md5sum "$SRC"   # compare against the value you captured pre-run
-# 1. structure: every line parses
-jq -e . "$NEW" >/dev/null && echo "json OK"
-# 2. one sessionId; chain root→leaf unbroken; ends on assistant/last-prompt, not mid-tool-call
-jq -r 'select(.sessionId)|.sessionId' "$NEW" | sort -u
-jq -rc '.type' "$NEW" | tail -3
-# 3. no dangling tool_use (see the validator pattern in this skill's notes / verify run)
-# 4. user turns preserved verbatim: the set of genuine user-turn texts must be identical
-for f in "$SRC" "$NEW"; do jq -rc 'select(.type=="user" and (.message.content|type=="array") and .message.content[0].type=="text" and (has("sourceToolAssistantUUID")|not) and (.isMeta!=true)) | .message.content[0].text' "$f" | md5sum; done
+# 1. structural checks + user-turn fidelity, all in one pass:
+#    single sessionId, linear parent chain, no dangling tool_use / orphan tool_result,
+#    usage stripped, last-prompt tail points at leaf, user turns identical to the
+#    source's ACTIVE PATH
+"${CLAUDE_PLUGIN_ROOT}/bin/recompact" verify "$NEW" --source "$SRC"
 ```
 
 Spot-check 2–3 summaries against the following user turn for fidelity. Report before/after token and
@@ -165,6 +201,12 @@ anything looks wrong, roll back per `ROLLBACK.md` (the new file is additive; del
 
 ## Notes
 
+- **Only the active path is processed.** Session files are trees: retries/rewinds leave abandoned
+  branches, and an auto-compaction starts a fresh chain root, leaving pre-boundary history
+  unreachable on resume. `extract` walks the leaf's parent chain and reports how many off-path
+  records it dropped — on a session that auto-compacted, most of the file can be off-path, which
+  is correct, not a bug. A segment carrying an `isCompactSummary` record is pinned verbatim
+  (never hand-summarized).
 - **Resume compatibility is empirically validated, not documented.** The output uses only normal
   record types (no reverse-engineered `compact_boundary`). Re-verify after a Claude Code version bump.
 - The synthetic summary record is tagged `recompactSynthetic: true` so a compacted session is

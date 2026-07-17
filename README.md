@@ -6,11 +6,16 @@ Claude Code's built-in compaction summarizes the whole conversation into one pro
 threshold. `segment_recompact` takes a different tack — a retrospective, offline pass over a
 session `.jsonl` that:
 
+- **operates on the active path only** (abandoned retry branches and pre-auto-compaction history
+  are unreachable on resume, so they are dropped, never resurrected),
 - **segments the session by genuine user turn**,
 - **keeps every user turn verbatim** (never compressed),
 - **collapses each segment's agent turns + tool results into one summary** that Claude writes,
 - keeps the most recent *K* turns verbatim for clean resume,
 - emits a **shorter, resume-compatible** `.jsonl` — a normal (just smaller) session in a new file.
+
+This fork extends the original tool; the direction (reversible compaction, mechanical-first
+compression, an evaluation harness) is laid out in [`docs/ROADMAP.md`](./docs/ROADMAP.md).
 
 A small Rust helper does the deterministic surgery (parsing, segmenting, re-chaining); **Claude is
 the summarizer.** It's an ad-hoc, human-in-the-loop procedure, not a turnkey one-command tool — the
@@ -39,10 +44,16 @@ Then, in any session:
 ## How it works
 
 ```
-recompact extract  <session.jsonl>  ->  work/segments.json   (Rust: parse, classify, segment)
+recompact extract  <session.jsonl>  ->  work/segments.json   (Rust: active path, classify, segment)
    Claude reads each segment, writes summaries -> work/summaries.json
 recompact assemble <session.jsonl> work/summaries.json  ->  <newId>.jsonl  (Rust: rebuild + re-chain)
-   verify, then: claude --resume <newId>
+recompact verify   <newId>.jsonl --source <session.jsonl>   (Rust: chain, tool pairs, user-turn fidelity)
+   then: claude --resume <newId>
+
+# or the zero-LLM express lane: keep all prose, elide stale tool-result bulk
+recompact assemble <session.jsonl> --mode mask   ->  <newId>.jsonl
+# and reversibility: list summaries / recover the verbatim originals they replaced
+recompact rehydrate <newId>.jsonl [ordinal]
 ```
 
 The skill walks Claude through it, including a **mandatory backup + rollback note** before any

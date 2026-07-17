@@ -1,0 +1,37 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            targets: "aarch64-apple-darwin x86_64-apple-darwin"
+          - os: ubuntu-latest
+            targets: "x86_64-unknown-linux-gnu"
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: plugins/segment_recompact
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --release
+      - name: build targets
+        run: |
+          mkdir -p dist
+          for t in ${{ matrix.targets }}; do
+            rustup target add "$t"
+            cargo build --release --target "$t"
+            cp "target/$t/release/recompact" "dist/recompact-$t"
+          done
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: plugins/segment_recompact/dist/recompact-*

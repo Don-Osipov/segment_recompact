@@ -1,7 +1,11 @@
 [package]
 name = "recompact"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+
+[lib]
+name = "recompact"
+path = "src/lib.rs"
 
 [[bin]]
 name = "recompact"
@@ -9,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 serde_json = "1"
+getrandom = "0.2"
 
 [profile.release]
 opt-level = 2
