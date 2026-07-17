@@ -159,6 +159,22 @@ pub fn user_text(r: &Value) -> String {
     }
 }
 
+/// `user_text` for the verify fidelity comparison: image-elision markers are the one synthetic
+/// text an assembled user turn may contain, so they are excluded before comparing to the source.
+pub fn fidelity_text(r: &Value) -> String {
+    match content(r) {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .filter(|t| !t.starts_with("[recompact: image elided"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 // ----------------------------------------------------------------------------- active path
 
 /// Session files are trees, not chains: retries and rewinds leave abandoned branches in the file,
@@ -438,12 +454,37 @@ pub fn load_jsonl(path: &Path) -> Vec<Value> {
     out
 }
 
+/// Estimated chars a base64 image block contributes to context. The API bills an image by its
+/// rendered tiles (~1.6k tokens), not its bytes — a 600KB screenshot must not read as 150k
+/// tokens, or thresholds fire on phantom mass and compaction chases weight it cannot remove.
+pub const IMAGE_EST_CHARS: usize = 6400;
+
+fn image_excess(v: &Value, acc: &mut usize) {
+    match v {
+        Value::Array(a) => a.iter().for_each(|x| image_excess(x, acc)),
+        Value::Object(o) => {
+            if o.get("type").and_then(|t| t.as_str()) == Some("image") {
+                if let Some(d) = o.get("source").and_then(|s| s.get("data")).and_then(|d| d.as_str()) {
+                    *acc += d.len().saturating_sub(IMAGE_EST_CHARS);
+                    return;
+                }
+            }
+            o.values().for_each(|x| image_excess(x, acc));
+        }
+        _ => {}
+    }
+}
+
+/// Serialized length for token math, with embedded images counted at flat visual weight.
+pub fn est_len(r: &Value) -> usize {
+    let total = serde_json::to_string(r).map(|s| s.len()).unwrap_or(0);
+    let mut excess = 0usize;
+    image_excess(r, &mut excess);
+    total.saturating_sub(excess)
+}
+
 pub fn approx_tokens(records: &[Value]) -> usize {
-    records
-        .iter()
-        .map(|r| serde_json::to_string(r).map(|s| s.len()).unwrap_or(0))
-        .sum::<usize>()
-        / 4
+    records.iter().map(est_len).sum::<usize>() / 4
 }
 
 pub fn truncate(s: &str, n: usize) -> String {
@@ -542,19 +583,15 @@ pub struct BudgetPlan {
 }
 
 fn tokens_of(records: &[Value], indices: &[usize]) -> usize {
-    indices
-        .iter()
-        .map(|&i| serde_json::to_string(&records[i]).map(|s| s.len()).unwrap_or(0))
-        .sum::<usize>()
-        / 4
+    indices.iter().map(|&i| est_len(&records[i])).sum::<usize>() / 4
 }
 
 fn mask_tokens_of(records: &[Value], indices: &[usize]) -> usize {
     indices
         .iter()
         .map(|&i| match mask_record(&records[i]) {
-            Masked::Unchanged => serde_json::to_string(&records[i]).map(|s| s.len()).unwrap_or(0),
-            Masked::Replaced(v) => serde_json::to_string(&v).map(|s| s.len()).unwrap_or(0),
+            Masked::Unchanged => est_len(&records[i]),
+            Masked::Replaced(v) => est_len(&v),
             Masked::Dropped => 0,
         })
         .sum::<usize>()
@@ -1075,6 +1112,23 @@ pub fn mask_record(r: &Value) -> Masked {
         for b in blocks.iter_mut() {
             match b.get("type").and_then(|v| v.as_str()) {
                 Some("tool_result") => {
+                    // Screenshot-style results carry image blocks in their content array; the
+                    // bytes get the same flat treatment as top-level images.
+                    if let Some(arr) = b.get_mut("content").and_then(|c| c.as_array_mut()) {
+                        for e in arr.iter_mut() {
+                            if e.get("type").and_then(|v| v.as_str()) == Some("image") {
+                                let n = e
+                                    .pointer("/source/data")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.len())
+                                    .unwrap_or(0);
+                                if n > IMAGE_EST_CHARS {
+                                    *e = json!({"type": "text", "text": format!("[recompact: image elided (~{} KB); the original session file retains it]", n / 1024)});
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
                     let text = tool_result_text(b);
                     let is_error = b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
                     let chars = text.chars().count();
@@ -1104,6 +1158,17 @@ pub fn mask_record(r: &Value) -> Masked {
                                 }
                             }
                         }
+                    }
+                }
+                Some("image") => {
+                    let n = b
+                        .pointer("/source/data")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.len())
+                        .unwrap_or(0);
+                    if n > IMAGE_EST_CHARS {
+                        *b = json!({"type": "text", "text": format!("[recompact: image elided (~{} KB); the original session file retains it]", n / 1024)});
+                        changed = true;
                     }
                 }
                 _ => {}
@@ -1153,6 +1218,38 @@ pub fn mask_record(r: &Value) -> Masked {
         Masked::Replaced(m)
     } else {
         Masked::Unchanged
+    }
+}
+
+/// Replace base64 image blocks with rehydratable text markers, leaving every text block intact.
+/// Applied to user turns outside the keep tail: a user turn's TEXT is sacred (verify compares it
+/// verbatim), but an old screenshot's bytes are the heaviest thing a session can pin — the model
+/// has already acted on it, recent images stay, and the original file retains what is elided.
+pub fn elide_images(r: &Value) -> Option<Value> {
+    let mut m = r.clone();
+    let mut count = 0usize;
+    if let Some(blocks) = m.pointer_mut("/message/content").and_then(|c| c.as_array_mut()) {
+        for b in blocks.iter_mut() {
+            if b.get("type").and_then(|v| v.as_str()) == Some("image") {
+                let n = b
+                    .pointer("/source/data")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.len())
+                    .unwrap_or(0);
+                if n > IMAGE_EST_CHARS {
+                    *b = json!({"type": "text", "text": format!("[recompact: image elided (~{} KB); rehydrate from the original session to recover it]", n / 1024)});
+                    count += 1;
+                }
+            }
+        }
+    }
+    if count > 0 {
+        if let Some(obj) = m.as_object_mut() {
+            obj.insert("recompactImagesElided".into(), json!(count));
+        }
+        Some(m)
+    } else {
+        None
     }
 }
 
@@ -1540,7 +1637,16 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
                 out.push(l);
             }
         }
-        out.push(records[seg.user_idx].clone());
+        // User turns are pinned, but their embedded screenshots are not: outside the keep tail
+        // the image bytes give way to markers (text verbatim; the original retains the pixels).
+        if s < tail_start {
+            match elide_images(&records[seg.user_idx]) {
+                Some(v) => out.push(v),
+                None => out.push(records[seg.user_idx].clone()),
+            }
+        } else {
+            out.push(records[seg.user_idx].clone());
+        }
         if plans[s].kept_verbatim {
             for &i in &seg.activity {
                 if drop_old_ledgers && truthy(&records[i], "recompactLedger") {
@@ -3368,12 +3474,13 @@ pub fn cmd_verify(args: &[String]) -> i32 {
                 if growth > 0 {
                     hole = true;
                 }
-                known_texts.push(user_text(r));
+                known_texts.push(fidelity_text(r));
             } else {
                 growth += 1;
             }
         }
-        let assembled: Vec<String> = new.iter().filter(|r| is_genuine_user(r)).map(user_text).collect();
+        let assembled: Vec<String> =
+            new.iter().filter(|r| is_genuine_user(r)).map(fidelity_text).collect();
         let ok = !hole && known_texts == assembled;
         let mut detail = format!(
             "source has {} known to assembly, assembled has {}",
