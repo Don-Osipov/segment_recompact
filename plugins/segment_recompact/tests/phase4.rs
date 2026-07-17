@@ -103,6 +103,44 @@ fn project_path_munging_matches_claude_code() {
 }
 
 #[test]
+fn lineage_skips_stale_twin_when_parent_kept_living() {
+    let dir = tmp_dir();
+    let src = write_compressible_session(&dir);
+    assert_eq!(
+        cmd_continue(&[src.to_string_lossy().into_owned(), "--threshold".into(), "1000".into()]),
+        0
+    );
+    let twin = lineage_latest(&dir, SESSION);
+    assert_ne!(twin, SESSION);
+
+    // The parent session keeps living AFTER the twin was cut (mid-session compaction, then the
+    // conversation continued). Its new turns exist only in the parent, so resolution must stop
+    // treating the twin as the live head.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    let mut f = fs::OpenOptions::new().append(true).open(&src).unwrap();
+    use std::io::Write;
+    writeln!(
+        f,
+        "{}",
+        serde_json::json!({
+            "type": "user", "uuid": "post-cut", "parentUuid": null, "sessionId": SESSION,
+            "timestamp": "2026-07-17T23:59:59.000Z", "userType": "external", "isSidechain": false,
+            "message": {"role": "user", "content": [{"type": "text", "text": "turn after the cut"}]}
+        })
+    )
+    .unwrap();
+    assert_eq!(
+        lineage_latest(&dir, SESSION),
+        SESSION,
+        "a twin older than its still-living parent is stale and must not be resolved to"
+    );
+
+    // A deleted twin is equally unresolvable.
+    fs::remove_file(dir.join(format!("{twin}.jsonl"))).unwrap();
+    assert_eq!(lineage_latest(&dir, SESSION), SESSION);
+}
+
+#[test]
 fn continue_under_threshold_is_identity() {
     let dir = tmp_dir();
     let src = write_compressible_session(&dir);

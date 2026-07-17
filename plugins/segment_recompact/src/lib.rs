@@ -1794,13 +1794,31 @@ pub fn lineage_remove(dir: &Path, child: &str) {
 
 /// Follow the lineage from a session id to its newest compacted descendant. Returns the input id
 /// unchanged when it has no descendants (identity resolution keeps this composable).
+fn session_mtime(dir: &Path, id: &str) -> Option<std::time::SystemTime> {
+    fs::metadata(dir.join(format!("{id}.jsonl")))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
 pub fn lineage_latest(dir: &Path, start: &str) -> String {
     let m = lineage_load(dir);
     let mut cur = start.to_string();
     for _ in 0..1000 {
+        // A descendant is only followed while it is FRESHER than its parent: a twin cut
+        // mid-session goes stale the moment the parent session keeps appending (its unique
+        // turns are missing from the twin), and resuming it would silently drop them from the
+        // continued thread. A stale or deleted twin is skipped; continue then re-compacts from
+        // the parent, which the summary cache makes cheap.
+        let cur_mtime = session_mtime(dir, &cur);
         let next = m
             .iter()
-            .filter(|(_, v)| v.get("parent").and_then(|p| p.as_str()) == Some(cur.as_str()))
+            .filter(|(k, v)| {
+                v.get("parent").and_then(|p| p.as_str()) == Some(cur.as_str())
+                    && match (session_mtime(dir, k), cur_mtime) {
+                        (Some(child), Some(parent)) => child >= parent,
+                        (child, _) => child.is_some(),
+                    }
+            })
             .max_by_key(|(_, v)| v.get("at").and_then(|a| a.as_u64()).unwrap_or(0))
             .map(|(k, _)| k.clone());
         match next {
