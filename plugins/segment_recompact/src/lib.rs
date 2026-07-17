@@ -27,7 +27,9 @@ recompact rehydrate <compacted.jsonl> [part-key | ordinal | uuid]\n  \
 recompact continue  <session.jsonl | sessionId> [--threshold T] [--keep K]\n                      \
 [--summarize-with M [--escalate-with M2] [--escalate-above S]]\n  \
 recompact shell     [sessionId] [--threshold T] [--goal G] [--auto]\n                      \
-[--summarize-with M ...] (continuous self-compacting session)\n  \
+[--summarize-with M ...] (continuous self-compacting session;\n                      \
+agent SIGTERM handoff auto-cycles; old summaries consolidate\n                      \
+into epochs re-derived from raw provenance)\n  \
 recompact resume    <session.jsonl | sessionId>\n  \
 recompact scan      [project-dir] [--estimate]\n\n\
   --keep K       number of most-recent segments kept verbatim (default 1)\n  \
@@ -379,13 +381,23 @@ pub fn split_parts(records: &[Value], seg: &Segment, threshold: usize) -> Vec<Ve
 /// of age: those records are the only surviving carriers of what they replaced, and a hand-written
 /// summary of a summary is exactly the recursive loss this tool exists to avoid.
 pub fn plan(records: &[Value], segs: &[Segment], keep: usize) -> Vec<SegPlan> {
+    plan_ex(records, segs, keep, false)
+}
+
+/// With `epochs`, this tool's own summaries (recompactSynthetic) no longer pin their segment:
+/// the budget planner may consolidate runs of them into coarser epoch digests re-derived from the
+/// RAW records their provenance covers — never from the summary text — so an arbitrarily long
+/// self-compaction loop stays bounded instead of monotonically accumulating old summaries.
+/// Native compactor summaries (isCompactSummary) still pin: they carry no provenance to re-derive
+/// from. Only the budget path uses `epochs`; classic assembly keeps the hard pin.
+pub fn plan_ex(records: &[Value], segs: &[Segment], keep: usize, epochs: bool) -> Vec<SegPlan> {
     segs.iter()
         .enumerate()
         .map(|(s, seg)| {
             let tail = s + keep >= segs.len();
             let pinned = seg.activity.iter().any(|&i| {
                 truthy(&records[i], "isCompactSummary")
-                    || truthy(&records[i], "recompactSynthetic")
+                    || (!epochs && truthy(&records[i], "recompactSynthetic"))
                     || truthy(&records[i], "recompactLedger")
             });
             let kept_verbatim = tail || pinned;
@@ -470,7 +482,7 @@ fn last_prompt_text(records: &[Value]) -> Option<String> {
 // --------------------------------------------------------------------------------- arg plumbing
 
 pub fn parse_opts(args: &[String]) -> (Vec<String>, Map<String, Value>) {
-    const FLAGS: &[&str] = &["plan", "auto", "estimate"]; // boolean flags take no value
+    const FLAGS: &[&str] = &["plan", "auto", "estimate", "epochs"]; // boolean flags take no value
     let mut positional = Vec::new();
     let mut opts = Map::new();
     let mut i = 0;
@@ -576,6 +588,7 @@ pub fn plan_budget(
     seg_keys: &[Vec<String>],
     target: usize,
     allow_summarize: bool,
+    epochs: &HashMap<String, Option<String>>,
     summary_tokens: impl Fn(&str) -> Option<usize>,
 ) -> BudgetPlan {
     // Fixed cost: head + every genuine user turn + pinned/tail segments kept whole.
@@ -640,6 +653,24 @@ pub fn plan_budget(
         let verbatim = tokens_of(records, part);
         let mask = mask_tokens_of(records, part).min(verbatim);
         let summary = summary_tokens(&key).unwrap_or(400).min(mask);
+        // Parts touching this tool's own prior summaries are epoch material: consolidatable only
+        // when every record is synthetic AND its provenance resolves back to raw (the digest was
+        // buildable). Anything else — mixed parts, unresolvable provenance, epochs disabled —
+        // stays verbatim: summarizing summary text is the recursive loss this tool exists to
+        // avoid.
+        let syn = part
+            .iter()
+            .filter(|&&i| truthy(&records[i], "recompactSynthetic"))
+            .count();
+        if syn > 0 {
+            match epochs.get(&key) {
+                Some(Some(_)) => {
+                    salience = 0.0; // oldest, already-compressed: first to coarsen
+                    floor = "";
+                }
+                _ => floor = "pinned",
+            }
+        }
         units.push(UnitPlan {
             key,
             seg: s,
@@ -657,6 +688,9 @@ pub fn plan_budget(
         }
         let mut best: Option<(usize, Treatment, usize, f32)> = None; // (idx, next, savings, score)
         for (i, u) in units.iter().enumerate() {
+            if u.floor == "pinned" {
+                continue;
+            }
             let next = match u.treatment {
                 // Pure-prose units mask to zero savings; they may skip straight to Summarize,
                 // or the ladder would strand them at Verbatim forever.
@@ -1252,11 +1286,13 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         eprintln!("error: --plan requires --target <tokens>");
         return Err(2);
     }
+    let epochs_on = opts.get("epochs").and_then(|v| v.as_bool()).unwrap_or(false)
+        && target.is_some();
 
     let loaded = load_jsonl(&src);
     let (records, _off_path) = select_active(loaded);
     let (head, segs) = segment(&records);
-    let plans = plan(&records, &segs, keep);
+    let plans = plan_ex(&records, &segs, keep, epochs_on);
 
     let summaries: Value = if mode == "summarize" {
         let summaries_path = PathBuf::from(&pos[1]);
@@ -1319,6 +1355,11 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
 
     // With --target, the planner decides per-unit treatments; the budget is an objective, the
     // salience floors are constraints, and floors win.
+    let epoch_map = if epochs_on {
+        epoch_digests(&records, &segs, &seg_parts, &seg_keys, keep)
+    } else {
+        HashMap::new()
+    };
     let budget: Option<BudgetPlan> = target.map(|t| {
         plan_budget(
             &records,
@@ -1328,6 +1369,7 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
             &seg_keys,
             t,
             mode == "summarize",
+            &epoch_map,
             |key| get_summary(key).map(|s| s.len() / 4 + 60),
         )
     });
@@ -1952,8 +1994,12 @@ pub struct Units {
 }
 
 pub fn build_units(records: &[Value], keep: usize, split: usize) -> Units {
+    build_units_ex(records, keep, split, false)
+}
+
+pub fn build_units_ex(records: &[Value], keep: usize, split: usize, epochs: bool) -> Units {
     let (_, segs) = segment(records);
-    let plans = plan(records, &segs, keep);
+    let plans = plan_ex(records, &segs, keep, epochs);
     let seg_parts: Vec<Vec<Vec<usize>>> = segs
         .iter()
         .map(|sg| split_parts(records, sg, split))
@@ -2048,6 +2094,173 @@ pub fn unit_digest(records: &[Value], seg: &Segment, part: &[usize]) -> String {
         }
     }
     truncate(&lines.join("\n"), DIGEST_CAP)
+}
+
+// ------------------------------------------------------------------------- epoch consolidation
+
+/// Leniently-parsed session files keyed by path, shared across one consolidation pass. Lenient on
+/// purpose: a missing or corrupt raw file must make its epoch unresolvable (stays verbatim), not
+/// kill the run the way load_jsonl's hard exit would.
+type RawCache = HashMap<String, Vec<Value>>;
+
+fn raw_records<'a>(cache: &'a mut RawCache, path: &str) -> &'a [Value] {
+    cache.entry(path.to_string()).or_insert_with(|| {
+        fs::read_to_string(path)
+            .map(|s| {
+                s.lines()
+                    .filter_map(|l| serde_json::from_str(l.trim()).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
+const EPOCH_MAX_DEPTH: usize = 8;
+
+/// Render the RAW records behind one synthetic summary into digest lines, following provenance
+/// through earlier generations until ground truth. Summary text is never rendered: feeding a
+/// summary to the summarizer is the drift-compounding loss the whole design forbids. Returns
+/// false when any hop cannot be resolved — the caller then leaves the unit verbatim.
+fn epoch_lines(
+    cache: &mut RawCache,
+    synth: &Value,
+    depth: usize,
+    lines: &mut Vec<String>,
+) -> bool {
+    if depth >= EPOCH_MAX_DEPTH {
+        return false;
+    }
+    let Some(prov) = synth.get("recompactProvenance") else {
+        return false;
+    };
+    let Some(srcp) = prov.get("source").and_then(|v| v.as_str()).map(String::from) else {
+        return false;
+    };
+    let covered: HashSet<String> = prov
+        .get("coveredUuids")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if covered.is_empty() {
+        return false;
+    }
+    let raw: Vec<Value> = raw_records(cache, &srcp)
+        .iter()
+        .filter(|r| rec_uuid(r).map_or(false, |u| covered.contains(u)))
+        .cloned()
+        .collect();
+    if raw.is_empty() {
+        return false; // file unreadable, or none of the covered uuids found
+    }
+    let mut tool_names: HashMap<String, String> = HashMap::new();
+    for r in &raw {
+        if let Some(blocks) = r.pointer("/message/content").and_then(|c| c.as_array()) {
+            for b in blocks {
+                if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
+                    if let (Some(id), Some(name)) = (
+                        b.get("id").and_then(|v| v.as_str()),
+                        b.get("name").and_then(|v| v.as_str()),
+                    ) {
+                        tool_names.insert(id.to_string(), name.to_string());
+                    }
+                }
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    for r in &raw {
+        if truthy(r, "recompactSynthetic") {
+            if !epoch_lines(cache, r, depth + 1, lines) {
+                return false;
+            }
+            continue;
+        }
+        if truthy(r, "recompactLedger") {
+            continue;
+        }
+        for a in render_record(r, &tool_names, &mut seen) {
+            let kind = a["kind"].as_str().unwrap_or("");
+            let line = match kind {
+                "assistant_text" => Some(format!(
+                    "ASSISTANT: {}",
+                    truncate(a["text"].as_str().unwrap_or(""), 400)
+                )),
+                "tool_use" => Some(format!(
+                    "TOOL {} {}",
+                    a["name"].as_str().unwrap_or("?"),
+                    truncate(&a["input"].to_string(), 100)
+                )),
+                "tool_result" => Some(format!(
+                    "RESULT[{},{}]: {}",
+                    a["status"].as_str().unwrap_or("?"),
+                    a["chars"].as_u64().unwrap_or(0),
+                    truncate(a["result"].as_str().unwrap_or(""), 120)
+                )),
+                "delivered_message" => Some(format!(
+                    "AGENT-REPORT: {}",
+                    truncate(a["text"].as_str().unwrap_or(""), 300)
+                )),
+                _ => None,
+            };
+            if let Some(l) = line {
+                lines.push(l);
+            }
+        }
+    }
+    true
+}
+
+/// For every non-tail part made entirely of this tool's own summaries: key → Some(digest built
+/// from the raw records their provenance covers), or None when any provenance hop is
+/// unresolvable (that part then stays verbatim via the planner's pin floor). Deterministic on
+/// the session file + raw files, so continue and assemble derive identical eligibility.
+pub fn epoch_digests(
+    records: &[Value],
+    segs: &[Segment],
+    seg_parts: &[Vec<Vec<usize>>],
+    seg_keys: &[Vec<String>],
+    keep: usize,
+) -> HashMap<String, Option<String>> {
+    let mut out = HashMap::new();
+    let mut cache: RawCache = HashMap::new();
+    let tail_start = segs.len().saturating_sub(keep);
+    for (s, parts) in seg_parts.iter().enumerate() {
+        if s >= tail_start {
+            break;
+        }
+        for (p, part) in parts.iter().enumerate() {
+            if part.is_empty()
+                || !part
+                    .iter()
+                    .all(|&i| truthy(&records[i], "recompactSynthetic"))
+            {
+                continue;
+            }
+            let mut lines = vec![
+                format!(
+                    "USER ASKED: {}",
+                    truncate(&user_text(&records[segs[s].user_idx]), 300)
+                ),
+                "EARLIER, ALREADY-SUMMARIZED WORK — below is the RAW activity it covered. Write ONE consolidated recap of the whole span.".to_string(),
+            ];
+            let ok = part
+                .iter()
+                .all(|&i| epoch_lines(&mut cache, &records[i], 0, &mut lines));
+            out.insert(
+                seg_keys[s][p].clone(),
+                if ok {
+                    Some(truncate(&lines.join("\n"), DIGEST_CAP))
+                } else {
+                    None
+                },
+            );
+        }
+    }
+    out
 }
 
 pub const SUMMARIZER_RUBRIC: &str = "You are compacting a Claude Code session transcript. For EACH unit below, write the replacement summary in first person past tense, as the assistant's own recap. Preserve exactly: decisions and their reasons, rejected approaches, discovered values/names/numbers/ids (quote them verbatim), errors and their outcomes, file paths. State success only where the activity shows it verified; mark observed-but-unverified as such. 3 to 6 sentences per unit. Return ONLY a JSON object mapping each unit key to its summary string.";
@@ -2318,7 +2531,8 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
         // Full-ladder pre-pass: find the units the budget plan wants summarized, fill the cache.
         let mut sums_path: Option<PathBuf> = None;
         if let Some(cfg) = &o.summarize {
-            let u = build_units(&active, keep, split);
+            let u = build_units_ex(&active, keep, split, true);
+            let epoch_map = epoch_digests(&active, &u.segs, &u.seg_parts, &u.seg_keys, keep);
             let cache: Map<String, Value> = fs::read_to_string(&cache_path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -2332,6 +2546,7 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
                 &u.seg_keys,
                 o.threshold,
                 true,
+                &epoch_map,
                 |key| {
                     u.key_hashes
                         .get(key)
@@ -2353,11 +2568,13 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
                             .unwrap_or(0);
                         let seg = &u.segs[unit.seg];
                         let part = &u.seg_parts[unit.seg][p];
-                        work.push((
-                            unit.key.clone(),
-                            unit.salience,
-                            unit_digest(&active, seg, part),
-                        ));
+                        // Epoch units summarize from RAW (via provenance); everything else from
+                        // the current records.
+                        let digest = match epoch_map.get(&unit.key) {
+                            Some(Some(d)) => d.clone(),
+                            _ => unit_digest(&active, seg, part),
+                        };
+                        work.push((unit.key.clone(), unit.salience, digest));
                     }
                 }
             }
@@ -2404,6 +2621,7 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
             a_args.push(sp.to_string_lossy().into_owned());
             a_args.push("--mode".into());
             a_args.push("summarize".into());
+            a_args.push("--epochs".into());
             a_args.push("--cache".into());
             a_args.push(cache_path.to_string_lossy().into_owned());
         } else {
@@ -2575,17 +2793,28 @@ pub fn cmd_shell(args: &[String]) -> i32 {
             cmd.arg(format!("/goal {g}"));
         }
         first = false;
-        match cmd.status() {
+        let handoff = match cmd.status() {
             Ok(st) => {
+                // Exit 143 (or death by SIGTERM) is the agent handing control back on purpose —
+                // cycle immediately. A human exit (0, or Ctrl+C's 130) keeps the confirmation
+                // prompt: a person who typed /exit may genuinely want out.
                 if !st.success() {
                     eprintln!("shell: claude exited with {st}");
                 }
+                #[allow(unused_mut)]
+                let mut h = st.code() == Some(143);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    h = h || st.signal() == Some(15);
+                }
+                h
             }
             Err(e) => {
                 eprintln!("shell: cannot spawn {bin}: {e}");
                 return 1;
             }
-        }
+        };
         if let Some(live) = newest_session(&dir) {
             if id.as_deref() != Some(live.as_str()) {
                 eprintln!(
@@ -2595,17 +2824,21 @@ pub fn cmd_shell(args: &[String]) -> i32 {
                 id = Some(live);
             }
         }
-        if !auto {
+        if handoff {
+            eprintln!("shell: agent handoff (SIGTERM exit); compacting and respawning");
+        } else if !auto {
             eprintln!(
                 "shell: session {} ended. Enter = compact+respawn, q = quit",
                 id.as_deref().unwrap_or("<none>")
             );
             let mut line = String::new();
-            if std::io::stdin().read_line(&mut line).is_err() {
-                break;
-            }
-            if line.trim() == "q" {
-                break;
+            match std::io::stdin().read_line(&mut line) {
+                Err(_) | Ok(0) => break, // no terminal / EOF: quitting beats respawning forever
+                Ok(_) => {
+                    if line.trim() == "q" {
+                        break;
+                    }
+                }
             }
         }
     }
