@@ -20,10 +20,13 @@ pub const TOOL_RESULT_TRUNC: usize = 1500;
 pub const USAGE: &str = "usage:\n  \
 recompact extract   <session.jsonl> [--out work/segments.json] [--keep K]\n  \
 recompact assemble  <session.jsonl> <summaries.json> [--keep K] [--out <path>]\n  \
+recompact assemble  <session.jsonl> --mode mask [--keep K] [--out <path>]\n  \
 recompact verify    <assembled.jsonl> [--source <session.jsonl>]\n  \
 recompact probe     <session.jsonl>\n  \
 recompact rehydrate <compacted.jsonl> [ordinal]\n\n\
-  --keep K  number of most-recent segments kept verbatim (default 1)";
+  --keep K     number of most-recent segments kept verbatim (default 1)\n  \
+  --mode mask  no-LLM compaction: keep every record, replace old tool-result\n               \
+payloads with placeholders (errors kept verbatim, head+tail)";
 
 fn usage() -> i32 {
     eprintln!("{USAGE}");
@@ -490,6 +493,111 @@ pub fn cmd_extract(args: &[String]) -> i32 {
     0
 }
 
+// ------------------------------------------------------------------------------------- masking
+
+/// Error output stays verbatim up to this budget (head+tail): the exact assertion or stack trace
+/// is the one thing a resumed session cannot re-derive cheaply.
+pub const MASK_ERROR_BUDGET: usize = 2000;
+/// tool_use input string fields above this length get head+tail truncated (a 50KB Write payload
+/// is on disk already; history only needs its shape).
+pub const MASK_INPUT_FIELD_MAX: usize = 2000;
+/// Non-error results at or under this length stay verbatim: a placeholder would not be smaller,
+/// and short results ("ok", a count, a path) are usually the load-bearing part of the exchange.
+pub const MASK_RESULT_MIN: usize = 500;
+
+pub enum Masked {
+    Unchanged,
+    Replaced(Value),
+    /// The record held nothing but dead weight (e.g. a lone empty-thinking signature carrier).
+    Dropped,
+}
+
+/// Mechanical, non-generative compression of one record: replace stale tool-result payloads with
+/// placeholders, truncate oversized tool_use input fields, drop empty thinking blocks (their
+/// multi-KB signatures are pure dead weight on old turns, which are never replayed with thinking),
+/// and elide the top-level toolUseResult duplicate (UI metadata, never sent to the API). Never
+/// rewrites prose, so it cannot hallucinate; it can only omit, and the untouched original session
+/// retains everything omitted.
+pub fn mask_record(r: &Value) -> Masked {
+    let mut m = r.clone();
+    let mut changed = false;
+    if let Some(blocks) = m.pointer_mut("/message/content").and_then(|c| c.as_array_mut()) {
+        let before = blocks.len();
+        blocks.retain(|b| {
+            !(b.get("type").and_then(|v| v.as_str()) == Some("thinking")
+                && b.get("thinking")
+                    .and_then(|v| v.as_str())
+                    .is_none_or(|t| t.trim().is_empty()))
+        });
+        if blocks.len() != before {
+            changed = true;
+        }
+        if blocks.is_empty() {
+            return Masked::Dropped;
+        }
+        for b in blocks.iter_mut() {
+            match b.get("type").and_then(|v| v.as_str()) {
+                Some("tool_result") => {
+                    let text = tool_result_text(b);
+                    let is_error = b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let chars = text.chars().count();
+                    let replacement = if is_error {
+                        if chars <= MASK_ERROR_BUDGET {
+                            continue; // errors under budget stay verbatim
+                        }
+                        truncate_head_tail(&text, MASK_ERROR_BUDGET, 0.5)
+                    } else {
+                        if chars <= MASK_RESULT_MIN {
+                            continue; // short results stay verbatim; a placeholder would not be smaller
+                        }
+                        format!("[recompact: elided {chars}-char result; the original session file retains it verbatim]")
+                    };
+                    if let Some(obj) = b.as_object_mut() {
+                        obj.insert("content".into(), Value::String(replacement));
+                        changed = true;
+                    }
+                }
+                Some("tool_use") => {
+                    if let Some(input) = b.get_mut("input").and_then(|i| i.as_object_mut()) {
+                        for (_k, v) in input.iter_mut() {
+                            if let Some(s) = v.as_str() {
+                                if s.chars().count() > MASK_INPUT_FIELD_MAX {
+                                    *v = Value::String(truncate_head_tail(s, 500, 0.5));
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Claude Code duplicates every tool result in a top-level toolUseResult field (transcript-UI
+    // metadata, never part of the API message); for bulky results the duplicate costs as much as
+    // the payload itself.
+    if let Some(obj) = m.as_object_mut() {
+        if let Some(t) = obj.get("toolUseResult") {
+            let n = serde_json::to_string(t).map(|s| s.len()).unwrap_or(0);
+            if n > MASK_INPUT_FIELD_MAX {
+                obj.insert(
+                    "toolUseResult".into(),
+                    json!({"recompactElided": true, "chars": n}),
+                );
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        if let Some(obj) = m.as_object_mut() {
+            obj.insert("recompactMasked".into(), Value::Bool(true));
+        }
+        Masked::Replaced(m)
+    } else {
+        Masked::Unchanged
+    }
+}
+
 /// Code-derived facts about a segment: which files were touched and how, what ran, what failed.
 /// Deterministic (no model call), so it can be regenerated from raw on every pass without drift,
 /// and it cannot forget a file path the way prose summarization measurably does.
@@ -577,11 +685,22 @@ pub fn uuid_v4() -> String {
 
 pub fn cmd_assemble(args: &[String]) -> i32 {
     let (pos, opts) = parse_opts(args);
-    if pos.len() < 2 {
+    let mode = opts
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("summarize");
+    if !matches!(mode, "summarize" | "mask") {
+        eprintln!("error: unknown --mode {mode} (expected summarize or mask)");
+        return 2;
+    }
+    if pos.is_empty() || (mode == "summarize" && pos.len() < 2) {
         return usage();
     }
+    if mode == "mask" && pos.len() >= 2 {
+        eprintln!("error: --mode mask takes no summaries file (masking is mechanical)");
+        return 2;
+    }
     let src = PathBuf::from(&pos[0]);
-    let summaries_path = PathBuf::from(&pos[1]);
     let keep = keep_window(&opts);
 
     let loaded = load_jsonl(&src);
@@ -589,7 +708,8 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
     let (head, segs) = segment(&records);
     let plans = plan(&records, &segs, keep);
 
-    let summaries: Value = {
+    let summaries: Value = if mode == "summarize" {
+        let summaries_path = PathBuf::from(&pos[1]);
         let mut s = String::new();
         if let Err(e) = fs::File::open(&summaries_path).and_then(|mut f| f.read_to_string(&mut s)) {
             eprintln!("error: cannot read {}: {e}", summaries_path.display());
@@ -602,6 +722,8 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
                 return 1;
             }
         }
+    } else {
+        json!({})
     };
     let get_summary = |idx: usize| -> Option<String> {
         summaries
@@ -610,19 +732,18 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
             .map(String::from)
     };
 
-    // Validate: every segment that needs a summary has one.
-    let mut missing = Vec::new();
-    for (s, p) in plans.iter().enumerate() {
-        if p.needs_summary && get_summary(s).is_none() {
-            missing.push(s);
+    // Validate: every segment that needs a summary has one (masking needs none).
+    if mode == "summarize" {
+        let mut missing = Vec::new();
+        for (s, p) in plans.iter().enumerate() {
+            if p.needs_summary && get_summary(s).is_none() {
+                missing.push(s);
+            }
         }
-    }
-    if !missing.is_empty() {
-        eprintln!(
-            "error: missing summaries for segments {missing:?} in {}",
-            summaries_path.display()
-        );
-        return 1;
+        if !missing.is_empty() {
+            eprintln!("error: missing summaries for segments {missing:?} in {}", pos[1]);
+            return 1;
+        }
     }
 
     let new_session = uuid_v4();
@@ -664,6 +785,18 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
             for &i in &seg.activity {
                 if rec_uuid(&records[i]).is_some() {
                     out.push(records[i].clone());
+                }
+            }
+        } else if plans[s].needs_summary && mode == "mask" {
+            // Mechanical lane: keep every record, elide stale tool-result payloads. Pairs stay
+            // atomic (both halves kept), so the structure the Messages API validates is intact.
+            for &i in &seg.activity {
+                if rec_uuid(&records[i]).is_some() {
+                    match mask_record(&records[i]) {
+                        Masked::Unchanged => out.push(records[i].clone()),
+                        Masked::Replaced(v) => out.push(v),
+                        Masked::Dropped => {}
+                    }
                 }
             }
         } else if plans[s].needs_summary {
@@ -783,7 +916,7 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
     }
 
     eprintln!(
-        "assemble: {} → {} records (~{} → ~{} tokens, keep last {} verbatim).\n  new sessionId: {}\n  wrote: {}",
+        "assemble ({mode}): {} → {} records (~{} → ~{} tokens, keep last {} verbatim).\n  new sessionId: {}\n  wrote: {}",
         records.len(),
         out.len(),
         approx_tokens(&records),

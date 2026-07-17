@@ -49,6 +49,11 @@ recompact extract  <session.jsonl>  ->  work/segments.json   (Rust: active path,
 recompact assemble <session.jsonl> work/summaries.json  ->  <newId>.jsonl  (Rust: rebuild + re-chain)
 recompact verify   <newId>.jsonl --source <session.jsonl>   (Rust: chain, tool pairs, user-turn fidelity)
    then: claude --resume <newId>
+
+# or the zero-LLM express lane: keep all prose, elide stale tool-result bulk
+recompact assemble <session.jsonl> --mode mask   ->  <newId>.jsonl
+# and reversibility: list summaries / recover the verbatim originals they replaced
+recompact rehydrate <newId>.jsonl [ordinal]
 ```
 
 The skill walks Claude through it, including a **mandatory backup + rollback note** before any

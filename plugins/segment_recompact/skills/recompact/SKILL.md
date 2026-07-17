@@ -112,20 +112,48 @@ in `summaries.json` as a map from the segment's index (string) to the summary te
 ```
 
 Each summary replaces that segment's entire agent turn — so it must let the *following* user turn
-still make sense. Rubric:
+still make sense. The worksheet helps: every tool result carries a `tool` name, a `status`
+(`ok` / `error` / `empty` / `duplicate`), and a `chars` count, and each segment carries a
+code-derived `derived_index` (files touched with roles, commands run, error count) you can trust
+over your own reading of the prose. Rubric:
 
 - **State what the agent did and the outcome** in a few sentences.
 - **Preserve the non-recoverable**: errors hit + how resolved, decisions + rationale, values/answers
   discovered, build/test results (pass/fail + which), anything the next user turn reacts to.
+- **Record rejected alternatives, not just the winner**: "tried X, failed because Y, chose Z". A
+  resumed session that does not know X failed will try X again.
+- **Grade every claim epistemically**: *verified* (an exit code or test output in the worksheet
+  proves it), *observed* (text appeared in a truncated or interrupted stream), or *claimed* (the
+  agent said so without evidence). A result whose `status` is `error`, or whose output was cut off
+  by a timeout or kill, must NEVER be summarized as a confirmed success; write what was observed
+  and that completion is unverified.
+- **Quote key phrases verbatim** for the load-bearing specifics (exact error text, exact values,
+  exact names); paraphrase is where drift starts.
 - **Reference recoverable state by pointer, not content**: "edited `src/foo.rs` (added `bar`)", not
-  the diff; inline a file's content only if that specific value mattered to the thread.
-- **Drop**: superseded reads, verbose successful output, dead-end exploration, duplicate listings.
+  the diff; inline a file's content only if that specific value mattered to the thread. Take file
+  paths from `derived_index`, which cannot have missed one.
+- **Drop**: superseded reads, verbose successful output, dead-end exploration, duplicate listings
+  (the worksheet has already elided `empty` and `duplicate` results for you).
 - **Keep the connective tissue**: if the next user turn says "now the other one," the summary must
   make "the other one" resolvable.
 - **Stay faithful**: never claim a success that didn't happen; preserve uncertainty the agent had.
 
 Write in first person past tense ("I read…, found…, then edited…"), as the assistant's own recap —
 because that's exactly the role the record plays on resume.
+
+### Mask mode — the no-summary express lane
+
+When the goal is bulk reduction rather than narrative compression, skip Steps 2 and 3 entirely:
+
+```bash
+"${CLAUDE_PLUGIN_ROOT}/bin/recompact" assemble <session.jsonl> --mode mask --keep 1
+```
+
+Masking keeps every record and all assistant prose verbatim; it only replaces stale tool-result
+payloads over 500 chars with placeholders (error output stays verbatim, head+tail to 2000 chars)
+and truncates oversized `tool_use` inputs. It never rewrites text, so it cannot hallucinate.
+Verify and resume exactly as below. On tool-heavy sessions the reduction approaches summarize
+mode at zero model cost; on discussion-heavy sessions it saves little (prose is untouched).
 
 ### Step 4 — Assemble
 

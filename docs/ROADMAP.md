@@ -59,11 +59,18 @@ cites the strongest evidence behind it.
       originals from the untouched source.
 - [x] Iteration invariant (early Phase 2 pull-forward): segments carrying a `recompactSynthetic`
       record are pinned verbatim, so a second pass can never summarize a summary.
-- [ ] Superseded-file-read elision and errored-call input dropping in the assembled output.
-- [ ] Narrative lane rubric: structured fields for decisions and rejected alternatives, verbatim
-      key-phrase quoting, mandatory epistemic grading in SKILL.md.
-- [ ] Mask mode: a no-LLM compaction mode that keeps assistant text verbatim and replaces old
-      tool_result contents with placeholders (pairs stay atomic).
+- [x] Narrative lane rubric in SKILL.md: rejected alternatives, epistemic grading
+      (verified/observed/claimed; a killed or truncated result is never a confirmed success),
+      verbatim key-phrase quoting, derived_index as the source of truth for file paths.
+- [x] Mask mode (`assemble --mode mask`): no-LLM compaction. Keeps every record and all assistant
+      prose; elides tool-result payloads over 500 chars (errors verbatim head+tail to 2000),
+      truncates oversized tool_use inputs, elides the top-level toolUseResult duplicate, and drops
+      empty-thinking signature carriers (multi-KB signatures on zero-content blocks). Pairs stay
+      atomic. Measured on a real 980k-token session: 63% reduction at zero model cost (summarize
+      mode: 98% with LLM summaries); resume-compatibility proven by headless resume with full
+      continuity.
+- [ ] Attachment-record elision: `attachment` records held 0.46MB in the reference session; their
+      resume semantics are unverified, so masking leaves them untouched until studied.
 
 ## Phase 2: iterated recompaction lifecycle
 

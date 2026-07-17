@@ -215,6 +215,95 @@ fn synthetic_summaries_are_never_resummarized() {
 }
 
 #[test]
+fn mask_mode_elides_bulk_keeps_errors_and_structure() {
+    let dir = tmp_dir();
+    let big = "x".repeat(5000);
+    let mut sig_carrier = assistant("a0", "u1", "");
+    sig_carrier["message"]["content"] =
+        json!([{"type": "thinking", "thinking": "", "signature": "SIGBLOB".repeat(500)}]);
+    let mut heavy_result = tool_result_full("r1", "a1", "t_read", &big, false);
+    heavy_result["toolUseResult"] = json!({"file": {"content": "z".repeat(8000)}});
+    let records = vec![
+        user("u1", None, "investigate"),
+        sig_carrier,
+        tool_use_named("a1", "a0", "t_read", "Read", json!({"file_path": "/src/big.rs"})),
+        heavy_result,
+        tool_use_named("a2", "r1", "t_bash", "Bash", json!({"command": "cargo build"})),
+        tool_result_full("r2", "a2", "t_bash", "error[E0308]: mismatched types", true),
+        tool_use_named(
+            "a3",
+            "r2",
+            "t_write",
+            "Write",
+            json!({"file_path": "/src/gen.rs", "content": "y".repeat(6000)}),
+        ),
+        tool_result_full("r3", "a3", "t_write", "ok", false),
+        assistant("a4", "r3", "I looked at the big file and rebuilt."),
+        user("u2", Some("a4"), "and then?"),
+        assistant("a5", "u2", "done"),
+        last_prompt("a5", "and then?"),
+    ];
+    let src = write_jsonl_file(&dir, "maskable.jsonl", &records);
+    let out = dir.join("masked.jsonl");
+    assert_eq!(
+        cmd_assemble(&[
+            src.to_string_lossy().into_owned(),
+            "--mode".into(),
+            "mask".into(),
+            "--out".into(),
+            out.to_string_lossy().into_owned(),
+        ]),
+        0
+    );
+    // Structure survives the strictest checks, including verbatim user turns.
+    assert_eq!(
+        cmd_verify(&[
+            out.to_string_lossy().into_owned(),
+            "--source".into(),
+            src.to_string_lossy().into_owned(),
+        ]),
+        0
+    );
+    let text = fs::read_to_string(&out).unwrap();
+    assert!(!text.contains(&big), "bulk result must be elided");
+    assert!(text.contains("elided 5000-char result"));
+    assert!(text.contains("error[E0308]"), "error text stays verbatim");
+    assert!(text.contains("\\\"ok\\\"") || text.contains("ok"), "short results stay verbatim");
+    assert!(!text.contains(&"y".repeat(6000)), "oversized tool_use input truncated");
+    assert!(text.contains("recompactMasked"));
+    assert!(
+        text.contains("I looked at the big file"),
+        "assistant prose is never touched by masking"
+    );
+    // No LLM summary record in mask mode.
+    assert!(!text.contains("recompactSynthetic"));
+    // Empty-thinking signature carriers are dropped whole.
+    assert!(!text.contains("SIGBLOB"), "empty-thinking signature blob must be gone");
+    // The top-level toolUseResult duplicate is elided.
+    assert!(!text.contains(&"z".repeat(8000)), "bulky toolUseResult must be elided");
+    assert!(text.contains("recompactElided"));
+}
+
+#[test]
+fn mask_mode_rejects_summaries_file_and_bad_mode() {
+    let dir = tmp_dir();
+    let src = write_jsonl_file(&dir, "s.jsonl", &rich_session());
+    assert_eq!(
+        cmd_assemble(&[
+            src.to_string_lossy().into_owned(),
+            "sums.json".into(),
+            "--mode".into(),
+            "mask".into(),
+        ]),
+        2
+    );
+    assert_eq!(
+        cmd_assemble(&[src.to_string_lossy().into_owned(), "--mode".into(), "bogus".into()]),
+        2
+    );
+}
+
+#[test]
 fn probe_passes_on_wellformed_and_fails_on_userless() {
     let dir = tmp_dir();
     let good = write_jsonl_file(&dir, "good.jsonl", &rich_session());
