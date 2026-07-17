@@ -270,15 +270,15 @@ fn double_recompaction_preserves_multihop_provenance() {
     assert_eq!(seg0["kept_verbatim"], true, "synthetic-summary segment is pinned");
     assert_eq!(seg0["needs_summary"], false);
 
-    let needs: Vec<u64> = doc["segments_needing_summary"]
+    let needs: Vec<String> = doc["segments_needing_summary"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|v| v.as_u64().unwrap())
+        .map(|v| v.as_str().unwrap().to_string())
         .collect();
     let sums2: Value = needs
         .iter()
-        .map(|s| (s.to_string(), Value::String(format!("Summary for segment {s}."))))
+        .map(|s| (s.clone(), Value::String(format!("Summary for segment {s}."))))
         .collect::<serde_json::Map<String, Value>>()
         .into();
     let sums2_path = dir.join("sums2.json");
