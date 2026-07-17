@@ -234,6 +234,20 @@ automatically with a kick-prompt, because a resumed goal does not start a turn o
 `--goal` arms one on the first spawn; `--auto` cycles without the confirmation prompt. From the
 chair it is one session that never fills up.
 
+Two properties make the loop truly hands-off and unbounded:
+
+- **Agent handoff needs no keystroke.** When the agent inside the session ends it with SIGTERM
+  (`kill -TERM <tui-pid>` as the entire command, exit status 143), the shell treats that as a
+  deliberate handoff and cycles immediately. A human exit (status 0, or Ctrl+C) still gets the
+  Enter/q prompt — a person who typed `/exit` may genuinely want out.
+- **Old summaries do not accumulate forever.** When the budget requires it, runs of prior-cycle
+  summary records are consolidated into coarser epoch digests. The summarizer input for an epoch
+  is re-derived from the RAW records its provenance covers (following provenance across
+  generations to ground truth) — summary text is never fed back to a model, so drift cannot
+  compound. If the raw file is gone, those records stay verbatim instead. The steady state is a
+  recency gradient: verbatim tail, per-unit summaries for recent work, epoch digests for old
+  work — bounded total size over unlimited cycles.
+
 ### Step 4 — Assemble
 
 ```bash

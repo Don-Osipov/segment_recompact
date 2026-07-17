@@ -86,6 +86,19 @@ a paper; a tool you run without thinking, and a lifecycle that lets a session li
 - [x] Rehydrate addressing matches provenance: selectors are a part key (exactly what
       `recompactProvenance.part` advertises), a listing ordinal, or a covered record uuid
       (returns that single verbatim record); unknown selectors list the known part keys.
+- [x] Agent handoff without a keystroke: a SIGTERM exit (143) from inside the session means the
+      agent handed control back on purpose — the shell cycles immediately; a human exit (0/130)
+      keeps the confirmation prompt.
+- [x] Bounded context for arbitrarily long loops — epoch consolidation. Prior-cycle summaries no
+      longer accumulate forever: when the budget needs it, runs of old synthetic records are
+      consolidated into coarser epoch digests whose summarizer input is re-derived from the RAW
+      records their provenance covers (recursively, across generations, to ground truth). Summary
+      text is never fed to the summarizer — the never-resummarize invariant holds by
+      construction. Unresolvable provenance (deleted raw file) pins the records verbatim.
+      Result: a recency gradient — verbatim tail, per-unit summaries, epoch digests — with total
+      size bounded across unlimited cycles. Known limitation: a part mixing synthetic and real
+      records stays pinned this cycle (it consolidates once fully synthetic in a later cycle);
+      the epoch record's derived index is not yet merged from the covered units' indexes.
 - [ ] Stop-hook / scheduled-job packaging for the continue loop (today it is a documented
       one-liner; a shipped hook config would make it turnkey).
 

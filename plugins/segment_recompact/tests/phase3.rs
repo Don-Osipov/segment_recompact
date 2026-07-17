@@ -348,12 +348,12 @@ fn planner_floors_hold_and_salience_orders_demotion() {
     let (segs, plans, seg_parts, seg_keys) = build_plan_inputs(&kept, 1, 0);
 
     // Generous target: nothing demoted.
-    let b = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1_000_000, true, |_| Some(100));
+    let b = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1_000_000, true, &std::collections::HashMap::new(), |_| Some(100));
     assert!(b.units.iter().all(|u| u.treatment == Treatment::Verbatim));
     assert!(b.planned_total <= 1_000_000);
 
     // Impossible target: floors hold, planner terminates, reports over budget.
-    let b = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1, true, |_| Some(100));
+    let b = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1, true, &std::collections::HashMap::new(), |_| Some(100));
     assert!(b.planned_total > 1);
     let err_unit = b.units.iter().find(|u| u.floor == "error").expect("error unit exists");
     assert_ne!(err_unit.treatment, Treatment::Summarize, "error floor: never below mask");
@@ -365,7 +365,7 @@ fn planner_floors_hold_and_salience_orders_demotion() {
     assert!(boring.salience < 0.2);
 
     // Without summarize allowed (mask mode), no unit may be planned as Summarize.
-    let b = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1, false, |_| None);
+    let b = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1, false, &std::collections::HashMap::new(), |_| None);
     assert!(b.units.iter().all(|u| u.treatment != Treatment::Summarize));
     assert!(b.need_summaries.is_empty());
 }
