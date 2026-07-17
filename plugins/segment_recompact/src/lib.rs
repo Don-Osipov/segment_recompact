@@ -23,7 +23,7 @@ recompact assemble  <session.jsonl> <summaries.json> [--keep K] [--out <path>]\n
 recompact assemble  <session.jsonl> --mode mask [--keep K] [--out <path>]\n  \
 recompact verify    <assembled.jsonl> [--source <session.jsonl>]\n  \
 recompact probe     <session.jsonl>\n  \
-recompact rehydrate <compacted.jsonl> [ordinal]\n  \
+recompact rehydrate <compacted.jsonl> [part-key | ordinal | uuid]\n  \
 recompact continue  <session.jsonl | sessionId> [--threshold T] [--keep K]\n                      \
 [--summarize-with M [--escalate-with M2] [--escalate-above S]]\n  \
 recompact shell     [sessionId] [--threshold T] [--goal G] [--auto]\n                      \
@@ -2832,18 +2832,101 @@ pub fn cmd_probe(args: &[String]) -> i32 {
 /// Recover the verbatim raw records behind a synthetic summary, from the untouched original
 /// transcript. Without an ordinal, lists the summaries. With one, dumps the covered records as
 /// raw JSONL on stdout.
+/// Resolve a rehydration selector against a compacted session's synthetic records and return the
+/// verbatim originals from the source transcript. Selectors, tried in order:
+///   - a part key exactly matching `recompactProvenance.part` (what provenance advertises)
+///   - a plain 0-based ordinal into the synthetic records (the `rehydrate` listing's [n])
+///   - a record uuid found in some summary's coveredUuids — returns just that one record
+pub fn rehydrate_select(compacted: &[Value], selector: &str) -> Result<Vec<Value>, String> {
+    let synths: Vec<&Value> = compacted
+        .iter()
+        .filter(|r| truthy(r, "recompactSynthetic"))
+        .collect();
+    let prov_of = |r: &Value| r.get("recompactProvenance").cloned();
+    let part_of = |r: &Value| {
+        r.pointer("/recompactProvenance/part")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+
+    let mut single_uuid: Option<String> = None;
+    let chosen: Option<&Value> = if let Some(hit) =
+        synths.iter().find(|r| part_of(r).as_deref() == Some(selector))
+    {
+        Some(hit)
+    } else if let Ok(n) = selector.parse::<usize>() {
+        // A numeric selector can also be an unsplit segment's part key (part "3"), handled above;
+        // here it is the listing ordinal.
+        match synths.get(n) {
+            Some(r) => Some(r),
+            None => {
+                return Err(format!(
+                    "no synthetic summary [{n}] (have {}); selectors are a part key, a listing ordinal, or a covered uuid",
+                    synths.len()
+                ))
+            }
+        }
+    } else if selector.len() >= 32 {
+        let hit = synths.iter().find(|r| {
+            r.pointer("/recompactProvenance/coveredUuids")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| a.iter().any(|u| u.as_str() == Some(selector)))
+        });
+        single_uuid = Some(selector.to_string());
+        hit.copied()
+    } else {
+        None
+    };
+    let Some(rec) = chosen else {
+        let known: Vec<String> = synths.iter().filter_map(|r| part_of(r)).collect();
+        return Err(format!(
+            "selector {selector:?} matches no part key, ordinal, or covered uuid; known part keys: {known:?}"
+        ));
+    };
+    let Some(prov) = prov_of(rec) else {
+        return Err("summary has no provenance (assembled by an older version)".into());
+    };
+    let src = PathBuf::from(prov.get("source").and_then(|v| v.as_str()).unwrap_or(""));
+    if !src.exists() {
+        return Err(format!(
+            "original transcript not found at {} (moved or deleted?)",
+            src.display()
+        ));
+    }
+    let want: HashSet<&str> = match &single_uuid {
+        Some(u) => std::iter::once(u.as_str()).collect(),
+        None => prov
+            .get("coveredUuids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|u| u.as_str()).collect())
+            .unwrap_or_default(),
+    };
+    let recovered: Vec<Value> = load_jsonl(&src)
+        .into_iter()
+        .filter(|r| rec_uuid(r).is_some_and(|u| want.contains(u)))
+        .collect();
+    if recovered.is_empty() {
+        return Err(format!(
+            "0 of {} covered records found in {}",
+            want.len(),
+            src.display()
+        ));
+    }
+    Ok(recovered)
+}
+
 pub fn cmd_rehydrate(args: &[String]) -> i32 {
     let (pos, _opts) = parse_opts(args);
     if pos.is_empty() {
         return usage();
     }
     let compacted = load_jsonl(Path::new(&pos[0]));
-    let synths: Vec<&Value> = compacted
-        .iter()
-        .filter(|r| truthy(r, "recompactSynthetic"))
-        .collect();
 
     if pos.len() < 2 {
+        let synths: Vec<&Value> = compacted
+            .iter()
+            .filter(|r| truthy(r, "recompactSynthetic"))
+            .collect();
         eprintln!("{} synthetic summaries:", synths.len());
         for (n, r) in synths.iter().enumerate() {
             let text = r
@@ -2855,8 +2938,12 @@ pub fn cmd_rehydrate(args: &[String]) -> i32 {
                 .and_then(|v| v.as_array())
                 .map(|a| a.len())
                 .unwrap_or(0);
+            let part = r
+                .pointer("/recompactProvenance/part")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             eprintln!(
-                "  [{n}] covers {covered} records: {}",
+                "  [{n}] part {part} covers {covered} records: {}",
                 truncate(&text.replace('\n', " "), 100)
             );
         }
@@ -2866,47 +2953,19 @@ pub fn cmd_rehydrate(args: &[String]) -> i32 {
         return 0;
     }
 
-    let Ok(n) = pos[1].parse::<usize>() else {
-        return usage();
-    };
-    let Some(rec) = synths.get(n) else {
-        eprintln!("error: no synthetic summary [{n}] (have {})", synths.len());
-        return 1;
-    };
-    let Some(prov) = rec.get("recompactProvenance") else {
-        eprintln!("error: summary [{n}] has no provenance (assembled by an older version)");
-        return 1;
-    };
-    let src = PathBuf::from(prov.get("source").and_then(|v| v.as_str()).unwrap_or(""));
-    if !src.exists() {
-        eprintln!(
-            "error: original transcript not found at {} (moved or deleted?)",
-            src.display()
-        );
-        return 1;
-    }
-    let want: HashSet<&str> = prov
-        .get("coveredUuids")
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|u| u.as_str()).collect())
-        .unwrap_or_default();
-    let source = load_jsonl(&src);
-    let mut printed = 0;
-    for r in &source {
-        if rec_uuid(r).is_some_and(|u| want.contains(u)) {
-            println!("{}", serde_json::to_string(r).unwrap());
-            printed += 1;
+    match rehydrate_select(&compacted, &pos[1]) {
+        Ok(records) => {
+            for r in &records {
+                println!("{}", serde_json::to_string(r).unwrap());
+            }
+            eprintln!("rehydrate: {} verbatim record(s) recovered", records.len());
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
         }
     }
-    eprintln!(
-        "rehydrate: {printed} of {} covered records recovered from {}",
-        want.len(),
-        src.display()
-    );
-    if printed == 0 {
-        return 1;
-    }
-    0
 }
 
 // ----------------------------------------------------------------------------------- subcommand: verify
@@ -2919,7 +2978,25 @@ pub fn cmd_verify(args: &[String]) -> i32 {
     if pos.is_empty() {
         return usage();
     }
-    let new = load_jsonl(Path::new(&pos[0]));
+    let mut new = load_jsonl(Path::new(&pos[0]));
+
+    // Assemble writes exactly one last-prompt record, as the file's final line. A twin that has
+    // been resumed grows past it (the CLI appends live records, including further last-prompt
+    // records per user turn). Structural guarantees only ever applied to the assembled product,
+    // so verify the prefix up to the first last-prompt and report growth informationally —
+    // otherwise every resumed twin fails on its own post-assembly life.
+    let grown = match new.iter().position(|r| rec_type(r) == "last-prompt") {
+        Some(b) => new.split_off(b + 1),
+        None => Vec::new(),
+    };
+    if !grown.is_empty() {
+        eprintln!(
+            "note: {} record(s) appended after the assembly boundary (session has been resumed); \
+             verifying the assembled prefix of {} record(s)",
+            grown.len(),
+            new.len()
+        );
+    }
     let mut checks: Vec<(&str, bool, String)> = Vec::new();
 
     // Single sessionId across every record that carries one.
@@ -3012,18 +3089,54 @@ pub fn cmd_verify(args: &[String]) -> i32 {
         format!("leaf {last_uuid:?}"),
     ));
 
-    // Optional fidelity check against the source: genuine user turns, in order, must be identical.
+    // Optional fidelity check against the source: genuine user turns, in order, must be
+    // identical. The source itself may have grown after assembly (session teardown appends
+    // interrupt markers and notification records when the original session exits), so turns the
+    // assembly never saw are fine ONLY as a trailing suffix: the assembly knew a record either by
+    // keeping it (uuid in the prefix) or by summarizing it (uuid in some coveredUuids) — an
+    // unknown turn followed by a known one means a hole in the middle, which is real corruption.
     if let Some(srcp) = opts.get("source").and_then(|v| v.as_str()) {
         let (src, _) = select_active(load_jsonl(Path::new(srcp)));
-        let texts = |rs: &[Value]| -> Vec<String> {
-            rs.iter().filter(|r| is_genuine_user(r)).map(user_text).collect()
-        };
-        let (a, b) = (texts(&src), texts(&new));
-        checks.push((
-            "user turns preserved verbatim",
-            a == b,
-            format!("source has {}, assembled has {}", a.len(), b.len()),
-        ));
+        let mut known: HashSet<String> = new
+            .iter()
+            .filter_map(rec_uuid)
+            .map(str::to_string)
+            .collect();
+        for r in &new {
+            if let Some(covered) = r
+                .pointer("/recompactProvenance/coveredUuids")
+                .and_then(|v| v.as_array())
+            {
+                known.extend(covered.iter().filter_map(|u| u.as_str()).map(str::to_string));
+            }
+        }
+        let mut known_texts: Vec<String> = Vec::new();
+        let mut growth = 0usize;
+        let mut hole = false;
+        for r in src.iter().filter(|r| is_genuine_user(r)) {
+            if rec_uuid(r).is_some_and(|u| known.contains(u)) {
+                if growth > 0 {
+                    hole = true;
+                }
+                known_texts.push(user_text(r));
+            } else {
+                growth += 1;
+            }
+        }
+        let assembled: Vec<String> = new.iter().filter(|r| is_genuine_user(r)).map(user_text).collect();
+        let ok = !hole && known_texts == assembled;
+        let mut detail = format!(
+            "source has {} known to assembly, assembled has {}",
+            known_texts.len(),
+            assembled.len()
+        );
+        if hole {
+            detail.push_str("; a turn the assembly never saw sits BEFORE turns it kept — records were dropped");
+        }
+        checks.push(("user turns preserved verbatim", ok, detail));
+        if ok && growth > 0 {
+            eprintln!("note: source gained {growth} user turn(s) after assembly (session teardown or continued use); assembled turns match everything the assembly saw");
+        }
     }
 
     let mut fails = 0;
