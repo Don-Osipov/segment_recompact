@@ -60,6 +60,18 @@ resume. The wrap-up ritual: finish the stretch of work, update the ledger with t
 corrections, run the compaction, verify, and hand the user the new id to resume next time (or let
 the autonomous loop below pick it up).
 
+**Already-compacted check (do this FIRST, before any backup or extract).** If the transcript you
+are running in carries a recompact orientation preamble ("This transcript was compacted by
+segment_recompact…" — emitted as the LAST conversation record, so look at the end of the
+transcript, not the start), you are inside a compacted twin — the compaction the user asked for has
+usually ALREADY RUN, and the /recompact invocation you're reading may be the very prompt that
+triggered it before the respawn (its args describing the past run, not requesting a new one).
+Mechanical check: `recompact scan` (or the lineage sidecar) — if this session is a fresh twin
+with little or no new work since resume, do NOT compact again. Say so, and only proceed if the
+user explicitly confirms they want a *second* pass on top of the twin (e.g. after substantial
+new work). A twin that has since grown large again is a legitimate target; a just-resumed one is
+not.
+
 Confirm with the user which session, and the `--keep K` window (default `K=1`: the last K segments
 stay verbatim for clean resume).
 
@@ -177,6 +189,20 @@ treatments toward that budget instead of blanket application: error-bearing unit
 below mask, pinned records and the recent tail never move, and if the floors make the target
 unreachable the output comes in over budget with the reasons printed. `--plan` previews the
 per-unit table without writing anything.
+
+The error floor is a blunt proxy: it fires on **any** `is_error` result and cannot tell a
+benign failure (a `grep`/`rg` exit 1 on no-match, a `sed`/`cat` on a path that does not exist)
+from a load-bearing one. When one big unit carries a couple of benign errors, the floor pins its
+whole mass to mask and can hold the output far above your target — e.g. an opening
+codebase-exploration turn of 200+ mostly-successful reads that masks to ~237k because two greps
+returned no match. `--target ... --summarize-errors` lifts the veto: error-bearing units become
+summarizable like any other, but keep their raised salience (demoted last, not first), so the
+planner sheds only the units it must to reach budget and retains your recent, load-bearing turns.
+**Your summary for such a unit MUST preserve the error text verbatim** — the plan prints a
+reminder and lists the unit in the work set. The flag requires `--target`, only relaxes the
+`error` floor (never `pinned`), and is deliberately unavailable to the autonomous `continue` /
+`shell` loop: summarizing error evidence away is a supervised judgment call, not something the
+unattended loop should do.
 
 ### Autonomous continuation — sessions that compact themselves
 

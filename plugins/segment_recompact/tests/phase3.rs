@@ -348,12 +348,12 @@ fn planner_floors_hold_and_salience_orders_demotion() {
     let (segs, plans, seg_parts, seg_keys) = build_plan_inputs(&kept, 1, 0);
 
     // Generous target: nothing demoted.
-    let b = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1_000_000, true, &std::collections::HashMap::new(), |_| Some(100));
+    let b = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1_000_000, true, false, &std::collections::HashMap::new(), |_| Some(100));
     assert!(b.units.iter().all(|u| u.treatment == Treatment::Verbatim));
     assert!(b.planned_total <= 1_000_000);
 
     // Impossible target: floors hold, planner terminates, reports over budget.
-    let b = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1, true, &std::collections::HashMap::new(), |_| Some(100));
+    let b = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1, true, false, &std::collections::HashMap::new(), |_| Some(100));
     assert!(b.planned_total > 1);
     let err_unit = b.units.iter().find(|u| u.floor == "error").expect("error unit exists");
     assert_ne!(err_unit.treatment, Treatment::Summarize, "error floor: never below mask");
@@ -365,9 +365,44 @@ fn planner_floors_hold_and_salience_orders_demotion() {
     assert!(boring.salience < 0.2);
 
     // Without summarize allowed (mask mode), no unit may be planned as Summarize.
-    let b = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1, false, &std::collections::HashMap::new(), |_| None);
+    let b = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1, false, false, &std::collections::HashMap::new(), |_| None);
     assert!(b.units.iter().all(|u| u.treatment != Treatment::Summarize));
     assert!(b.need_summaries.is_empty());
+}
+
+/// `--summarize-errors` lifts the error floor: an error-bearing unit that is otherwise pinned to
+/// mask becomes summarizable, so a benign error (a grep no-match, a failed exploratory command)
+/// stops holding the whole budget hostage. The flag must NOT touch the `pinned` floor, and the
+/// unit still carries its raised salience (demoted last, not first).
+#[test]
+fn summarize_errors_flag_lifts_error_floor() {
+    let (kept, _) = select_active(salience_session());
+    let (segs, plans, seg_parts, seg_keys) = build_plan_inputs(&kept, 1, 0);
+    let no_epochs = std::collections::HashMap::new();
+
+    // Baseline (flag off), impossible target: the error unit floors at mask, never summarized.
+    // `|_| None` = no summary supplied yet, so Summarize units surface in need_summaries.
+    let off = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1, true, false, &no_epochs, |_| None);
+    let off_err = off.units.iter().find(|u| u.floor == "error").expect("error unit exists");
+    assert_ne!(off_err.treatment, Treatment::Summarize, "floor holds with flag off");
+    assert!(off.planned_total > 1, "floor keeps output over the impossible target");
+
+    // Flag on, same impossible target: the error unit is now allowed to summarize.
+    let on = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1, true, true, &no_epochs, |_| None);
+    assert!(on.allow_error_summarize, "plan records the relaxed floor");
+    let on_err = on.units.iter().find(|u| u.floor == "error").expect("error unit still labeled");
+    assert_eq!(on_err.treatment, Treatment::Summarize, "flag lets the error unit summarize");
+    // Its salience bump is preserved (correction turn + error signals stack), so it is demoted
+    // only after cheaper, lower-salience units — not eagerly.
+    assert!(on_err.salience > 0.7, "salience preserved: {}", on_err.salience);
+    // Lifting the floor strictly helps the budget: output is no larger than with the floor on.
+    assert!(on.planned_total <= off.planned_total);
+    // The now-summarized error unit joins the work list (its summary must preserve the error text).
+    assert!(on.need_summaries.contains(&on_err.key));
+
+    // The flag only relaxes the error floor; with summarize disabled entirely it is inert.
+    let masked = plan_budget(&kept, &segs, &plans, &seg_parts, &seg_keys, 1, false, true, &no_epochs, |_| None);
+    assert!(masked.units.iter().all(|u| u.treatment != Treatment::Summarize));
 }
 
 #[test]

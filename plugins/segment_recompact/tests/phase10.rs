@@ -78,7 +78,7 @@ fn two_segment_session() -> Vec<Value> {
 // ---------------------------------------------------------------------------------------- tests
 
 #[test]
-fn preamble_present_early_and_regenerated_not_duplicated() {
+fn preamble_present_last_and_regenerated_not_duplicated() {
     let dir = tmp_dir();
     let src = write_session(&dir, format!("{SESSION}.jsonl").as_str(), &two_segment_session());
     let twin = assemble(&dir, &src, &json!({"0": "Did the research."}));
@@ -88,8 +88,13 @@ fn preamble_present_early_and_regenerated_not_duplicated() {
     assert!(text.contains("recompact rehydrate"), "recovery command taught: {text}");
     assert!(text.contains("recompact continue"), "self-compaction taught");
     assert!(text.contains(SESSION), "names its source session");
+    // Last conversation record: only the `last-prompt` resume pointer may follow it.
     let pos = twin.iter().position(|r| truthy(r, "recompactPreamble")).unwrap();
-    assert!(pos <= 2, "preamble lands early, got position {pos}");
+    let last_conv = twin
+        .iter()
+        .rposition(|r| r.get("type").and_then(|v| v.as_str()) != Some("last-prompt"))
+        .unwrap();
+    assert_eq!(pos, last_conv, "preamble lands last, got position {pos} of {}", twin.len());
 
     // Second generation: the old preamble is stripped and a fresh one minted — never two.
     let twin_path = write_session(&dir, "gen1.jsonl", &twin);
