@@ -43,7 +43,11 @@ Pass the same value to extract and assemble\n  \
   --target <tok> plan per-unit treatments (verbatim/mask/summarize) toward\n                 \
 this token budget; salience floors may exceed it, with reasons\n  \
   --plan         with --target: print the plan table and exit without\n                 \
-validating or writing anything";
+validating or writing anything\n  \
+  --summarize-errors  with --target: let the planner summarize error-bearing\n                 \
+units too (default: errors floor at mask). The supplied summary MUST\n                 \
+preserve the error evidence. Use when the errors are benign (e.g. a\n                 \
+grep exit 1 / no-match) and retaining them verbatim wastes budget";
 
 fn usage() -> i32 {
     eprintln!("{USAGE}");
@@ -523,7 +527,7 @@ fn last_prompt_text(records: &[Value]) -> Option<String> {
 // --------------------------------------------------------------------------------- arg plumbing
 
 pub fn parse_opts(args: &[String]) -> (Vec<String>, Map<String, Value>) {
-    const FLAGS: &[&str] = &["plan", "auto", "estimate", "epochs"]; // boolean flags take no value
+    const FLAGS: &[&str] = &["plan", "auto", "estimate", "epochs", "summarize-errors"]; // boolean flags take no value
     let mut positional = Vec::new();
     let mut opts = Map::new();
     let mut i = 0;
@@ -580,6 +584,9 @@ pub struct BudgetPlan {
     pub target: usize,
     /// Summarize units with no summary available yet — the operator's work list.
     pub need_summaries: Vec<String>,
+    /// True when the error floor was relaxed (`--summarize-errors`): error-bearing units
+    /// could be summarized. Their summaries MUST preserve the error evidence.
+    pub allow_error_summarize: bool,
 }
 
 fn tokens_of(records: &[Value], indices: &[usize]) -> usize {
@@ -616,6 +623,12 @@ fn first_word_signals_correction(text: &str) -> bool {
 /// exceed the target, and the plan says exactly why. Salience is code-derived: error density,
 /// future-file overlap (this tool knows the session's future — a live compactor never does), and
 /// correction markers in the next human turn.
+///
+/// The error floor (an error-bearing unit never demotes below mask) is a blunt proxy: it fires on
+/// any `is_error` result, and cannot tell a benign `grep` exit-1 from a load-bearing failure. When
+/// the operator judges the errors benign, `allow_error_summarize` lifts the veto so those units can
+/// be summarized like any other — they keep the +0.4 salience bump (demoted last), and their
+/// summary is obligated to preserve the error evidence.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_budget(
     records: &[Value],
@@ -625,6 +638,7 @@ pub fn plan_budget(
     seg_keys: &[Vec<String>],
     target: usize,
     allow_summarize: bool,
+    allow_error_summarize: bool,
     epochs: &HashMap<String, Option<String>>,
     summary_tokens: impl Fn(&str) -> Option<usize>,
 ) -> BudgetPlan {
@@ -728,14 +742,14 @@ pub fn plan_budget(
             if u.floor == "pinned" {
                 continue;
             }
+            // The error floor blocks summarization unless the operator lifted it explicitly.
+            let summarizable = allow_summarize && (u.floor != "error" || allow_error_summarize);
             let next = match u.treatment {
                 // Pure-prose units mask to zero savings; they may skip straight to Summarize,
                 // or the ladder would strand them at Verbatim forever.
                 Treatment::Verbatim if u.cost[1] < u.cost[0] => Treatment::Mask,
-                Treatment::Verbatim if allow_summarize && u.floor != "error" => {
-                    Treatment::Summarize
-                }
-                Treatment::Mask if allow_summarize && u.floor != "error" => Treatment::Summarize,
+                Treatment::Verbatim if summarizable => Treatment::Summarize,
+                Treatment::Mask if summarizable => Treatment::Summarize,
                 _ => continue,
             };
             let cur_cost = u.cost[u.treatment as usize];
@@ -767,6 +781,7 @@ pub fn plan_budget(
         planned_total: total,
         target,
         need_summaries,
+        allow_error_summarize,
     }
 }
 
@@ -801,6 +816,18 @@ fn print_budget_plan(b: &BudgetPlan) {
             "plan: total {} tokens (target {})",
             b.planned_total, b.target
         );
+    }
+    if b.allow_error_summarize {
+        let n = b
+            .units
+            .iter()
+            .filter(|u| u.floor == "error" && u.treatment == Treatment::Summarize)
+            .count();
+        if n > 0 {
+            eprintln!(
+                "plan: --summarize-errors active — {n} error-bearing unit(s) will be summarized; their summaries MUST preserve the error evidence verbatim"
+            );
+        }
     }
     if !b.need_summaries.is_empty() {
         eprintln!("plan: provide summaries for {:?}", b.need_summaries);
@@ -1391,6 +1418,14 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         eprintln!("error: --plan requires --target <tokens>");
         return Err(2);
     }
+    let allow_error_summarize = opts
+        .get("summarize-errors")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if allow_error_summarize && target.is_none() {
+        eprintln!("error: --summarize-errors requires --target <tokens>");
+        return Err(2);
+    }
     let epochs_on = opts.get("epochs").and_then(|v| v.as_bool()).unwrap_or(false)
         && target.is_some();
 
@@ -1477,6 +1512,7 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
             &seg_keys,
             t,
             mode == "summarize",
+            allow_error_summarize,
             &epoch_map,
             |key| get_summary(key).map(|s| s.len() / 4 + 60),
         )
@@ -1608,6 +1644,8 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     // to see. Everything else about the compaction (uuids, provenance, part keys) is envelope
     // metadata invisible at inference time — this record is where a fresh agent learns that
     // summaries are summaries, that elisions are recoverable, and which commands do it.
+    // It is emitted LAST (see the push after the segment loop): a resumed model reads it
+    // immediately before its own first turn, with nothing in between to displace it.
     let project_dir = src
         .canonicalize()
         .unwrap_or(src.clone())
@@ -1632,13 +1670,15 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
          with code 143 (SIGTERM) triggers automatic recompact-and-respawn.\n\
          Source session: {orig_session_id}."
     );
-    let preamble_pending = json!({
+    let preamble = json!({
         "parentUuid": Value::Null,
         "isSidechain": false,
         "userType": "external",
         "type": "assistant",
         "uuid": uuid_v4(),
-        "timestamp": records.first().and_then(|r| r.get("timestamp")).cloned().unwrap_or(Value::Null),
+        // Last record, so it carries the latest timestamp in the file (the `last-prompt` tail
+        // has none) — a first-record timestamp here would read as out-of-order history.
+        "timestamp": records.iter().rev().find_map(|r| r.get("timestamp").cloned()).unwrap_or(Value::Null),
         "sessionId": new_session,
         "cwd": cwd,
         "gitBranch": git_branch,
@@ -1653,7 +1693,6 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
             "content": [{ "type": "text", "text": preamble_text }]
         }
     });
-    let mut preamble_pending = Some(preamble_pending);
 
     let mut out: Vec<Value> = Vec::new();
 
@@ -1711,9 +1750,6 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
             }
         } else {
             out.push(records[seg.user_idx].clone());
-        }
-        if let Some(p) = preamble_pending.take() {
-            out.push(p); // right after the first user turn: guaranteed early, valid chain position
         }
         if plans[s].kept_verbatim {
             for &i in &seg.activity {
@@ -1784,12 +1820,13 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         }
     }
 
-    if let Some(p) = preamble_pending.take() {
-        out.push(p); // no segments at all (head-only file): the preamble still lands
-    }
     if let Some(l) = ledger_pending.take() {
         out.push(l); // keep >= segment count: the ledger still lands, at the end
     }
+    // The preamble closes the file — the recency-peak position, and the only one that survives a
+    // long transcript intact. It follows a completed turn (or the head, on a segment-less file),
+    // so it never lands between a tool_use and its tool_result.
+    out.push(preamble);
 
     // Summaries inherited from older generations predate the model-visible footer; annotate them
     // at emission so every summary in the output names its selector. Idempotent and additive —
@@ -2748,6 +2785,10 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
                 &u.seg_keys,
                 o.threshold,
                 true,
+                // Headless/autonomous compaction keeps the error floor: summarizing error
+                // evidence away is a judgment call for a supervising operator (`assemble
+                // --target --summarize-errors`), not something the unattended loop should do.
+                false,
                 &epoch_map,
                 |key| {
                     u.key_hashes

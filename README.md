@@ -23,23 +23,36 @@ value is a disciplined process plus correct structural surgery.
 
 ## Install
 
-Requires a **Rust toolchain** (`cargo`) — the helper builds from source on install.
+**Prerequisite: a Rust toolchain** (`cargo`, from [rustup.rs](https://rustup.rs)). No prebuilt
+binary ships with the plugin; the helper is compiled from source at install time, so without
+`cargo` the install produces a plugin that cannot run. macOS and Linux only (the build hook is a
+POSIX shell command).
 
 ```bash
-# add this repo as a marketplace (GitHub repo, git URL, or local path)
-claude plugin marketplace add <your-org>/segment_recompact     # or: claude plugin marketplace add /path/to/segment_recompact
+claude plugin marketplace add Don-Osipov/segment_recompact
 claude plugin install segment-recompact@segment-recompact
 ```
 
-The plugin's `Setup` hook runs `cargo build --release` and places the binary at
-`bin/recompact`. (The skill also builds it on first use if it's missing, so a missing Setup run is
-self-healing.)
+The marketplace source can be a GitHub `owner/repo`, a git URL, or a local path
+(`claude plugin marketplace add /path/to/segment_recompact`), which is the one to use if you are
+hacking on the tool: a directory-sourced marketplace picks up your edits with no reinstall.
+
+The plugin's `Setup` hook runs `cargo build --release` and places the binary at `bin/recompact`.
+(The skill also builds it on first use if it's missing, so a skipped Setup run is self-healing.)
+The plugin's `bin/` is added to PATH, so `recompact` works as a bare command; the skill still
+invokes it by full path, since shell variables do not persist between invocations.
 
 Then, in any session:
 
 ```
 /recompact
 ```
+
+To confirm the install before relying on it, `recompact` with no arguments prints the usage block:
+`extract`, `assemble`, `verify`, `probe`, `rehydrate`, `continue`, `shell`, `resume`, and `scan`.
+A binary listing only `extract` and `assemble` is a stale build from an early version.
+
+To pick up later changes, `claude plugin update segment-recompact@segment-recompact`.
 
 ## How it works
 
@@ -88,9 +101,10 @@ segment_recompact/                         # marketplace repo
 └── plugins/segment_recompact/             # the plugin
     ├── .claude-plugin/plugin.json
     ├── skills/recompact/SKILL.md          # the /recompact skill
-    ├── src/main.rs + Cargo.toml           # the helper (extract / assemble)
+    ├── src/lib.rs + src/main.rs           # the helper (all subcommands)
+    ├── tests/                             # integration suite, one file per phase
     ├── hooks/hooks.json                   # Setup hook: cargo build on install
-    └── bin/                               # built binary lands here
+    └── bin/                               # built binary lands here (gitignored)
 ```
 
 ## License
