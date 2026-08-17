@@ -229,6 +229,20 @@ pub fn select_active(records: Vec<Value>) -> (Vec<Value>, usize) {
     (kept, dropped)
 }
 
+/// The record set every unit-hashing path must agree on: the active path minus the PREVIOUS
+/// generation's orientation preamble.
+///
+/// `assemble` strips old preambles wholesale (it mints a fresh one), so any path that computes
+/// unit keys or content hashes has to strip them too. When it does not, the one unit containing
+/// the preamble hashes differently on each side and its cached summary can never be found —
+/// which stalls every re-compaction of an already-compacted lineage on exactly that unit,
+/// deterministically, no matter how many times it retries.
+pub fn select_active_for_units(records: Vec<Value>) -> (Vec<Value>, usize) {
+    let (mut kept, dropped) = select_active(records);
+    kept.retain(|r| !truthy(r, "recompactPreamble"));
+    (kept, dropped)
+}
+
 // ------------------------------------------------------------------------------------ segmenting
 
 pub struct Segment {
@@ -857,7 +871,7 @@ pub fn cmd_extract(args: &[String]) -> i32 {
 
     let loaded = load_jsonl(&src);
     let total_in_file = loaded.len();
-    let (records, off_path) = select_active(loaded);
+    let (records, off_path) = select_active_for_units(loaded);
     let (head, segs) = segment(&records);
     let plans = plan(&records, &segs, keep);
 
@@ -1430,10 +1444,9 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         && target.is_some();
 
     let loaded = load_jsonl(&src);
-    let (mut records, _off_path) = select_active(loaded);
     // Old orientation preambles are pure boilerplate for the PREVIOUS generation; strip them
-    // wholesale and mint a fresh one below (unlike the ledger, whose content is user-meaningful).
-    records.retain(|r| !truthy(r, "recompactPreamble"));
+    // wholesale (and mint a fresh one below), the same way every unit-hashing path must.
+    let (records, _off_path) = select_active_for_units(loaded);
     let (head, segs) = segment(&records);
     let plans = plan_ex(&records, &segs, keep, epochs_on);
 
@@ -2757,7 +2770,9 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
 
     const ATTEMPTS: usize = 3;
     for attempt in 1..=ATTEMPTS {
-        let (active, _) = select_active(load_jsonl(&latest_file));
+        // Unit keys built here must match the ones assemble computes below, so this shares
+        // assemble's view of the records (preamble stripped) rather than the raw active path.
+        let (active, _) = select_active_for_units(load_jsonl(&latest_file));
         let tokens = approx_tokens(&active);
         if tokens <= o.threshold {
             eprintln!(
