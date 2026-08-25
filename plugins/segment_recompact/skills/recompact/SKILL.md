@@ -37,7 +37,7 @@ variables do **not** persist between separate command invocations, so use the fu
 
 ## What this does
 
-1. Confirms the target session and **takes a full backup + writes a rollback note** (hard precondition).
+1. Confirms the target session and sets up a work directory.
 2. `recompact extract` → a worksheet (`segments.json`) of segments and their agent activity.
 3. **You read it and write one summary per segment** into `summaries.json`, per the rubric below.
 4. `recompact assemble` → a new `<newSessionId>.jsonl` in the same project dir.
@@ -60,7 +60,7 @@ resume. The wrap-up ritual: finish the stretch of work, update the ledger with t
 corrections, run the compaction, verify, and hand the user the new id to resume next time (or let
 the autonomous loop below pick it up).
 
-**Already-compacted check (do this FIRST, before any backup or extract).** If the transcript you
+**Already-compacted check (do this FIRST, before any extract).** If the transcript you
 are running in carries a recompact orientation preamble ("This transcript was compacted by
 segment_recompact…" — emitted as the LAST conversation record, so look at the end of the
 transcript, not the start), you are inside a compacted twin — the compaction the user asked for has
@@ -75,34 +75,21 @@ not.
 Confirm with the user which session, and the `--keep K` window (default `K=1`: the last K segments
 stay verbatim for clean resume).
 
-### Step 1 — Backup + rollback note (BEFORE any write — non-negotiable)
+### Step 1 — Work directory
 
-We're poking at reverse-engineered resume behavior; "we only write a new file" is a hope, not a
-guarantee. So, independent of that:
+`recompact` is additive: it opens the original read-only and creates a new `<newId>.jsonl` beside
+it, touching no existing file. So the rollback is `rm <newId>.jsonl`, and `claude --resume <origId>`
+returns to the working session either way — no backup step. Step 5 proves the non-mutation by
+checksum rather than assuming it, so capture the original's digest now, before any write:
 
 ```bash
 TS=$(date +%Y%m%d-%H%M%S)
 PROJ=<munged-cwd>            # e.g. -home-sdr-wirt
-tar czf ~/recompact-backup-${PROJ}-${TS}.tgz -C ~/.claude/projects "${PROJ}"
-cp ~/.claude/history.jsonl ~/recompact-backup-history-${TS}.jsonl
-```
-
-Then write the rollback note (and echo its key facts to the user):
-
-```bash
 WORK=/var/tmp/recompact-work/${TS}; mkdir -p "$WORK"
-cat > "$WORK/ROLLBACK.md" <<EOF
-# Rollback — recompact ${TS}
-- Backup: ~/recompact-backup-${PROJ}-${TS}.tgz  (+ ~/recompact-backup-history-${TS}.jsonl)
-- Restore: tar xzf ~/recompact-backup-${PROJ}-${TS}.tgz -C ~/.claude/projects
-- Original sessionId: <origId> — untouched; \`claude --resume <origId>\` returns to the working session.
-- New sessionId: <to be filled by assemble> — deleting its .jsonl is safe and additive-only.
-- Invariant: the tool only CREATES <newId>.jsonl and modifies no existing file (verified by checksum).
-EOF
+shasum -a 256 <session.jsonl> | tee "$WORK/source.sha256"
 ```
 
-Backups go to `~` (matching `cleanslate`), **never `/tmp`** (tmpfs, fills up). Work files go under
-`/var/tmp/recompact-work/`.
+Work files go under `/var/tmp/recompact-work/`, **never `/tmp`** (tmpfs, fills up).
 
 ### Step 2 — Extract
 
@@ -282,15 +269,14 @@ Two properties make the loop truly hands-off and unbounded:
 ```
 
 `assemble` errors out if any needed summary is missing, refuses to overwrite an existing file, opens
-the original read-only, and drops any in-flight `tool_use` with no matching `tool_result`. Fill the
-new sessionId into `ROLLBACK.md`.
+the original read-only, and drops any in-flight `tool_use` with no matching `tool_result`.
 
 ### Step 5 — Verify
 
 ```bash
 SRC=<session.jsonl>; NEW=~/.claude/projects/${PROJ}/<newId>.jsonl
 # 0. non-mutation: original byte-identical (it never opened for write, but prove it)
-md5sum "$SRC"   # compare against the value you captured pre-run
+shasum -a 256 -c "$WORK/source.sha256"
 # 1. structural checks + user-turn fidelity, all in one pass:
 #    single sessionId, linear parent chain, no dangling tool_use / orphan tool_result,
 #    usage stripped, last-prompt tail points at leaf, user turns identical to the
@@ -305,7 +291,8 @@ record counts (from the `assemble` line).
 
 Have the user run `claude --resume <newId>` and continue. This is the empirical validation that the
 hand-built file is actually resume-compatible — only the user can drive the interactive resume. If
-anything looks wrong, roll back per `ROLLBACK.md` (the new file is additive; deleting it is enough).
+anything looks wrong, delete the new `.jsonl` — it is purely additive, and `claude --resume <origId>`
+is still the original session.
 
 ## Waking up inside a compacted session (read this if you see recompact markers)
 
