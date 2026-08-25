@@ -24,6 +24,8 @@ recompact assemble  <session.jsonl> --mode mask [--keep K] [--out <path>]\n  \
 recompact verify    <assembled.jsonl> [--source <session.jsonl>]\n  \
 recompact probe     <session.jsonl>\n  \
 recompact rehydrate <compacted.jsonl> [part-key | ordinal | uuid | uuid-prefix>=8]\n  \
+recompact mcp       [project-dir]  (MCP stdio server exposing `recall`;\n                      \
+started by the plugin, not normally run by hand)\n  \
 recompact continue  <session.jsonl | sessionId> [--threshold T] [--keep K]\n                      \
 [--summarize-with M [--escalate-with M2] [--escalate-above S]]\n  \
 recompact shell     [sessionId] [--threshold T] [--goal G] [--auto]\n                      \
@@ -1673,10 +1675,12 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
          - Markers like \"[recompact: elided ...; rehydrate <prefix>]\" are mechanically removed \
          payloads (bulky tool results, old screenshots). Nothing is lost: originals live in \
          untouched source transcripts.\n\
-         - Recover anything verbatim before re-deriving or re-searching it: run \
-         `recompact rehydrate {new_session}.jsonl <selector>` in {project_dir} — the selector is \
-         a summary key or a uuid prefix from a marker; resolution follows provenance across all \
-         compaction generations. Bare `recompact rehydrate <file>` lists every summary.\n\
+         - Recover anything verbatim before re-deriving or re-searching it. Prefer the `recall` \
+         tool if you have it (the plugin serves one): pass the selector, no file path needed. \
+         Otherwise run `recompact rehydrate {new_session}.jsonl <selector>` in {project_dir}. The \
+         selector is a summary key or a uuid prefix from a marker; resolution follows provenance \
+         across all compaction generations, and uuid prefixes resolve across every session in the \
+         project. Either form with no selector lists every summary.\n\
          - `recompact scan` shows this project's sessions, sizes, and lineage. If this session \
          grows large, `recompact continue <session-id> --summarize-with haiku` compacts it \
          (writes a fresh twin; originals are never modified). Under `recompact shell`, exiting \
@@ -3385,7 +3389,12 @@ fn provenance_files(
         if order.contains(&p) || !p.exists() {
             continue;
         }
-        cache.entry(p.clone()).or_insert_with(|| load_jsonl(&p));
+        if !cache.contains_key(&p) {
+            // Skip on a malformed transcript for the same reason a missing one is skipped: an
+            // unreadable ancestor should degrade rehydration, not abort it.
+            let Ok(loaded) = load_jsonl_soft(&p) else { continue };
+            cache.insert(p.clone(), loaded);
+        }
         order.push(p.clone());
         for next in synth_sources(&cache[&p]) {
             if !order.contains(&next) && !frontier.contains(&next) {
@@ -3410,7 +3419,7 @@ fn ground_truth_by_uuid(
     cache: &mut HashMap<PathBuf, Vec<Value>>,
 ) -> Option<Value> {
     let mut fallback: Option<Value> = None;
-    let mut scan = |records: &[Value], fallback: &mut Option<Value>| -> Option<Value> {
+    let scan = |records: &[Value], fallback: &mut Option<Value>| -> Option<Value> {
         for r in records {
             if rec_uuid(r).is_some_and(|u| uuid_matches(u, uuid)) {
                 if is_ground(r) {
@@ -3788,4 +3797,626 @@ pub fn cmd_verify(args: &[String]) -> i32 {
         eprintln!("verify: {fails} check(s) failed");
         1
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recall: rehydration as a tool the model can call, not just an operator CLI.
+//
+// `rehydrate` already recovers anything a marker names, but only from a shell, and only once the
+// caller has answered "which .jsonl am I?" — a question a resumed session cannot answer reliably
+// (several sessions in one project dir are live at once, and their mtimes differ by seconds).
+// So uuid selectors resolve PROJECT-WIDE here: masking clones a record without re-minting its
+// uuid, which means one 8-char prefix names the same record in the twin and in every ancestor,
+// and any file holding it is a valid entry point into the provenance graph.
+// ---------------------------------------------------------------------------------------------
+
+/// Per-response payload budget. ARC (arXiv:2607.25066) caps a recall at 8k chars and chunks the
+/// rest; we copy the cap for a sharper reason. ARC can evict a recalled body back to a citation
+/// stub when its budget is exceeded — we cannot: once a tool result is in the transcript it is
+/// there for good. Never over-delivering is the only control left, so the cap is load-bearing.
+pub const RECALL_CHUNK_CHARS: usize = 8000;
+
+/// Read a transcript without the CLI's exit-on-error behavior. `load_jsonl` aborts the process on
+/// an unreadable or malformed file, which is right for a one-shot command and fatal for a
+/// long-lived MCP server: one corrupt transcript anywhere in a project dir would take recall down
+/// for the whole session.
+pub fn load_jsonl_soft(path: &Path) -> Result<Vec<Value>, String> {
+    let mut buf = String::new();
+    fs::File::open(path)
+        .and_then(|mut f| f.read_to_string(&mut buf))
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut out = Vec::new();
+    for (n, line) in buf.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let v = serde_json::from_str::<Value>(line)
+            .map_err(|e| format!("{}: line {} is not valid JSON: {e}", path.display(), n + 1))?;
+        out.push(v);
+    }
+    Ok(out)
+}
+
+/// The project transcript dir for an explicit working directory. `project_dir_from_cwd` reads the
+/// *process* cwd, which is wrong for an MCP server: it is spawned by the client, not by the user,
+/// and its cwd need not be the session's.
+pub fn project_dir_for(cwd: &Path) -> Option<PathBuf> {
+    let munged = munge_project_path(&cwd.to_string_lossy());
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .ok()?;
+    Some(PathBuf::from(home).join(".claude/projects").join(munged))
+}
+
+/// Every session in `dir` holding a record whose uuid matches `sel`, best entry point first:
+/// ground-truth copies before degraded ones, then newest by mtime. A ground hit IS the original,
+/// so the common case resolves with no provenance walk at all.
+///
+/// The substring pre-filter matters: the scan reads whole transcripts (this machine's largest
+/// project dir is 288 files / 727 MB) but only parses lines that could match, so a full sweep
+/// costs tens of milliseconds rather than parsing ~700 MB of JSON.
+pub fn find_uuid_sessions(dir: &Path, sel: &str) -> (Vec<PathBuf>, Vec<String>) {
+    let mut hits: Vec<(bool, std::time::SystemTime, PathBuf)> = Vec::new();
+    let mut distinct: Vec<String> = Vec::new();
+    // The pre-filter is deliberately loose: it matches the bare selector anywhere in the file,
+    // including parentUuid, coveredUuids and prose. Anchoring it on `"uuid":"` would skip a few
+    // line parses but assumes compact serialization, and a transcript written with spaces after
+    // the colons would then resolve to nothing — silently, which is the worst failure this tool
+    // can have. A full sweep of the largest project dir here (288 files, 727 MB) costs ~64 ms,
+    // so the parses this would save are not worth a format assumption.
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return (Vec::new(), Vec::new()),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let mut buf = String::new();
+        if fs::File::open(&path)
+            .and_then(|mut f| f.read_to_string(&mut buf))
+            .is_err()
+        {
+            continue;
+        }
+        if !buf.contains(sel) {
+            continue;
+        }
+        let mut ground = false;
+        let mut found = false;
+        for line in buf.lines() {
+            if !line.contains(sel) {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if let Some(u) = rec_uuid(&v).filter(|u| uuid_matches(u, sel)) {
+                found = true;
+                if !distinct.iter().any(|d| d == u) {
+                    distinct.push(u.to_string());
+                }
+                if is_ground(&v) {
+                    ground = true;
+                }
+            }
+        }
+        if found {
+            let mtime = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            hits.push((ground, mtime, path));
+        }
+    }
+    // ground first, then newest.
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+    (hits.into_iter().map(|(_, _, p)| p).collect(), distinct)
+}
+
+/// What a recall resolved to, and where from — the caller reports the source so a model can tell
+/// a verbatim original from a degraded copy.
+pub struct Recalled {
+    pub records: Vec<Value>,
+    pub session: String,
+}
+
+/// Resolve a selector to verbatim records.
+///
+/// uuid / uuid-prefix selectors (what elision markers print) are project-wide: no session needed.
+/// Part keys and ordinals index one file's summary list, so they need a session — explicit when
+/// the caller knows it, newest-by-mtime otherwise, and the answer always says which was used
+/// because that fallback is a guess.
+pub fn recall_select(
+    dir: &Path,
+    selector: &str,
+    session: Option<&str>,
+) -> Result<Recalled, String> {
+    let uuidish =
+        selector.len() >= 8 && selector.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+
+    // A named session is a hint, not a constraint: for a uuid it is tried first, then the rest of
+    // the project. Naming the wrong session should not make a resolvable uuid unresolvable.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(sess) = session {
+        let p = session_path(dir, sess);
+        if !p.exists() {
+            return Err(format!(
+                "no session {sess:?} under {}. Uuid prefixes need no session at all — \
+                 pass the prefix alone.",
+                dir.display()
+            ));
+        }
+        candidates.push(p);
+    }
+    if uuidish {
+        let (found, distinct) = find_uuid_sessions(dir, selector);
+        if distinct.len() > 1 {
+            return Err(format!(
+                "{selector:?} is ambiguous: it prefixes {} different records ({}). \
+                 Use more characters of the uuid.",
+                distinct.len(),
+                distinct
+                    .iter()
+                    .map(|u| truncate(u, 12))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if found.is_empty() && candidates.is_empty() {
+            return Err(format!(
+                "uuid {selector:?} is not in any transcript under {}. \
+                 Check the prefix against the marker that printed it.",
+                dir.display()
+            ));
+        }
+        for f in found {
+            if !candidates.contains(&f) {
+                candidates.push(f);
+            }
+        }
+    } else if candidates.is_empty() {
+        // Keys and ordinals index one file's summary list, so there is nothing to search: fall
+        // back to the newest session and let the answer name which one that was.
+        let newest = newest_session(dir).ok_or_else(|| {
+            format!("no sessions under {} to resolve {selector:?} against", dir.display())
+        })?;
+        candidates.push(session_path(dir, &newest));
+    }
+
+    let mut last_err = String::new();
+    for path in &candidates {
+        let records = match load_jsonl_soft(path) {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
+        };
+        match rehydrate_select(&records, selector) {
+            Ok(records) => {
+                return Ok(Recalled {
+                    records,
+                    session: stem_of(path),
+                })
+            }
+            Err(e) => last_err = e,
+        }
+    }
+    Err(last_err)
+}
+
+fn session_path(dir: &Path, session: &str) -> PathBuf {
+    let s = session.strip_suffix(".jsonl").unwrap_or(session);
+    dir.join(format!("{s}.jsonl"))
+}
+
+fn stem_of(p: &Path) -> String {
+    p.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------------------------
+// MCP server: `recall` as a tool the model calls mid-inference.
+//
+// Newline-delimited JSON-RPC 2.0 over stdio, hand-rolled on serde_json. The crate is already a
+// JSONL processor with two dependencies and builds from source on every plugin install, so an SDK
+// would cost more than the ~200 lines it saves.
+// ---------------------------------------------------------------------------------------------
+
+/// What the client is told the tool is for. This reaches the model through `tools/list` without a
+/// skill load, so it has to teach the whole convention in a paragraph.
+const RECALL_DESC: &str = "Recover the verbatim original behind a compaction marker in this \
+session's transcript. If you see \"[recompact: elided ...; rehydrate <prefix>]\", \
+\"[recompact: image elided ...]\", or a summary ending \"[recompact summary <key> — rehydratable]\", \
+the full content still exists untouched and this returns it. Recall before re-deriving: re-running \
+a search or a tool call costs more than reading back what it already produced, and guessing at an \
+elided detail is how a compacted session goes wrong. Call with no selector to list what is \
+recallable.";
+
+const INSTRUCTIONS: &str = "This session's transcript may have been compacted by \
+segment_recompact. Markers of the form \"[recompact: ...; rehydrate <prefix>]\" and summaries \
+ending \"[recompact summary <key> — rehydratable]\" mark content that was removed from context \
+but still exists verbatim. Use the recall tool to read it back rather than re-deriving it.";
+
+fn rpc_result(id: Value, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": result})
+}
+
+fn rpc_error(id: Value, code: i64, message: &str) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
+}
+
+fn tool_text(text: String, is_error: bool) -> Value {
+    json!({"content": [{"type": "text", "text": text}], "isError": is_error})
+}
+
+/// One recalled payload, split the way a tool result has to be delivered: prose that can be
+/// chunked, and images that cannot.
+struct Payload {
+    text: String,
+    images: Vec<(String, String)>, // (base64 data, mime)
+}
+
+/// Pull the model-meaningful content out of raw transcript records. The envelope (uuids, parent
+/// links, provenance) is never shown at inference and would spend the budget on bookkeeping, so
+/// only message content survives.
+fn payload_of(records: &[Value]) -> Payload {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for r in records {
+        let Some(content) = r.pointer("/message/content") else {
+            continue;
+        };
+        match content {
+            Value::String(s) => {
+                text.push_str(s);
+                text.push('\n');
+            }
+            Value::Array(blocks) => {
+                for b in blocks {
+                    collect_block(b, &mut text, &mut images);
+                }
+            }
+            _ => {}
+        }
+    }
+    Payload {
+        text: text.trim_end().to_string(),
+        images,
+    }
+}
+
+fn collect_block(b: &Value, text: &mut String, images: &mut Vec<(String, String)>) {
+    match b.get("type").and_then(|v| v.as_str()) {
+        Some("text") => {
+            if let Some(s) = b.get("text").and_then(|v| v.as_str()) {
+                text.push_str(s);
+                text.push('\n');
+            }
+        }
+        Some("thinking") => {
+            if let Some(s) = b.get("thinking").and_then(|v| v.as_str()) {
+                if !s.trim().is_empty() {
+                    text.push_str(s);
+                    text.push('\n');
+                }
+            }
+        }
+        Some("image") => {
+            let data = b.pointer("/source/data").and_then(|v| v.as_str());
+            let mime = b
+                .pointer("/source/media_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("image/png");
+            if let Some(d) = data {
+                images.push((d.to_string(), mime.to_string()));
+            }
+        }
+        Some("tool_use") => {
+            if let Some(name) = b.get("name").and_then(|v| v.as_str()) {
+                text.push_str(&format!("[tool_use {name}]\n"));
+            }
+            if let Some(input) = b.get("input") {
+                text.push_str(&serde_json::to_string(input).unwrap_or_default());
+                text.push('\n');
+            }
+        }
+        Some("tool_result") => match b.get("content") {
+            Some(Value::String(s)) => {
+                text.push_str(s);
+                text.push('\n');
+            }
+            Some(Value::Array(inner)) => {
+                for ib in inner {
+                    collect_block(ib, text, images);
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+/// Chunk boundaries are char-based, not byte-based, so a multi-byte character is never split.
+/// An out-of-range chunk is an error rather than a clamp: silently serving the last chunk under a
+/// number the caller did not ask for makes a model believe it has read past the end.
+fn chunk_of(text: &str, chunk: usize) -> Result<(String, usize), String> {
+    let chars: Vec<char> = text.chars().collect();
+    let total = chars.len().div_ceil(RECALL_CHUNK_CHARS).max(1);
+    if chunk > total {
+        return Err(format!(
+            "chunk {chunk} is past the end: this payload has {total} chunk(s)."
+        ));
+    }
+    let start = (chunk - 1) * RECALL_CHUNK_CHARS;
+    let end = (start + RECALL_CHUNK_CHARS).min(chars.len());
+    Ok((chars[start..end].iter().collect(), total))
+}
+
+/// One line per covered record, so a multi-record expansion stays inside a single response and the
+/// model can then ask for the one record it wants. Concatenating them instead makes finding a
+/// detail a walk through every chunk — the cost recall exists to avoid.
+fn digest_of(records: &[Value]) -> String {
+    let mut out = format!(
+        "{} records. Recall any single one by its uuid prefix:\n",
+        records.len()
+    );
+    for r in records {
+        let uuid = rec_uuid(r).unwrap_or("????????");
+        let kind = r.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+        let p = payload_of(std::slice::from_ref(r));
+        let preview = p.text.replace('\n', " ");
+        let imgs = if p.images.is_empty() {
+            String::new()
+        } else {
+            format!(" [{} image(s)]", p.images.len())
+        };
+        out.push_str(&format!(
+            "  {} {kind}{imgs} — {}\n",
+            uuid.get(..8).unwrap_or(uuid),
+            truncate(&preview, 120)
+        ));
+    }
+    out
+}
+
+fn list_summaries(dir: &Path, session: Option<&str>) -> Value {
+    let path = match session {
+        Some(s) => session_path(dir, s),
+        None => match newest_session(dir) {
+            Some(s) => session_path(dir, &s),
+            None => {
+                return tool_text(format!("no sessions under {}", dir.display()), true);
+            }
+        },
+    };
+    let records = match load_jsonl_soft(&path) {
+        Ok(r) => r,
+        Err(e) => return tool_text(e, true),
+    };
+    let synths: Vec<&Value> = records
+        .iter()
+        .filter(|r| truthy(r, "recompactSynthetic"))
+        .collect();
+    if synths.is_empty() {
+        return tool_text(
+            format!(
+                "{} holds no compaction summaries; nothing to recall by key or ordinal. \
+                 Uuid prefixes from markers still resolve project-wide.",
+                stem_of(&path)
+            ),
+            false,
+        );
+    }
+    let mut out = format!("{} summaries in {}:\n", synths.len(), stem_of(&path));
+    for (n, r) in synths.iter().enumerate() {
+        let part = r
+            .pointer("/recompactProvenance/part")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
+        let covered = r
+            .pointer("/recompactProvenance/coveredUuids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let text = r
+            .pointer("/message/content/0/text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        out.push_str(&format!(
+            "  [{n}] part {part} covers {covered} records: {}\n",
+            truncate(&text.replace('\n', " "), 100)
+        ));
+    }
+    tool_text(out, false)
+}
+
+fn call_recall(dir: &Path, args: &Value) -> Value {
+    let selector = args.get("selector").and_then(|v| v.as_str());
+    let session = args.get("session").and_then(|v| v.as_str());
+    let chunk = args
+        .get("chunk")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .max(1) as usize;
+
+    let Some(selector) = selector.filter(|s| !s.trim().is_empty()) else {
+        return list_summaries(dir, session);
+    };
+
+    let recalled = match recall_select(dir, selector, session) {
+        Ok(r) => r,
+        Err(e) => return tool_text(e, true),
+    };
+    let payload = payload_of(&recalled.records);
+    if payload.text.is_empty() && payload.images.is_empty() {
+        return tool_text(
+            format!(
+                "{selector:?} resolved to {} record(s) in {} but they carry no readable content.",
+                recalled.records.len(),
+                recalled.session
+            ),
+            false,
+        );
+    }
+
+    // A multi-record expansion that will not fit in one response becomes an index instead of a
+    // wall of concatenated text; a single record is always served as itself.
+    let multi = recalled.records.len() > 1;
+    let oversized = payload.text.chars().count() > RECALL_CHUNK_CHARS;
+    if multi && oversized {
+        return tool_text(
+            format!(
+                "recall {selector:?} — {} records from {}\n\n{}",
+                recalled.records.len(),
+                recalled.session,
+                digest_of(&recalled.records)
+            ),
+            false,
+        );
+    }
+
+    let (body, total) = match chunk_of(&payload.text, chunk) {
+        Ok(v) => v,
+        Err(e) => return tool_text(e, true),
+    };
+    let mut header = format!(
+        "recall {selector:?} — {} record(s) from {}",
+        recalled.records.len(),
+        recalled.session
+    );
+    if total > 1 {
+        let next = if chunk < total {
+            format!(" (call again with chunk={} for the next)", chunk + 1)
+        } else {
+            " (final chunk)".to_string()
+        };
+        header.push_str(&format!("; chunk {chunk}/{total}{next}"));
+    }
+
+    let mut content = vec![json!({"type": "text", "text": format!("{header}\n\n{body}")})];
+    // Images ride the first chunk only, so walking a long payload does not re-deliver them.
+    if chunk == 1 {
+        for (data, mime) in &payload.images {
+            content.push(json!({"type": "image", "data": data, "mimeType": mime}));
+        }
+    }
+    json!({"content": content, "isError": false})
+}
+
+fn tools_list() -> Value {
+    json!({"tools": [{
+        "name": "recall",
+        "title": "Recall compacted content",
+        "description": RECALL_DESC,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "The handle a marker printed: an 8+ character uuid prefix (from \"rehydrate <prefix>\"), a summary key (from \"[recompact summary <key> ...]\"), or a listing ordinal. Omit to list what is recallable."
+                },
+                "chunk": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based chunk for payloads too large to return at once. Defaults to 1; the response says how many there are."
+                },
+                "session": {
+                    "type": "string",
+                    "description": "Session id to resolve against. Only needed for summary keys and ordinals; uuid prefixes resolve across the whole project."
+                }
+            }
+        }
+    }]})
+}
+
+/// Serve MCP over any line-oriented pair of streams. Generic rather than bound to stdio so the
+/// tests can drive it in-process, as every other test in this crate does.
+pub fn mcp_serve<R: std::io::BufRead, W: Write>(input: R, mut output: W, dir: &Path) -> i32 {
+    for line in input.lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(req) = serde_json::from_str::<Value>(line) else {
+            // No id to answer with, and the spec has no way to report a parse error on a stream
+            // whose framing may itself be broken. Skip and keep serving.
+            continue;
+        };
+        let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        let id = req.get("id").cloned();
+        // Notifications carry no id and MUST NOT be answered.
+        let Some(id) = id else { continue };
+
+        let resp = match method {
+            "initialize" => {
+                // Echo the client's protocol version: the spec requires a server that supports the
+                // requested version to answer with that same version, and a tools-only server
+                // supports every version there is. Nothing to keep in sync.
+                let version = req
+                    .pointer("/params/protocolVersion")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("2025-06-18");
+                rpc_result(
+                    id,
+                    json!({
+                        "protocolVersion": version,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "recompact", "version": env!("CARGO_PKG_VERSION")},
+                        "instructions": INSTRUCTIONS,
+                    }),
+                )
+            }
+            "ping" => rpc_result(id, json!({})),
+            "tools/list" => rpc_result(id, tools_list()),
+            "tools/call" => {
+                let name = req
+                    .pointer("/params/name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if name == "recall" {
+                    let args = req
+                        .pointer("/params/arguments")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    rpc_result(id, call_recall(dir, &args))
+                } else {
+                    rpc_error(id, -32602, &format!("unknown tool: {name}"))
+                }
+            }
+            other => rpc_error(id, -32601, &format!("method not found: {other}")),
+        };
+
+        if writeln!(output, "{}", serde_json::to_string(&resp).unwrap_or_default()).is_err() {
+            return 1;
+        }
+        // Explicit: stdout block-buffers when it is a pipe, which is exactly the MCP case, and a
+        // response sitting in the buffer reads as a hung server.
+        if output.flush().is_err() {
+            return 1;
+        }
+    }
+    0
+}
+
+/// Serve MCP on stdio. Started automatically by the plugin; not normally run by hand.
+pub fn cmd_mcp(args: &[String]) -> i32 {
+    let (pos, _opts) = parse_opts(args);
+    let dir = pos
+        .first()
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("CLAUDE_PROJECT_DIR").ok().and_then(|d| project_dir_for(Path::new(&d))))
+        .or_else(|| std::env::current_dir().ok().and_then(|d| project_dir_for(&d)));
+    let Some(dir) = dir else {
+        eprintln!("error: cannot resolve a project transcript dir (set CLAUDE_PROJECT_DIR)");
+        return 1;
+    };
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    mcp_serve(stdin.lock(), stdout.lock(), &dir)
 }
