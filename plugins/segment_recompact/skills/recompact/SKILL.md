@@ -301,14 +301,21 @@ by segment_recompact"), summaries ending in `[recompact summary <key> — rehydr
 markers like `[recompact: elided ...; rehydrate <prefix>]`, you are in a compacted twin. Rules
 of thumb:
 
-- **Rehydrate before re-deriving.** If a summary or marker covers something you need exactly
+- **Recall before re-deriving.** If a summary or marker covers something you need exactly
   (an error message, a file diff, a research report, a screenshot), recover it verbatim instead
-  of re-running searches or guessing:
-  `recompact rehydrate <this-session.jsonl> <selector>` — selector is the summary's key, a
-  uuid, or the 8-char prefix from a marker. Resolution follows provenance across ALL prior
-  compaction generations to the untouched originals. Bare `rehydrate <file>` lists summaries.
-- **Find your own file**: it is the newest `.jsonl` in `~/.claude/projects/<munged-cwd>/`, or
-  run `recompact scan` there (shows sizes, lineage, and which sessions are compacted twins).
+  of re-running searches or guessing. The selector is the summary's key or the 8-char prefix
+  from a marker; resolution follows provenance across ALL prior compaction generations to the
+  untouched originals.
+  - **Prefer the `recall` tool** if the plugin's MCP server is connected: pass the selector and
+    nothing else. A uuid prefix resolves across every session in the project, so you do not
+    need to know which file you are in.
+  - Otherwise `recompact rehydrate <this-session.jsonl> <selector>`. Either form with no
+    selector lists the summaries.
+- **Finding your own file** is only needed for a *summary key or ordinal*, which index one
+  file's summary list. Do not guess it from mtime: several sessions in a project are commonly
+  live at once and the newest `.jsonl` is often somebody else's. Run `recompact scan` in
+  `~/.claude/projects/<munged-cwd>/` (shows sizes, lineage, and which sessions are compacted
+  twins), or use a uuid prefix, which needs no file at all.
 - **Trust user text, treat summaries as summaries.** User turns are verbatim by construction;
   synthetic summaries are honest but lossy — verify against rehydrated originals before acting
   on a detail that matters.
