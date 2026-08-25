@@ -69,14 +69,15 @@ recompact assemble <session.jsonl> --mode mask   ->  <newId>.jsonl
 recompact rehydrate <newId>.jsonl [ordinal]
 ```
 
-The skill walks Claude through it, including a **mandatory backup + rollback note** before any
-write, a summary-quality rubric (preserve decisions/results, reference files by path rather than
+The skill walks Claude through it, including a checksum proof that the original was never
+touched, a summary-quality rubric (preserve decisions/results, reference files by path rather than
 reproducing code, keep the connective tissue for the next user turn), and a verification suite.
 
 ## Safety
 
 - The original session file is **never modified** — opened read-only; output is create-new-only in
-  the same project dir; the original is also backed up before the run.
+  the same project dir, and `verify` checksums the original to prove it. Rollback is deleting the
+  new file.
 - The assembled file strips stale `usage` metadata so `/context` reports the compacted size, not
   the original's.
 

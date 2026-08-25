@@ -5,7 +5,7 @@
 //!   assemble — rebuild a shorter, resume-compatible session from hand-written per-segment summaries
 //!   verify   — structural checks on an assembled session (chain, tool pairs, user-turn fidelity)
 //!
-//! Invariants (see the rollback plan): the original is opened read-only and never written; the
+//! Invariants: the original is opened read-only and never written; the
 //! output is create-new-only and lands in the same project transcript dir as the original.
 
 use std::collections::{HashMap, HashSet};
