@@ -151,6 +151,30 @@ Driven by a month of real use (62 twins, 56 resumed) and the June–September 20
       `/branch` copies in lineage, bare ids across project dirs, titles carried, model and effort
       restored in the resume command.
 
+## v1.1 (2026-09): compaction in place
+
+The v1.0 flow to compact the session you were in took six steps: note the id, open a second
+session, run the skill there, copy the new id, exit, resume. Now:
+
+- [x] **`recompact shell` is a drop-in for `claude`.** It supervises claude; hooks inside report the
+      live session and request handoffs. On a request it stops claude with SIGTERM (Claude Code
+      exits cleanly on it, measured: terminal restored, exit 143), compacts, and resumes the twin in
+      the same terminal with the same flags, model, and effort.
+- [x] **A typed `/recompact` costs no model turn:** a UserPromptSubmit hook blocks the prompt and
+      hands off (measured: the command never reaches the model).
+- [x] **Automatic at turn boundaries:** a Stop hook hands off when the context is over the threshold,
+      unless background tasks or session crons would be lost. A re-arm floor stops a twin that could
+      not get below the threshold from compacting every turn.
+- [x] **Checkpoints for long autonomous turns:** past the checkpoint size, a PostToolUse hook asks
+      the agent to finish its step and stop; the resumed session gets a continue prompt. The
+      compaction lands on a boundary the agent chose (compaction at resolved points).
+- [x] **Prewarm:** from half the threshold, a detached background run writes the summaries the
+      handoff would need into the cache. Measured on a real 5.9 MB session: 34 s in the background,
+      then 0.23 s for the compaction itself.
+- [x] Without the launcher, `recompact handoff` compacts the current session and puts the resume
+      command on the clipboard; a Stop hook says when a session is large.
+- [x] Summarizer runs no longer create a Claude Code project dir per call (115 accumulated).
+
 Next, in evidence order:
 - [ ] Probe-based evaluation harness (`recompact eval`): exact-match probes mined from the original
       (errors, ids, files, next step), answered by a resumed model; TRACE-style next-action agreement.

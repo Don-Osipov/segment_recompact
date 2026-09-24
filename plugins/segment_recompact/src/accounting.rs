@@ -182,7 +182,7 @@ impl Calib {
     }
 }
 
-fn prompt_tokens(usage: &Value) -> Option<usize> {
+pub(crate) fn prompt_tokens(usage: &Value) -> Option<usize> {
     let get = |k: &str| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let t =
         get("input_tokens") + get("cache_creation_input_tokens") + get("cache_read_input_tokens");

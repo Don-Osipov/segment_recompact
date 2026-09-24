@@ -1,6 +1,6 @@
 {
   "name": "segment-recompact",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Offline, structure-preserving compaction of Claude Code sessions that resume well: user turns verbatim, older work summarized or masked with provenance, evidence carried by code, an orientation brief and resume hook, and a recall tool that reads back anything removed.",
   "author": {
     "name": "Stephen Roylance"
