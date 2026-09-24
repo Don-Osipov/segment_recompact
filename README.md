@@ -37,6 +37,9 @@ use claude as always:
 - When a turn ends with the context at 400k tokens (140k on Haiku), the same happens by itself.
   Set `RECOMPACT_WINDOW=200k` if your Opus or Sonnet plan has a 200k window.
 - Long autonomous turns are asked to checkpoint, then compacted and told to continue.
+- `/recompact off` and `/recompact on` switch the automatic part for every session;
+  `/recompact status` shows the setting and this session's size; `/recompact on 300k` changes
+  the size. They answer instantly, without a model turn.
 
 Anything removed stays readable through the `recall` tool. `claude -p`, subcommands, and flags the
 launcher does not recognize run plain claude. To undo the shell change:
