@@ -50,7 +50,10 @@ recompact handoff   [sessionId] [--continue-after]  (compact the current session
 queued for turn end under `shell`; otherwise compacts now and\n                      \
 prints the resume command)\n  \
 recompact prewarm   <session> [--target T]  (summarize ahead into the cache)\n  \
-recompact install   (make interactive `claude` run through `shell`; `uninstall` undoes it)\n  \
+recompact install   (make interactive `claude` run through `shell`, turn on plugin\n                      \
+auto-update; `uninstall` undoes the shell part)\n  \
+recompact update    (newest plugin version, binary, and setup, then `doctor`)\n  \
+recompact doctor    (check the install; prints the command for anything to fix)\n  \
 recompact auto      [on [300k] | off | status]  (the auto-compaction switch; inside\n                      \
 claude: /recompact on, /recompact off, /recompact status)\n  \
 recompact version\n  \

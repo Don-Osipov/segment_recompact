@@ -604,3 +604,64 @@ fn the_binary_and_the_plugin_manifest_carry_the_same_version() {
     .unwrap();
     assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
 }
+
+#[test]
+fn auto_update_is_added_to_the_marketplace_entry_and_nothing_else_changes() {
+    let settings = r#"{
+  "model": "opus",
+  "zeta": 1,
+  "extraKnownMarketplaces": {
+    "other": {
+      "source": { "source": "github", "repo": "a/b" }
+    },
+    "segment-recompact": {
+      "source": {
+        "source": "git",
+        "url": "https://github.com/Don-Osipov/segment_recompact.git"
+      }
+    }
+  },
+  "alpha": true
+}
+"#;
+    let out = with_auto_update(settings).unwrap().expect("changed");
+    let before: Value = serde_json::from_str(settings).unwrap();
+    let after: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(
+        after["extraKnownMarketplaces"]["segment-recompact"]["autoUpdate"],
+        true
+    );
+    assert_eq!(
+        after["extraKnownMarketplaces"]["other"],
+        before["extraKnownMarketplaces"]["other"]
+    );
+    // Key order and formatting elsewhere are untouched: only the one key is inserted.
+    assert_eq!(out.replace("\"autoUpdate\": true,", ""), settings);
+    // Idempotent; left alone for a local directory marketplace or when it is not there at all.
+    assert!(with_auto_update(&out).unwrap().is_none());
+    let dir = settings.replace(
+        r#""source": "git",
+        "url": "https://github.com/Don-Osipov/segment_recompact.git""#,
+        r#""source": "directory", "path": "/x""#,
+    );
+    assert!(with_auto_update(&dir).unwrap().is_none());
+    assert!(with_auto_update(r#"{"model": "opus"}"#).unwrap().is_none());
+    assert!(with_auto_update("{ not json").is_err());
+}
+
+#[test]
+fn doctor_names_the_command_for_each_missing_piece() {
+    let home = tmp_dir();
+    let (lines, ok) = doctor_report(&home, Some(&home.join(".zshrc")));
+    assert!(!ok);
+    let text = lines.join("\n");
+    assert!(text.contains("plugin not installed: curl -fsSL"), "{text}");
+    assert!(
+        text.contains("shell not set up") && text.contains("recompact install"),
+        "{text}"
+    );
+    // A shell file that defines claude itself is reported, not overwritten.
+    fs::write(home.join(".zshrc"), "alias claude='claude --verbose'\n").unwrap();
+    let (lines, _) = doctor_report(&home, Some(&home.join(".zshrc")));
+    assert!(lines.join("\n").contains("defines `claude` itself"));
+}

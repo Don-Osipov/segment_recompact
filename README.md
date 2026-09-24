@@ -24,14 +24,14 @@ value is a disciplined process plus correct structural surgery.
 ## Install
 
 One line, on macOS or Linux with zsh or bash and Claude Code installed. There is nothing else to
-set up:
+set up, and running it again updates everything:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Don-Osipov/segment_recompact/main/install.sh | sh
 ```
 
-It installs the plugin, fetches the prebuilt binary for your platform (checksum-verified; no Rust
-needed), and adds a small `claude` function to `~/.zshrc` or `~/.bashrc` that runs claude
+It installs the plugin with auto-update on, fetches the prebuilt binary for your platform
+(checksum-verified; no Rust needed), and adds a small `claude` function to `~/.zshrc` or `~/.bashrc` that runs claude
 through recompact. Aliases like `alias c='claude --model opus'` go through it too. Open a new
 terminal and use claude as always:
 
@@ -46,9 +46,27 @@ terminal and use claude as always:
   new sessions. They answer instantly, without a model turn.
 
 Anything removed stays readable through the `recall` tool. `claude -p`, subcommands, and flags the
-launcher does not recognize run plain claude. Updates arrive with the plugin's own updates; the
-first run of each version downloads its binary from GitHub, so it needs network access (or
-`cargo`). To undo the shell change: `~/.claude/recompact/bin/recompact uninstall`.
+launcher does not recognize run plain claude. New versions install themselves when claude starts
+(the plugin's auto-update); the first run of each version downloads its binary from GitHub, so it
+needs network access (or `cargo`). `recompact update` updates on demand, and `recompact doctor`
+checks the whole setup. To undo the shell change: `~/.claude/recompact/bin/recompact uninstall`.
+
+### Installing or updating with an agent
+
+Paste this to Claude (or any coding agent): "Install segment_recompact: follow the agent steps in
+https://github.com/Don-Osipov/segment_recompact". The steps, for the agent:
+
+1. Run `curl -fsSL https://raw.githubusercontent.com/Don-Osipov/segment_recompact/main/install.sh | sh`.
+   It is non-interactive, idempotent (the same command updates), and safe inside a Claude Code
+   session. If piping to `sh` is not allowed, run the steps in `install.sh` one by one.
+2. Run `~/.claude/recompact/bin/recompact doctor` and relay its lines. Every line should be `ok` or
+   `note`; for a `fix` line, run the command it names, then run doctor again.
+3. Tell the user: open a new terminal and start claude as usual. Sessions already running keep the
+   old setup until restarted. In sessions they want to run long, `/recompact on`.
+
+Do not edit `~/.zshrc` or Claude Code settings by hand, build from source, or run `recompact shell`
+inside a claude session. If doctor reports that the shell file already defines `claude`, ask the
+user before changing that definition. To update later: `~/.claude/recompact/bin/recompact update`.
 
 Already have the plugin (for example through a team's settings)? Type `/recompact setup` once
 inside claude instead.
@@ -62,7 +80,8 @@ plugin and its updates; each person then types `/recompact setup` once for in-pl
 {
   "extraKnownMarketplaces": {
     "segment-recompact": {
-      "source": { "source": "git", "url": "https://github.com/Don-Osipov/segment_recompact.git" }
+      "source": { "source": "git", "url": "https://github.com/Don-Osipov/segment_recompact.git" },
+      "autoUpdate": true
     }
   },
   "enabledPlugins": { "segment-recompact@segment-recompact": true }
