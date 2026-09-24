@@ -1,7 +1,7 @@
 {
   "name": "segment-recompact",
-  "version": "0.9.0",
-  "description": "Offline, segment-wise, structure-preserving compaction of a Claude Code session .jsonl. Segments by user turn, keeps user turns verbatim, replaces each segment's agent turns + tool results with a hand-written summary, and emits a shorter resume-compatible session. A small Rust helper does the deterministic surgery; Claude writes the summaries.",
+  "version": "1.0.0",
+  "description": "Offline, structure-preserving compaction of Claude Code sessions that resume well: user turns verbatim, older work summarized or masked with provenance, evidence carried by code, an orientation brief and resume hook, and a recall tool that reads back anything removed.",
   "author": {
     "name": "Stephen Roylance"
   },

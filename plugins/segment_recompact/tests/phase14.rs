@@ -41,7 +41,11 @@ fn write(path: &Path, records: &[Value]) {
 }
 
 fn load(p: &Path) -> Vec<Value> {
-    fs::read_to_string(p).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+    fs::read_to_string(p)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
 }
 
 const ORIG: &str = "0a000000-0000-4000-8000-000000000001";
@@ -66,12 +70,20 @@ fn compacted_project(root: &Path) -> (PathBuf, String, Vec<Value>) {
     fs::write(&sums, json!({"0": "I found the outage cause."}).to_string()).unwrap();
     let out = dir.join("twin-out.jsonl");
     assert_eq!(
-        cmd_assemble(&[orig.to_string_lossy().into_owned(), sums.to_string_lossy().into_owned(),
-            "--out".into(), out.to_string_lossy().into_owned()]),
+        cmd_assemble(&[
+            orig.to_string_lossy().into_owned(),
+            sums.to_string_lossy().into_owned(),
+            "--out".into(),
+            out.to_string_lossy().into_owned()
+        ]),
         0
     );
     let twin = load(&out);
-    let twin_id = twin.iter().find_map(|r| r["sessionId"].as_str()).unwrap().to_string();
+    let twin_id = twin
+        .iter()
+        .find_map(|r| r["sessionId"].as_str())
+        .unwrap()
+        .to_string();
     let twin_path = dir.join(format!("{twin_id}.jsonl"));
     fs::rename(&out, &twin_path).unwrap();
     (dir, twin_id, twin)
@@ -80,27 +92,46 @@ fn compacted_project(root: &Path) -> (PathBuf, String, Vec<Value>) {
 fn serve(ctx: RecallCtx, args: Value) -> Value {
     let req = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"recall","arguments":args}});
     let mut out: Vec<u8> = Vec::new();
-    assert_eq!(mcp_serve(Cursor::new(format!("{req}\n").into_bytes()), &mut out, ctx), 0);
-    let resp: Value = serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
+    assert_eq!(
+        mcp_serve(Cursor::new(format!("{req}\n").into_bytes()), &mut out, ctx),
+        0
+    );
+    let resp: Value =
+        serde_json::from_str(String::from_utf8(out).unwrap().lines().next().unwrap()).unwrap();
     resp["result"].clone()
 }
 
 fn text_of(result: &Value) -> String {
-    result["content"].as_array().unwrap().iter()
-        .filter_map(|c| c["text"].as_str()).collect::<Vec<_>>().join("\n")
+    result["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
 fn the_footer_id_resolves_with_no_session_known_at_all() {
     let root = tmp_root();
     let (dir, _twin_id, twin) = compacted_project(&root);
-    let synth = twin.iter().find(|r| r["recompactSynthetic"] == true).unwrap();
+    let synth = twin
+        .iter()
+        .find(|r| r["recompactSynthetic"] == true)
+        .unwrap();
     let footer_id = &synth["uuid"].as_str().unwrap()[..8];
     let footer = synth["message"]["content"][0]["text"].as_str().unwrap();
     assert!(footer.contains(&format!("recall {footer_id}")));
-    let r = serve(RecallCtx::from(dir.as_path()), json!({"selector": footer_id}));
+    let r = serve(
+        RecallCtx::from(dir.as_path()),
+        json!({"selector": footer_id}),
+    );
     assert_eq!(r["isError"], false, "{}", text_of(&r));
-    assert!(text_of(&r).contains("max_client_conn=400"), "{}", text_of(&r));
+    assert!(
+        text_of(&r).contains("max_client_conn=400"),
+        "{}",
+        text_of(&r)
+    );
 }
 
 #[test]
@@ -108,19 +139,39 @@ fn a_bound_session_makes_keys_and_listing_exact_and_an_unbound_one_never_guesses
     let root = tmp_root();
     let (dir, twin_id, _) = compacted_project(&root);
     // A newer, unrelated session in the same dir: v0.9 would have resolved keys against it.
-    write(&dir.join("ffffffff-0000-4000-8000-00000000000f.jsonl"),
-        &[user("f1000000-0000-4000-8000-000000000001", None, "other work", "ffff"),
-          last_prompt("f1000000-0000-4000-8000-000000000001", "ffff")]);
-    let bound = || RecallCtx { dir: dir.clone(), session: Some(twin_id.clone()) };
+    write(
+        &dir.join("ffffffff-0000-4000-8000-00000000000f.jsonl"),
+        &[
+            user(
+                "f1000000-0000-4000-8000-000000000001",
+                None,
+                "other work",
+                "ffff",
+            ),
+            last_prompt("f1000000-0000-4000-8000-000000000001", "ffff"),
+        ],
+    );
+    let bound = || RecallCtx {
+        dir: dir.clone(),
+        session: Some(twin_id.clone()),
+    };
     let r = serve(bound(), json!({"selector": "0"}));
     assert_eq!(r["isError"], false, "{}", text_of(&r));
     assert!(text_of(&r).contains("max_client_conn=400"));
     let listing = serve(bound(), json!({}));
-    assert!(text_of(&listing).contains("(part 0,"), "{}", text_of(&listing));
+    assert!(
+        text_of(&listing).contains("(part 0,"),
+        "{}",
+        text_of(&listing)
+    );
 
     let unbound = serve(RecallCtx::from(dir.as_path()), json!({"selector": "0"}));
     assert_eq!(unbound["isError"], true);
-    assert!(text_of(&unbound).contains("does not know which session"), "{}", text_of(&unbound));
+    assert!(
+        text_of(&unbound).contains("does not know which session"),
+        "{}",
+        text_of(&unbound)
+    );
 }
 
 #[test]
@@ -130,10 +181,24 @@ fn ids_and_sessions_resolve_across_project_dirs() {
     // The server was started for a worktree's project dir; the session lives in the main one.
     let worktree_dir = root.join("-proj-main--claude-worktrees-feature");
     fs::create_dir_all(&worktree_dir).unwrap();
-    let synth_id = &twin.iter().find(|r| r["recompactSynthetic"] == true).unwrap()["uuid"].as_str().unwrap()[..8];
-    let r = serve(RecallCtx::from(worktree_dir.as_path()), json!({"selector": synth_id}));
+    let synth_id = &twin
+        .iter()
+        .find(|r| r["recompactSynthetic"] == true)
+        .unwrap()["uuid"]
+        .as_str()
+        .unwrap()[..8];
+    let r = serve(
+        RecallCtx::from(worktree_dir.as_path()),
+        json!({"selector": synth_id}),
+    );
     assert_eq!(r["isError"], false, "{}", text_of(&r));
-    let r = serve(RecallCtx { dir: worktree_dir.clone(), session: Some(twin_id.clone()) }, json!({"selector": "0"}));
+    let r = serve(
+        RecallCtx {
+            dir: worktree_dir.clone(),
+            session: Some(twin_id.clone()),
+        },
+        json!({"selector": "0"}),
+    );
     assert_eq!(r["isError"], false, "{}", text_of(&r));
     let _ = dir;
 }
@@ -145,25 +210,40 @@ fn provenance_survives_the_source_moving_to_another_project_dir() {
     // Claude Code relocated the original when it was resumed from a worktree.
     let moved = root.join("-proj-main--claude-worktrees-moved");
     fs::create_dir_all(&moved).unwrap();
-    fs::rename(dir.join(format!("{ORIG}.jsonl")), moved.join(format!("{ORIG}.jsonl"))).unwrap();
+    fs::rename(
+        dir.join(format!("{ORIG}.jsonl")),
+        moved.join(format!("{ORIG}.jsonl")),
+    )
+    .unwrap();
     let twin = load(&dir.join(format!("{twin_id}.jsonl")));
     let got = rehydrate_select(&twin, "0").expect("provenance follows the session id");
-    assert!(got.iter().any(|r| r.to_string().contains("max_client_conn=400")));
+    assert!(got
+        .iter()
+        .any(|r| r.to_string().contains("max_client_conn=400")));
 }
 
 #[test]
 fn query_searches_what_compaction_removed_and_skips_what_is_still_visible() {
     let root = tmp_root();
     let (dir, twin_id, _) = compacted_project(&root);
-    let ctx = || RecallCtx { dir: dir.clone(), session: Some(twin_id.clone()) };
+    let ctx = || RecallCtx {
+        dir: dir.clone(),
+        session: Some(twin_id.clone()),
+    };
     let r = serve(ctx(), json!({"query": "max_client_conn"}));
     assert_eq!(r["isError"], false, "{}", text_of(&r));
     let t = text_of(&r);
-    assert!(t.contains("1 match") && t.contains("b0000000") && t.contains("max_client_conn=400"), "{t}");
+    assert!(
+        t.contains("1 match") && t.contains("b0000000") && t.contains("max_client_conn=400"),
+        "{t}"
+    );
     // An exact error code finds it too; a phrase that only appears in visible turns does not.
     assert!(text_of(&serve(ctx(), json!({"query": "PGRST-9001"}))).contains("b0000000"));
     let visible = text_of(&serve(ctx(), json!({"query": "\"Raised the pool\""})));
-    assert!(visible.starts_with("no match"), "visible records are not search results: {visible}");
+    assert!(
+        visible.starts_with("no match"),
+        "visible records are not search results: {visible}"
+    );
     // Without a session, query explains what it needs instead of searching everything.
     let unbound = serve(RecallCtx::from(dir.as_path()), json!({"query": "pool"}));
     assert_eq!(unbound["isError"], true);
@@ -177,7 +257,58 @@ fn a_key_carried_by_several_generations_is_refused_with_its_ids() {
         s["recompactProvenance"] = json!({"source": "/gone", "sourceSessionId": "gone", "part": "3.1", "coveredUuids": ["x"]});
         s
     };
-    let twin = vec![user("u1", None, "hi", "t"), mk("11111111-0000-4000-8000-000000000000"), mk("22222222-0000-4000-8000-000000000000")];
+    let twin = vec![
+        user("u1", None, "hi", "t"),
+        mk("11111111-0000-4000-8000-000000000000"),
+        mk("22222222-0000-4000-8000-000000000000"),
+    ];
     let err = rehydrate_select(&twin, "3.1").unwrap_err();
-    assert!(err.contains("11111111") && err.contains("22222222"), "{err}");
+    assert!(
+        err.contains("11111111") && err.contains("22222222"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_branch_copy_that_kept_moving_is_the_live_head() {
+    let root = tmp_root();
+    let dir = root.join("-proj");
+    fs::create_dir_all(&dir).unwrap();
+    let parent = "0b000000-0000-4000-8000-000000000001";
+    let branch = "0b000000-0000-4000-8000-000000000002";
+    write(
+        &dir.join(format!("{parent}.jsonl")),
+        &[user("c1", None, "start", parent), last_prompt("c1", parent)],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let mut first = user("c1", None, "start", branch);
+    first["forkedFrom"] = json!({"sessionId": parent, "messageUuid": "c1"});
+    write(
+        &dir.join(format!("{branch}.jsonl")),
+        &[
+            first,
+            assistant("c2", "c1", "branched work", branch),
+            last_prompt("c2", branch),
+        ],
+    );
+    assert_eq!(
+        fork_parents(&dir).get(branch).map(String::as_str),
+        Some(parent)
+    );
+    assert_eq!(
+        lineage_latest(&dir, parent),
+        branch,
+        "the branch moved last"
+    );
+    // The parent kept going after the branch was abandoned: the parent is the head again.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write(
+        &dir.join(format!("{parent}.jsonl")),
+        &[
+            user("c1", None, "start", parent),
+            assistant("c3", "c1", "more", parent),
+            last_prompt("c3", parent),
+        ],
+    );
+    assert_eq!(lineage_latest(&dir, parent), parent);
 }

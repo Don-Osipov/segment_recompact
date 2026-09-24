@@ -11,6 +11,7 @@
 //!   invisible in the transcript text. So live usage cannot calibrate a chars-per-token ratio.
 //! - The ratio is the tokenizer's: the same content ran 2.39 chars/token on Opus 5.5, ~2.65 on
 //!   Fable 5.1 and 3.06 on Haiku 4.5 (dense content; prose runs higher).
+//!
 //! Hence: visible chars at the model's measured ratio for sizing a twin (twins carry no
 //! thinking), plus a fixed system+tools overhead (`--overhead` overrides it), and the last usage
 //! record — ground truth — for how big the live session is now.
@@ -183,7 +184,8 @@ impl Calib {
 
 fn prompt_tokens(usage: &Value) -> Option<usize> {
     let get = |k: &str| usage.get(k).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let t = get("input_tokens") + get("cache_creation_input_tokens") + get("cache_read_input_tokens");
+    let t =
+        get("input_tokens") + get("cache_creation_input_tokens") + get("cache_read_input_tokens");
     (t > 0).then_some(t)
 }
 

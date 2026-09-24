@@ -1513,7 +1513,7 @@ pub fn is_ceremony(r: &Value) -> bool {
         Some(t) if CEREMONY_ATTACHMENTS.contains(&t) => true,
         Some("hook_additional_context") => {
             serde_json::to_string(r.get("attachment").unwrap_or(&Value::Null))
-                .map_or(false, |s| s.contains(ORIENT_MARKER))
+                .is_ok_and(|s| s.contains(ORIENT_MARKER))
         }
         _ => false,
     }
@@ -1533,7 +1533,7 @@ pub fn is_human_queued(r: &Value) -> bool {
             .unwrap_or(false)
         && r.pointer("/attachment/origin/kind")
             .and_then(|v| v.as_str())
-            .map_or(true, |k| k == "human")
+            .is_none_or(|k| k == "human")
 }
 
 pub fn human_queued_text(r: &Value) -> String {
@@ -2700,27 +2700,71 @@ fn session_mtime(dir: &Path, id: &str) -> Option<std::time::SystemTime> {
         .ok()
 }
 
+/// Sessions in `dir` that `/branch` (or `--fork-session`) copied from another: child -> parent.
+/// The copy's records carry `forkedFrom.sessionId`, and the lineage sidecar never hears of it —
+/// so without this, continue would compact the stale parent a user had branched away from.
+pub fn fork_parents(dir: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(entries) = fs::read_dir(dir) else { return out };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(mut f) = fs::File::open(&p) else { continue };
+        let mut buf = vec![0u8; 256 * 1024];
+        let n = f.read(&mut buf).unwrap_or(0);
+        let head = String::from_utf8_lossy(&buf[..n]);
+        if !head.contains("\"forkedFrom\"") {
+            continue;
+        }
+        let parent = head.lines().find_map(|l| {
+            serde_json::from_str::<Value>(l)
+                .ok()?
+                .pointer("/forkedFrom/sessionId")?
+                .as_str()
+                .map(str::to_string)
+        });
+        if let Some(parent) = parent {
+            let child = stem_of(&p);
+            if parent != child {
+                out.insert(child, parent);
+            }
+        }
+    }
+    out
+}
+
 pub fn lineage_latest(dir: &Path, start: &str) -> String {
     let m = lineage_load(dir);
+    let forks = fork_parents(dir);
     let mut cur = start.to_string();
     for _ in 0..1000 {
         // A descendant is only followed while it is FRESHER than its parent: a twin cut
         // mid-session goes stale the moment the parent session keeps appending (its unique
         // turns are missing from the twin), and resuming it would silently drop them from the
         // continued thread. A stale or deleted twin is skipped; continue then re-compacts from
-        // the parent, which the summary cache makes cheap.
+        // the parent, which the summary cache makes cheap. Branch copies compete on the same
+        // terms: whichever copy of the thread moved last is its live head.
         let cur_mtime = session_mtime(dir, &cur);
-        let next = m
+        let fresh = |k: &str| match (session_mtime(dir, k), cur_mtime) {
+            (Some(child), Some(parent)) => child >= parent,
+            (child, _) => child.is_some(),
+        };
+        let twin = m
             .iter()
-            .filter(|(k, v)| {
-                v.get("parent").and_then(|p| p.as_str()) == Some(cur.as_str())
-                    && match (session_mtime(dir, k), cur_mtime) {
-                        (Some(child), Some(parent)) => child >= parent,
-                        (child, _) => child.is_some(),
-                    }
-            })
+            .filter(|(k, v)| v.get("parent").and_then(|p| p.as_str()) == Some(cur.as_str()) && fresh(k))
             .max_by_key(|(_, v)| v.get("at").and_then(|a| a.as_u64()).unwrap_or(0))
             .map(|(k, _)| k.clone());
+        let branch = forks
+            .iter()
+            .filter(|(k, p)| p.as_str() == cur && fresh(k))
+            .max_by_key(|(k, _)| session_mtime(dir, k))
+            .map(|(k, _)| k.clone());
+        let next = match (twin, branch) {
+            (Some(t), Some(b)) => Some(if session_mtime(dir, &b) > session_mtime(dir, &t) { b } else { t }),
+            (t, b) => t.or(b),
+        };
         match next {
             Some(n) if n != cur => cur = n,
             _ => break,
@@ -4090,7 +4134,7 @@ pub fn locate_session(hint: Option<&Path>, session: &str) -> Option<PathBuf> {
     for e in fs::read_dir(&root).ok()?.flatten() {
         let p = e.path().join(&name);
         if let Ok(t) = fs::metadata(&p).and_then(|m| m.modified()) {
-            if best.as_ref().map_or(true, |(bt, _)| t > *bt) {
+            if best.as_ref().is_none_or(|(bt, _)| t > *bt) {
                 best = Some((t, p));
             }
         }
@@ -5654,16 +5698,13 @@ pub fn cmd_hook(args: &[String]) -> i32 {
     let Ok(v) = serde_json::from_str::<Value>(&input) else {
         return 0;
     };
-    match args.first().map(String::as_str) {
-        Some("session-start") => {
-            if let Some(ctx) = session_start_context(&v) {
-                println!(
-                    "{}",
-                    json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}})
-                );
-            }
+    if args.first().map(String::as_str) == Some("session-start") {
+        if let Some(ctx) = session_start_context(&v) {
+            println!(
+                "{}",
+                json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}})
+            );
         }
-        _ => {}
     }
     0
 }

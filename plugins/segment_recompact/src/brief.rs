@@ -13,7 +13,9 @@ use std::process::Command;
 
 use serde_json::{json, Value};
 
-use crate::{content, is_genuine_user, is_human_queued, human_queued_text, rec_type, truncate, user_text};
+use crate::{
+    content, human_queued_text, is_genuine_user, is_human_queued, rec_type, truncate, user_text,
+};
 
 #[derive(Default)]
 struct FileTouch {
@@ -36,7 +38,11 @@ fn tool_result_texts(r: &Value) -> Vec<(String, String, bool)> {
             if b.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
                 continue;
             }
-            let id = b.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let id = b
+                .get("tool_use_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let err = b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
             let text = match b.get("content") {
                 Some(Value::String(s)) => s.clone(),
@@ -67,7 +73,10 @@ fn pr_urls(text: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(i) = rest.find("/pull/") {
-        let n: String = rest[i + 6..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        let n: String = rest[i + 6..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
         if !n.is_empty() && rest[..i].contains("github.com/") {
             out.push(n);
         }
@@ -81,10 +90,16 @@ fn commit_lines(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for line in text.lines() {
         let l = line.trim();
-        let Some(inner) = l.strip_prefix('[') else { continue };
-        let Some((head, msg)) = inner.split_once("] ") else { continue };
+        let Some(inner) = l.strip_prefix('[') else {
+            continue;
+        };
+        let Some((head, msg)) = inner.split_once("] ") else {
+            continue;
+        };
         let mut parts = head.split_whitespace();
-        let (Some(_branch), Some(sha)) = (parts.next(), parts.last()) else { continue };
+        let (Some(_branch), Some(sha)) = (parts.next(), parts.last()) else {
+            continue;
+        };
         if (7..=12).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit()) {
             out.push((sha.to_string(), truncate(msg.trim(), 60)));
         }
@@ -128,7 +143,11 @@ pub fn state_brief(records: &[Value]) -> Vec<String> {
                     }
                     let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
                     let input = b.get("input").cloned().unwrap_or(Value::Null);
-                    let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let id = b
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let path = input
                         .get("file_path")
                         .or_else(|| input.get("notebook_path"))
@@ -169,7 +188,13 @@ pub fn state_brief(records: &[Value]) -> Vec<String> {
             }
             if cmd.contains("gh pr create") && !err {
                 for n in pr_urls(&text) {
-                    prs.insert(n, PrState { state: "opened".into(), order });
+                    prs.insert(
+                        n,
+                        PrState {
+                            state: "opened".into(),
+                            order,
+                        },
+                    );
                 }
             }
             if let Some(n) = pr_number_after(&cmd, "gh pr merge") {
@@ -179,7 +204,13 @@ pub fn state_brief(records: &[Value]) -> Vec<String> {
                     } else {
                         "merged"
                     };
-                    prs.insert(n, PrState { state: state.into(), order });
+                    prs.insert(
+                        n,
+                        PrState {
+                            state: state.into(),
+                            order,
+                        },
+                    );
                 }
             }
             for sub in ["gh pr view", "gh pr checks", "gh pr status"] {
@@ -194,7 +225,13 @@ pub fn state_brief(records: &[Value]) -> Vec<String> {
                         None
                     };
                     if let (Some(s), false) = (state, err) {
-                        prs.insert(n, PrState { state: s.into(), order });
+                        prs.insert(
+                            n,
+                            PrState {
+                                state: s.into(),
+                                order,
+                            },
+                        );
                     }
                 }
             }
@@ -204,7 +241,7 @@ pub fn state_brief(records: &[Value]) -> Vec<String> {
     let mut lines = Vec::new();
     if !files.is_empty() {
         let mut v: Vec<(&String, &FileTouch)> = files.iter().collect();
-        v.sort_by(|a, b| b.1.order.cmp(&a.1.order));
+        v.sort_by_key(|(_, f)| std::cmp::Reverse(f.order));
         let root = common_dir(files.keys().map(String::as_str));
         let shown: Vec<String> = v
             .iter()
@@ -227,9 +264,15 @@ pub fn state_brief(records: &[Value]) -> Vec<String> {
         let more = v.len().saturating_sub(12);
         lines.push(format!(
             "Files changed this session, newest first{}: {}{}",
-            root.as_deref().map(|r| format!(" (under `{r}`)")).unwrap_or_default(),
+            root.as_deref()
+                .map(|r| format!(" (under `{r}`)"))
+                .unwrap_or_default(),
             shown.join(", "),
-            if more > 0 { format!(", +{more} more") } else { String::new() }
+            if more > 0 {
+                format!(", +{more} more")
+            } else {
+                String::new()
+            }
         ));
     }
     let mut git_bits = Vec::new();
@@ -244,7 +287,12 @@ pub fn state_brief(records: &[Value]) -> Vec<String> {
     }
     branches.dedup();
     if !branches.is_empty() {
-        let recent: Vec<String> = branches.iter().rev().take(6).map(|b| format!("`{b}`")).collect();
+        let recent: Vec<String> = branches
+            .iter()
+            .rev()
+            .take(6)
+            .map(|b| format!("`{b}`"))
+            .collect();
         git_bits.push(format!("branches/worktrees created {}", recent.join(", ")));
     }
     if !git_bits.is_empty() {
@@ -252,16 +300,31 @@ pub fn state_brief(records: &[Value]) -> Vec<String> {
     }
     if !prs.is_empty() {
         let mut v: Vec<(&String, &PrState)> = prs.iter().collect();
-        v.sort_by(|a, b| b.1.order.cmp(&a.1.order));
-        let shown: Vec<String> = v.iter().take(10).map(|(n, s)| format!("#{n} {}", s.state)).collect();
-        lines.push(format!("PRs, last state observed in this session: {}", shown.join(" · ")));
+        v.sort_by_key(|(_, p)| std::cmp::Reverse(p.order));
+        let shown: Vec<String> = v
+            .iter()
+            .take(10)
+            .map(|(n, s)| format!("#{n} {}", s.state))
+            .collect();
+        lines.push(format!(
+            "PRs, last state observed in this session: {}",
+            shown.join(" · ")
+        ));
     }
     let asks: Vec<String> = records
         .iter()
         .filter(|r| is_genuine_user(r) || is_human_queued(r))
-        .map(|r| if is_human_queued(r) { human_queued_text(r) } else { user_text(r) })
+        .map(|r| {
+            if is_human_queued(r) {
+                human_queued_text(r)
+            } else {
+                user_text(r)
+            }
+        })
         .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|t| !t.is_empty() && !t.starts_with("<command-name>") && !t.starts_with("<local-command"))
+        .filter(|t| {
+            !t.is_empty() && !t.starts_with("<command-name>") && !t.starts_with("<local-command")
+        })
         .collect();
     if !asks.is_empty() {
         let recent: Vec<String> = asks
@@ -271,7 +334,10 @@ pub fn state_brief(records: &[Value]) -> Vec<String> {
             .rev()
             .map(|t| format!("\"{}\"", truncate(t, 220)))
             .collect();
-        lines.push(format!("Most recent asks, oldest first: {}", recent.join(" → ")));
+        lines.push(format!(
+            "Most recent asks, oldest first: {}",
+            recent.join(" → ")
+        ));
     }
     lines
 }
@@ -284,9 +350,16 @@ pub fn session_path_root(records: &[Value]) -> Option<String> {
         if let Some(blocks) = content(r).and_then(|c| c.as_array()) {
             for b in blocks {
                 if b.get("type").and_then(|v| v.as_str()) == Some("tool_use")
-                    && matches!(b.get("name").and_then(|v| v.as_str()), Some("Edit" | "MultiEdit" | "Write" | "NotebookEdit"))
+                    && matches!(
+                        b.get("name").and_then(|v| v.as_str()),
+                        Some("Edit" | "MultiEdit" | "Write" | "NotebookEdit")
+                    )
                 {
-                    if let Some(p) = b.pointer("/input/file_path").or_else(|| b.pointer("/input/notebook_path")).and_then(|v| v.as_str()) {
+                    if let Some(p) = b
+                        .pointer("/input/file_path")
+                        .or_else(|| b.pointer("/input/notebook_path"))
+                        .and_then(|v| v.as_str())
+                    {
                         if !paths.iter().any(|x| x == p) {
                             paths.push(p.to_string());
                         }
@@ -331,7 +404,12 @@ fn common_dir<'a>(paths: impl Iterator<Item = &'a str>) -> Option<String> {
 }
 
 fn git(cwd: &str, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").arg("-C").arg(cwd).args(args).output().ok()?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -376,14 +454,21 @@ pub fn resume_flags(records: &[Value]) -> Vec<String> {
     for r in records {
         if let Some(u) = r.pointer("/message/usage") {
             let get = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-            if get("input_tokens") + get("cache_creation_input_tokens") + get("cache_read_input_tokens") > 200_000 {
+            if get("input_tokens")
+                + get("cache_creation_input_tokens")
+                + get("cache_read_input_tokens")
+                > 200_000
+            {
                 long_context = true;
             }
         }
         if rec_type(r) == "user" {
             let t = user_text(r);
             if let Some(i) = t.find("Set effort level to ") {
-                let e: String = t[i + 20..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+                let e: String = t[i + 20..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
                 if !e.is_empty() {
                     effort = Some(e);
                 }
@@ -400,7 +485,11 @@ pub fn resume_flags(records: &[Value]) -> Vec<String> {
     }
     if let Some(m) = model {
         flags.push("--model".into());
-        flags.push(if long_context { format!("{m}[1m]") } else { m.to_string() });
+        flags.push(if long_context {
+            format!("{m}[1m]")
+        } else {
+            m.to_string()
+        });
     }
     if let Some(e) = effort {
         flags.push("--effort".into());
@@ -453,7 +542,14 @@ pub fn parse_ts(ts: &str) -> Option<i64> {
         return None;
     }
     let n = |r: std::ops::Range<usize>| ts.get(r)?.parse::<i64>().ok();
-    let (y, mo, d, h, mi, s) = (n(0..4)?, n(5..7)?, n(8..10)?, n(11..13)?, n(14..16)?, n(17..19)?);
+    let (y, mo, d, h, mi, s) = (
+        n(0..4)?,
+        n(5..7)?,
+        n(8..10)?,
+        n(11..13)?,
+        n(14..16)?,
+        n(17..19)?,
+    );
     Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s)
 }
 
@@ -478,7 +574,11 @@ pub fn format_utc(secs: i64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", rem / 3600, (rem % 3600) / 60)
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
 }
 
 /// The newest twin in `transcript`'s project dir whose custom title is `title`.
@@ -495,7 +595,9 @@ fn twin_by_title(transcript: &str, title: &str) -> Option<String> {
         if p.extension().and_then(|x| x.to_str()) != Some("jsonl") {
             continue;
         }
-        let Ok(t) = e.metadata().and_then(|m| m.modified()) else { continue };
+        let Ok(t) = e.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
         if best.as_ref().is_some_and(|(bt, _)| *bt >= t) {
             continue;
         }
@@ -522,15 +624,31 @@ pub fn session_start_context(input: &Value) -> Option<String> {
         // session title (a twin's carries "(recompact N)") names the twin it was forked from.
         _ => twin_by_title(path, input.get("session_title").and_then(|v| v.as_str())?)?,
     };
-    let records: Vec<Value> = raw.lines().filter_map(|l| serde_json::from_str(l.trim()).ok()).collect();
-    let pidx = records.iter().rposition(|r| crate::truthy(r, "recompactPreamble"))?;
+    let records: Vec<Value> = raw
+        .lines()
+        .filter_map(|l| serde_json::from_str(l.trim()).ok())
+        .collect();
+    let pidx = records
+        .iter()
+        .rposition(|r| crate::truthy(r, "recompactPreamble"))?;
     let preamble = &records[pidx];
     let assembled_at = preamble
         .get("recompactAssembledAt")
         .and_then(|v| v.as_i64())
-        .or_else(|| preamble.get("timestamp").and_then(|v| v.as_str()).and_then(parse_ts));
-    let since: Vec<&Value> = records[pidx + 1..].iter().filter(|r| is_genuine_user(r)).collect();
-    let generation = preamble.get("recompactGeneration").and_then(|v| v.as_u64()).unwrap_or(1);
+        .or_else(|| {
+            preamble
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .and_then(parse_ts)
+        });
+    let since: Vec<&Value> = records[pidx + 1..]
+        .iter()
+        .filter(|r| is_genuine_user(r))
+        .collect();
+    let generation = preamble
+        .get("recompactGeneration")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
     let source_id = preamble
         .pointer("/recompactSource/sessionId")
         .and_then(|v| v.as_str())
@@ -596,7 +714,12 @@ pub fn session_start_context(input: &Value) -> Option<String> {
              instead of re-running the work."
                 .to_string(),
         );
-        let last_pre = records[..pidx].iter().rev().find(|r| is_genuine_user(r)).map(user_text).unwrap_or_default();
+        let last_pre = records[..pidx]
+            .iter()
+            .rev()
+            .find(|r| is_genuine_user(r))
+            .map(user_text)
+            .unwrap_or_default();
         if last_pre.contains("recompact") {
             lines.push(
                 "The /recompact request near the end of this transcript is the one that produced this session; it has already run — do not run it again."
@@ -613,21 +736,72 @@ pub fn short_id(id: &str) -> &str {
 
 /// Openings that make a sentence an instruction (imperative mood), after filler is stripped.
 const CONSTRAINT_OPENINGS: &[&str] = &[
-    "don't", "dont ", "do not", "never", "always", "make sure", "be sure", "stop ", "avoid",
-    "keep ", "lets not", "let's not", "no need to", "only use", "only do", "only run", "use ",
-    "remember", "from now on", "going forward", "you must", "you should", "you need to",
-    "i don't want", "i dont want", "we don't", "we dont", "no more",
+    "don't",
+    "dont ",
+    "do not",
+    "never",
+    "always",
+    "make sure",
+    "be sure",
+    "stop ",
+    "avoid",
+    "keep ",
+    "lets not",
+    "let's not",
+    "no need to",
+    "only use",
+    "only do",
+    "only run",
+    "use ",
+    "remember",
+    "from now on",
+    "going forward",
+    "you must",
+    "you should",
+    "you need to",
+    "i don't want",
+    "i dont want",
+    "we don't",
+    "we dont",
+    "no more",
 ];
 
 /// Phrases that bind wherever they appear.
 const CONSTRAINT_ANYWHERE: &[&str] = &[
-    "from now on", "going forward", "without asking", "without my", "no need to", "not yet",
-    "should never", "must not", "do not ", "don't ever", "dont ever", "never ever",
+    "from now on",
+    "going forward",
+    "without asking",
+    "without my",
+    "no need to",
+    "not yet",
+    "should never",
+    "must not",
+    "do not ",
+    "don't ever",
+    "dont ever",
+    "never ever",
 ];
 
 const FILLER: &[&str] = &[
-    "ok ", "okay ", "ok, ", "so ", "and ", "also ", "but ", "please ", "yes ", "yeah ",
-    "alright ", "no ", "no, ", "and also ", "also, ", "then ", "actually ", "btw ", "oh ",
+    "ok ",
+    "okay ",
+    "ok, ",
+    "so ",
+    "and ",
+    "also ",
+    "but ",
+    "please ",
+    "yes ",
+    "yeah ",
+    "alright ",
+    "no ",
+    "no, ",
+    "and also ",
+    "also, ",
+    "then ",
+    "actually ",
+    "btw ",
+    "oh ",
 ];
 
 fn is_instruction(sentence: &str) -> bool {
@@ -702,11 +876,23 @@ pub fn constraint_lane(records: &[Value]) -> Vec<String> {
         } else {
             continue;
         };
-        if raw.starts_with("<command-name>") || raw.starts_with("<local-command") || raw.starts_with("[Request interrupted") {
+        if raw.starts_with("<command-name>")
+            || raw.starts_with("<local-command")
+            || raw.starts_with("[Request interrupted")
+        {
             continue;
         }
         let mut text = raw;
-        for tag in ["pasted_content", "local-command-stdout", "bash-stdout", "bash-stderr", "command-message", "command-name", "command-args", "system-reminder"] {
+        for tag in [
+            "pasted_content",
+            "local-command-stdout",
+            "bash-stdout",
+            "bash-stderr",
+            "command-message",
+            "command-name",
+            "command-args",
+            "system-reminder",
+        ] {
             text = strip_tagged(&text, tag);
         }
         let text: String = text.chars().take(6000).collect();
@@ -734,12 +920,39 @@ pub fn constraint_lane(records: &[Value]) -> Vec<String> {
 }
 
 const CHECK_PATTERNS: &[&str] = &[
-    "cargo test", "cargo build", "cargo check", "cargo clippy", "npm test", "npm run test",
-    "npm run build", "npm run lint", "npm run typecheck", "pnpm test", "pnpm run test",
-    "pnpm build", "pnpm run build", "pnpm lint", "pnpm run lint", "pnpm typecheck",
-    "pnpm run typecheck", "pnpm tsc", "npx tsc", "yarn test", "vitest", "jest", "pytest",
-    "go test", "tsc --noEmit", "eslint", "make test", "make check", "ruff", "mypy",
-    "swift test", "xcodebuild test", "bun test",
+    "cargo test",
+    "cargo build",
+    "cargo check",
+    "cargo clippy",
+    "npm test",
+    "npm run test",
+    "npm run build",
+    "npm run lint",
+    "npm run typecheck",
+    "pnpm test",
+    "pnpm run test",
+    "pnpm build",
+    "pnpm run build",
+    "pnpm lint",
+    "pnpm run lint",
+    "pnpm typecheck",
+    "pnpm run typecheck",
+    "pnpm tsc",
+    "npx tsc",
+    "yarn test",
+    "vitest",
+    "jest",
+    "pytest",
+    "go test",
+    "tsc --noEmit",
+    "eslint",
+    "make test",
+    "make check",
+    "ruff",
+    "mypy",
+    "swift test",
+    "xcodebuild test",
+    "bun test",
 ];
 
 /// The most recent validation command and how it ended — the one line a successor needs to know
@@ -754,9 +967,16 @@ pub fn last_check(records: &[Value]) -> Option<String> {
                     if b.get("type").and_then(|v| v.as_str()) == Some("tool_use")
                         && b.get("name").and_then(|v| v.as_str()) == Some("Bash")
                     {
-                        let cmd = b.pointer("/input/command").and_then(|v| v.as_str()).unwrap_or("");
+                        let cmd = b
+                            .pointer("/input/command")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
                         if CHECK_PATTERNS.iter().any(|p| cmd.contains(p)) {
-                            let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let id = b
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             pending.insert(id, cmd.to_string());
                         }
                     }
@@ -766,13 +986,27 @@ pub fn last_check(records: &[Value]) -> Option<String> {
         for (id, text, err) in tool_result_texts(r) {
             if let Some(cmd) = pending.remove(&id) {
                 let clean = strip_ansi(&text);
-                let tail_lines: Vec<&str> = clean.lines().rev().map(str::trim).filter(|l| !l.is_empty()).take(15).collect();
-                let tail = tail_lines.first().map(|l| truncate(l, 140)).unwrap_or_default();
+                let tail_lines: Vec<&str> = clean
+                    .lines()
+                    .rev()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .take(15)
+                    .collect();
+                let tail = tail_lines
+                    .first()
+                    .map(|l| truncate(l, 140))
+                    .unwrap_or_default();
                 // A pipe (`| tail`) swallows the exit code; the output still says what happened.
                 let reported_failure = tail_lines.iter().any(|l| {
                     let lo = l.to_ascii_lowercase();
-                    l.starts_with("FAIL") || lo.contains(" failed") || lo.starts_with("error") || lo.contains("error:")
-                        || l.contains('✗') || l.contains('×') || lo.contains("panicked")
+                    l.starts_with("FAIL")
+                        || lo.contains(" failed")
+                        || lo.starts_with("error")
+                        || lo.contains("error:")
+                        || l.contains('✗')
+                        || l.contains('×')
+                        || lo.contains("panicked")
                 });
                 let status = if err {
                     "FAILED (non-zero exit)"
@@ -785,7 +1019,11 @@ pub fn last_check(records: &[Value]) -> Option<String> {
                 last = Some(format!(
                     "`{}` → {status}{}",
                     truncate(&one_line, 110),
-                    if tail.is_empty() { String::new() } else { format!("; last line: \"{tail}\"") }
+                    if tail.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; last line: \"{tail}\"")
+                    }
                 ));
             }
         }
@@ -855,7 +1093,10 @@ pub fn preamble_text(p: &PreambleInput) -> String {
         "\nState when compacted — a snapshot; re-check anything external (PRs, deploys, database rows, running jobs) before relying on it:\n",
     );
     if let Some(snap) = p.snapshot {
-        s.push_str(&format!("- Working directory: {}\n", describe_snapshot(snap)));
+        s.push_str(&format!(
+            "- Working directory: {}\n",
+            describe_snapshot(snap)
+        ));
     }
     for line in &p.brief {
         s.push_str(&format!("- {line}\n"));

@@ -57,21 +57,30 @@ To pick up later changes, `claude plugin update segment-recompact@segment-recomp
 ## How it works
 
 ```
-recompact extract  <session.jsonl>  ->  work/segments.json   (Rust: active path, classify, segment)
-   Claude reads each segment, writes summaries -> work/summaries.json
-recompact assemble <session.jsonl> work/summaries.json  ->  <newId>.jsonl  (Rust: rebuild + re-chain)
-recompact verify   <newId>.jsonl --source <session.jsonl>   (Rust: chain, tool pairs, user-turn fidelity)
-   then: claude --resume <newId>
-
-# or the zero-LLM express lane: keep all prose, elide stale tool-result bulk
-recompact assemble <session.jsonl> --mode mask   ->  <newId>.jsonl
-# and reversibility: list summaries / recover the verbatim originals they replaced
-recompact rehydrate <newId>.jsonl [ordinal]
+recompact continue <session> --threshold 150000 --summarize-with haiku   # hands-off: plan, summarize, verify
+recompact assemble <session.jsonl> --mode mask                            # zero-cost: mask bulky tool output
+recompact extract  <session.jsonl> → worksheet; you write summaries.json; recompact assemble … → twin
+recompact verify   <twin.jsonl> --source <session.jsonl>
+recompact recall   --query "words" | <id>                                 # read back anything removed
 ```
 
-The skill walks Claude through it, including a checksum proof that the original was never
-touched, a summary-quality rubric (preserve decisions/results, reference files by path rather than
-reproducing code, keep the connective tissue for the next user turn), and a verification suite.
+A compacted twin:
+
+- keeps every user turn, including messages typed mid-turn, verbatim;
+- keeps the last turn verbatim up to a tail budget, and summarizes or masks older agent work;
+- carries, beneath each summary, the files it changed, its errors verbatim, and the identifiers
+  later turns still use — decided by code from the session's future, not by the summarizer;
+- drops stale harness ceremony and persisted thinking, which Claude Code re-creates or strips anyway;
+- ends with an orientation note: a mechanical brief of where the work stood (files, commits, PRs,
+  the last check and its result, the most recent asks) and the user's standing instructions quoted
+  verbatim. A SessionStart hook adds the compaction's age and the repo's drift since.
+
+Everything removed stays addressable. Each summary footer and each marker carries an 8-character id
+that the `recall` MCP tool resolves across every project directory, and `recall(query=…)` searches
+the originals behind a session's whole compaction lineage.
+
+Sizes are what the model is sent: visible text at the session model's measured tokenizer ratio,
+plus system and tool overhead. (The raw record size overstates a resumed twin by a median 3.6x.)
 
 ## Safety
 
