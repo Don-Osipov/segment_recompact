@@ -1623,20 +1623,26 @@ fn rc_file() -> Result<PathBuf, String> {
 /// The shell block `install` writes: interactive `claude` runs through the launcher, and falls
 /// back to plain claude whenever the launcher is missing.
 pub fn shell_block(launcher: &Path) -> String {
-    let l = launcher.display();
-    format!(
-        "{BLOCK_START}\n\
-# Interactive claude runs through recompact: /recompact and large contexts compact in place.\n\
-# Remove this block (or run `recompact uninstall`) to undo.\n\
-claude() {{\n\
-  if [ -x \"{l}\" ]; then\n\
-    \"{l}\" shell \"$@\"\n\
-  else\n\
-    command claude \"$@\"\n\
-  fi\n\
-}}\n\
-{BLOCK_END}\n"
-    )
+    // `$HOME/...` keeps the block valid for a dotfiles repo shared across machines.
+    let l = match launcher.strip_prefix(home()) {
+        Ok(rel) => format!("$HOME/{}", rel.display()),
+        Err(_) => launcher.display().to_string(),
+    };
+    [
+        BLOCK_START,
+        "# Interactive claude runs through recompact: /recompact and large contexts compact in place.",
+        "# Remove this block (or run `recompact uninstall`) to undo.",
+        "claude() {",
+        &format!("  if [ -x \"{l}\" ]; then"),
+        &format!("    \"{l}\" shell \"$@\""),
+        "  else",
+        "    command claude \"$@\"",
+        "  fi",
+        "}",
+        BLOCK_END,
+        "",
+    ]
+    .join("\n")
 }
 
 /// Remove the managed block; `None` when there is none.
