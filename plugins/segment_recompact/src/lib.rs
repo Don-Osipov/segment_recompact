@@ -44,7 +44,7 @@ recompact continue  [session.jsonl | sessionId] [--threshold T] [--keep K]\n    
 (no session: the current Claude Code session)\n  \
 recompact shell     [--at T] [--target T] [--mask] [--no-auto] [claude args...]\n                      \
 (run claude with compaction in place: a bare /recompact, or a\n                      \
-turn ending over --at (default 400k on 1M models, else 140k),\n                      \
+turn ending over --at (default 500k on 1M models, else 140k),\n                      \
 compacts and resumes in the same terminal with the same flags)\n  \
 recompact handoff   [sessionId] [--continue-after]  (compact the current session:\n                      \
 queued for turn end under `shell`; otherwise compacts now and\n                      \

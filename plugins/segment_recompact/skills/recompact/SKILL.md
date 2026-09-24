@@ -199,7 +199,7 @@ cannot classify run claude directly, unwrapped. It stays in the background and d
 
 - **Typed `/recompact`:** compacts and resumes in the same terminal, no model turn spent.
 - **Automatic, for sessions that ask for it** (`/recompact on`, below): when a turn ends with the
-  context at or over `--at` (default 400k on a 1M window, 140k on 200k), it compacts toward
+  context at or over `--at` (default 500k on a 1M window, 140k on 200k), it compacts toward
   `--target` (default half of `--at`, at most 120k) and resumes. It waits while background tasks run or session crons are scheduled, and says so once.
   From half of `--at`, a background prewarm keeps the summary cache warm, so the handoff itself
   usually takes seconds.
