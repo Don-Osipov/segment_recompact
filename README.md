@@ -23,15 +23,17 @@ value is a disciplined process plus correct structural surgery.
 
 ## Install
 
-One line, on macOS or Linux, with Claude Code installed:
+One line, on macOS or Linux with zsh or bash and Claude Code installed. There is nothing else to
+set up:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Don-Osipov/segment_recompact/main/install.sh | sh
 ```
 
 It installs the plugin, fetches the prebuilt binary for your platform (checksum-verified; no Rust
-needed), and adds a small `claude` function to your shell startup file. Open a new terminal and
-use claude as always:
+needed), and adds a small `claude` function to `~/.zshrc` or `~/.bashrc` that runs claude
+through recompact. Aliases like `alias c='claude --model opus'` go through it too. Open a new
+terminal and use claude as always:
 
 - Type `/recompact` to compact the current session. It resumes in the same terminal.
 - Sessions you expect to run long: type `/recompact on` in them (or start them with
@@ -39,13 +41,14 @@ use claude as always:
   place and carries on, through as many handoffs as it takes; long autonomous turns are asked to
   reach a checkpoint first. Everything else stays untouched: automatic compaction is off by
   default. Set `RECOMPACT_WINDOW=200k` if your Opus or Sonnet plan has a 200k window.
-- `/recompact off` turns it off for that session, `/recompact on 500k` changes its size,
+- `/recompact off` turns it off for that session, `/recompact on 600k` changes its size,
   `/recompact status` shows where it stands, and `/recompact default on` makes it the default for
   new sessions. They answer instantly, without a model turn.
 
 Anything removed stays readable through the `recall` tool. `claude -p`, subcommands, and flags the
-launcher does not recognize run plain claude. To undo the shell change:
-`~/.claude/recompact/bin/recompact uninstall`.
+launcher does not recognize run plain claude. Updates arrive with the plugin's own updates; the
+first run of each version downloads its binary from GitHub, so it needs network access (or
+`cargo`). To undo the shell change: `~/.claude/recompact/bin/recompact uninstall`.
 
 Already have the plugin (for example through a team's settings)? Type `/recompact setup` once
 inside claude instead.
