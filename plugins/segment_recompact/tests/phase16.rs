@@ -187,12 +187,12 @@ fn relaunch_keeps_flags_and_drops_the_prompt_and_session_selection() {
 #[test]
 fn defaults_follow_the_context_window() {
     // Transcripts log `claude-opus-5-5` for 1M sessions; only Haiku is assumed to be 200k.
-    assert_eq!(default_at_for("claude-opus-5-5", 10), 400_000);
-    assert_eq!(default_at_for("claude-opus-5-5[1m]", 10), 400_000);
+    assert_eq!(default_at_for("claude-opus-5-5", 10), 500_000);
+    assert_eq!(default_at_for("claude-opus-5-5[1m]", 10), 500_000);
     assert_eq!(default_at_for("claude-haiku-4-5-20251001", 10), 140_000);
     assert_eq!(
         default_at_for("claude-haiku-4-5", 250_000),
-        400_000,
+        500_000,
         "past 200k it must be 1M"
     );
     assert_eq!(default_target(400_000), 120_000);

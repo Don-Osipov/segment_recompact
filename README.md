@@ -35,7 +35,7 @@ use claude as always:
 
 - Type `/recompact` to compact the current session. It resumes in the same terminal.
 - Sessions you expect to run long: type `/recompact on` in them (or start them with
-  `claude --auto`). When a turn ends past 400k tokens (140k on Haiku), that session compacts in
+  `claude --auto`). When a turn ends past 500k tokens (140k on Haiku), that session compacts in
   place and carries on, through as many handoffs as it takes; long autonomous turns are asked to
   reach a checkpoint first. Everything else stays untouched: automatic compaction is off by
   default. Set `RECOMPACT_WINDOW=200k` if your Opus or Sonnet plan has a 200k window.

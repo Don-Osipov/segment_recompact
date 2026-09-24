@@ -282,7 +282,7 @@ pub fn window_for(model: &str, live: usize) -> usize {
 /// before Claude Code's own compaction (~167k).
 pub fn default_at(window: usize) -> usize {
     if window >= 1_000_000 {
-        400_000
+        500_000
     } else {
         140_000
     }
@@ -1922,7 +1922,7 @@ pub fn switch(
     let at = match (shell, session, &live) {
         (Some(sh), Some(id), Some((t, m))) => thresholds(sh, id, m, *t).0,
         (_, _, Some((t, m))) => user_at(session).unwrap_or_else(|| default_at_for(m, *t)),
-        _ => user_at(session).unwrap_or(400_000),
+        _ => user_at(session).unwrap_or_else(|| default_at(1_000_000)),
     };
     let now = live
         .as_ref()

@@ -72,8 +72,8 @@ fn auto_compaction_is_off_by_default_and_switched_per_session() {
     let home = std::env::temp_dir().join(format!("recompact-switch-{}", uuid_v4()));
     fs::create_dir_all(&home).unwrap();
     std::env::set_var("RECOMPACT_HOME", &home);
-    let ta = write_session(&home, A, 450_000);
-    let tb = write_session(&home, B, 450_000);
+    let ta = write_session(&home, A, 550_000);
+    let tb = write_session(&home, B, 550_000);
     let (la, lb) = (launcher(&home, A, &ta), launcher(&home, B, &tb));
 
     // Off unless asked: a turn ending way over the size does nothing.
@@ -95,8 +95,8 @@ fn auto_compaction_is_off_by_default_and_switched_per_session() {
     assert!(stop(&la, A, &ta).is_none() && !requested(&la));
 
     // On with a size of its own.
-    assert!(say(A, "/recompact on 500k", &ta).contains("500k"));
-    assert!(stop(&la, A, &ta).is_none(), "450k is under 500k");
+    assert!(say(A, "/recompact on 600k", &ta).contains("600k"));
+    assert!(stop(&la, A, &ta).is_none(), "550k is under 600k");
 
     // Default on: sessions without a setting follow it, with the warning turn first; A keeps
     // its own setting.
@@ -112,7 +112,7 @@ fn auto_compaction_is_off_by_default_and_switched_per_session() {
         .contains("next turn"));
     assert!(!requested(&lb));
     assert!(stop(&lb, B, &tb).is_some() && requested(&lb));
-    assert!(say(A, "/recompact status", &ta).contains("at 500k"));
+    assert!(say(A, "/recompact status", &ta).contains("at 600k"));
     say(B, "/recompact default off", &tb);
     assert!(say(B, "/recompact status", &tb).contains("New sessions start OFF"));
 
