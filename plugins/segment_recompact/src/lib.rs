@@ -314,9 +314,42 @@ pub fn tail_budget(opts: &Map<String, Value>) -> usize {
         .unwrap_or(DEFAULT_TAIL_BUDGET)
 }
 
+/// Post-split plan refinements every command applies identically (extract, assemble and
+/// continue must derive the same units, or cached summaries land on the wrong unit):
+/// 1. A turn that `plan` pinned whole because it holds earlier summaries (or a ledger, or a native
+///    compaction summary) next to raw records keeps only the parts holding them pinned; its raw
+///    parts compact like any other. Otherwise a tail the tail budget cut in one generation would
+///    stay frozen in every generation after it.
+/// 2. The tail budget (see `DEFAULT_TAIL_BUDGET`), which never unpins such parts either.
+pub fn refine_plans(
+    records: &[Value],
+    segs: &[Segment],
+    plans: &mut [SegPlan],
+    seg_parts: &[Vec<Vec<usize>>],
+    tail_budget_tokens: usize,
+) {
+    let holds_pinned = |part: &[usize]| part.iter().any(|&i| is_pinned_content(&records[i]));
+    for s in 0..segs.len() {
+        if !plans[s].kept_verbatim || plans[s].tail {
+            continue;
+        }
+        let parts = &seg_parts[s];
+        let pinned: Vec<usize> = (0..parts.len()).filter(|&p| holds_pinned(&parts[p])).collect();
+        let raw_with_activity = (0..parts.len())
+            .any(|p| !pinned.contains(&p) && parts[p].iter().any(|&i| rec_uuid(&records[i]).is_some()));
+        if !pinned.is_empty() && raw_with_activity {
+            plans[s].kept_verbatim = false;
+            plans[s].needs_summary = true;
+            plans[s].pinned_parts = pinned;
+        }
+    }
+    apply_tail_budget(records, segs, plans, seg_parts, tail_budget_tokens);
+}
+
 /// Enforce the tail budget on the plan. Measured in visible chars at the fixed default ratio, not
 /// the session's calibration, so extract, assemble and continue always derive the same units.
-/// The newest part is always kept; `budget_tokens == 0` disables the budget.
+/// The newest part is always kept, and so is any part holding earlier summaries; a budget of 0
+/// disables it.
 pub fn apply_tail_budget(
     records: &[Value],
     segs: &[Segment],
@@ -339,7 +372,8 @@ pub fn apply_tail_budget(
         let mut pinned: Vec<usize> = Vec::new();
         for p in (0..parts.len()).rev() {
             let c: usize = parts[p].iter().map(|&i| visible_chars(&records[i])).sum();
-            if first || used + c <= budget_chars {
+            let holds_summaries = parts[p].iter().any(|&i| is_pinned_content(&records[i]));
+            if holds_summaries || first || used + c <= budget_chars {
                 used += c;
                 pinned.push(p);
                 first = false;
@@ -411,20 +445,90 @@ const DELEGATION_TOOLS: &[&str] = &["Task", "Agent", "Workflow", "Skill"];
 /// delegation seams (a completed Task/Agent/Workflow/Skill result, or a delivered message — each
 /// ends a self-contained unit of delegated work) and otherwise once the part exceeds its budget.
 /// A segment at or under the threshold stays a single part. threshold 0 disables splitting.
+/// Records this tool must never re-summarize or reshape: its own summaries, ledgers, and native
+/// compaction summaries.
+pub fn is_pinned_content(r: &Value) -> bool {
+    truthy(r, "recompactSynthetic") || truthy(r, "recompactLedger") || truthy(r, "isCompactSummary")
+}
+
+fn tool_ids(r: &Value) -> (Vec<&str>, Vec<&str>) {
+    let (mut uses, mut results) = (Vec::new(), Vec::new());
+    if let Some(blocks) = content(r).and_then(|c| c.as_array()) {
+        for b in blocks {
+            match b.get("type").and_then(|v| v.as_str()) {
+                Some("tool_use") => uses.extend(b.get("id").and_then(|v| v.as_str())),
+                Some("tool_result") => results.extend(b.get("tool_use_id").and_then(|v| v.as_str())),
+                _ => {}
+            }
+        }
+    }
+    (uses, results)
+}
+
 pub fn split_parts(records: &[Value], seg: &Segment, threshold: usize) -> Vec<Vec<usize>> {
+    let pinned = |i: usize| is_pinned_content(&records[i]);
+    let mixed = seg.activity.iter().any(|&i| pinned(i))
+        && seg
+            .activity
+            .iter()
+            .any(|&i| !pinned(i) && rec_uuid(&records[i]).is_some());
+    if !mixed {
+        return split_run(records, &seg.activity, threshold);
+    }
+    // A turn holding earlier summaries next to raw records (a final turn the tail budget cut in
+    // an earlier generation, a ledger at the end of a turn): cut at every boundary between the
+    // two, so the summaries stay exactly as they are while the raw remainder stays compactable.
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    let mut cur: Vec<usize> = Vec::new();
+    let mut cur_kind: Option<bool> = None;
+    let mut pending: HashSet<String> = HashSet::new();
+    for &i in &seg.activity {
+        let kind = rec_uuid(&records[i]).map(|_| pinned(i));
+        if let (Some(k), Some(ck)) = (kind, cur_kind) {
+            if k != ck && pending.is_empty() && !cur.is_empty() {
+                runs.push(std::mem::take(&mut cur));
+                cur_kind = None;
+            }
+        }
+        if cur_kind.is_none() {
+            cur_kind = kind;
+        }
+        let (uses, results) = tool_ids(&records[i]);
+        pending.extend(uses.into_iter().map(str::to_string));
+        for id in results {
+            pending.remove(id);
+        }
+        cur.push(i);
+    }
+    if !cur.is_empty() {
+        runs.push(cur);
+    }
+    let mut parts = Vec::new();
+    for run in runs {
+        if run.iter().any(|&i| pinned(i)) {
+            parts.push(run);
+        } else {
+            parts.extend(split_run(records, &run, threshold));
+        }
+    }
+    parts
+}
+
+/// Size-split one run of records at safe seams.
+fn split_run(records: &[Value], run: &[usize], threshold: usize) -> Vec<Vec<usize>> {
     // Sized by what the model sees, at the fixed default ratio (never the session's calibration,
     // so every command cuts identical units). Raw record size is dominated by envelope and by
     // unrendered attachments — current Claude Code writes ~200 KB prompt snapshots — which cut a
     // two-line exchange into three units, two of them with nothing to summarize.
     let rec_tokens = |i: usize| (visible_chars(&records[i]) as f64 / DEFAULT_CHARS_PER_TOKEN) as usize;
-    let seg_tokens: usize = seg.activity.iter().map(|&i| rec_tokens(i)).sum();
-    if threshold == 0 || seg_tokens <= threshold {
-        return vec![seg.activity.clone()];
+    let run_tokens: usize = run.iter().map(|&i| rec_tokens(i)).sum();
+    if threshold == 0 || run_tokens <= threshold {
+        return vec![run.to_vec()];
     }
     let part_budget = (threshold / 2).max(1);
     let min_part = (threshold / 10).max(1);
     let mut tool_names: HashMap<String, String> = HashMap::new();
-    for &i in &seg.activity {
+    for &i in run {
         if let Some(blocks) = content(&records[i]).and_then(|c| c.as_array()) {
             for b in blocks {
                 if b.get("type").and_then(|v| v.as_str()) == Some("tool_use") {
@@ -442,30 +546,18 @@ pub fn split_parts(records: &[Value], seg: &Segment, threshold: usize) -> Vec<Ve
     let mut cur: Vec<usize> = Vec::new();
     let mut cur_tokens = 0usize;
     let mut pending: HashSet<String> = HashSet::new();
-    for &i in &seg.activity {
+    for &i in run {
         let r = &records[i];
         let mut delegation_end = delivered_kind(r).is_some();
-        if let Some(blocks) = content(r).and_then(|c| c.as_array()) {
-            for b in blocks {
-                match b.get("type").and_then(|v| v.as_str()) {
-                    Some("tool_use") => {
-                        if let Some(id) = b.get("id").and_then(|v| v.as_str()) {
-                            pending.insert(id.to_string());
-                        }
-                    }
-                    Some("tool_result") => {
-                        if let Some(id) = b.get("tool_use_id").and_then(|v| v.as_str()) {
-                            pending.remove(id);
-                            if tool_names
-                                .get(id)
-                                .is_some_and(|n| DELEGATION_TOOLS.contains(&n.as_str()))
-                            {
-                                delegation_end = true;
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+        let (uses, results) = tool_ids(r);
+        pending.extend(uses.into_iter().map(str::to_string));
+        for id in results {
+            pending.remove(id);
+            if tool_names
+                .get(id)
+                .is_some_and(|n| DELEGATION_TOOLS.contains(&n.as_str()))
+            {
+                delegation_end = true;
             }
         }
         cur.push(i);
@@ -535,21 +627,33 @@ pub fn load_jsonl(path: &Path) -> Vec<Value> {
             std::process::exit(1);
         }
     }
+    match parse_jsonl(&buf) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Parse transcript text. A malformed LAST line is skipped rather than fatal: Claude Code appends
+/// to a live session line by line, so a file read mid-write can end in half a record — the normal
+/// state of a session compacting itself. A malformed line anywhere else is corruption.
+pub fn parse_jsonl(buf: &str) -> Result<Vec<Value>, String> {
+    let lines: Vec<&str> = buf.lines().map(str::trim).collect();
+    let last = lines.iter().rposition(|l| !l.is_empty());
     let mut out = Vec::new();
-    for (n, line) in buf.lines().enumerate() {
-        let line = line.trim();
+    for (n, line) in lines.iter().enumerate() {
         if line.is_empty() {
             continue;
         }
         match serde_json::from_str::<Value>(line) {
             Ok(v) => out.push(v),
-            Err(e) => {
-                eprintln!("error: line {} is not valid JSON: {e}", n + 1);
-                std::process::exit(1);
-            }
+            Err(_) if Some(n) == last => {}
+            Err(e) => return Err(format!("line {} is not valid JSON: {e}", n + 1)),
         }
     }
-    out
+    Ok(out)
 }
 
 /// Estimated chars a base64 image block contributes to context. The API bills an image by its
@@ -769,8 +873,20 @@ pub fn plan_budget(
         allow_error_summarize,
         epochs,
         &Calib::for_model(None),
+        400,
         summary_tokens,
     )
+}
+
+/// What a summary adds beyond its own text: the footer and the carried lines beneath it.
+pub const SUMMARY_OVERHEAD_TOKENS: usize = 150;
+
+/// The planner's price for a summary nobody has written yet: the mean of the summaries already
+/// in the cache (continue and assemble read the same cache, so they price identically).
+pub fn unknown_summary_tokens(cache: &Map<String, Value>, calib: &Calib) -> usize {
+    let lens: Vec<usize> = cache.values().filter_map(|v| v.as_str()).map(str::len).collect();
+    let mean = if lens.is_empty() { 600 } else { lens.iter().sum::<usize>() / lens.len() };
+    calib.tokens(mean) + SUMMARY_OVERHEAD_TOKENS
 }
 
 /// `plan_budget` with an explicit token calibration. `target` is conversation tokens: callers
@@ -787,6 +903,7 @@ pub fn plan_budget_calibrated(
     allow_error_summarize: bool,
     epochs: &HashMap<String, Option<String>>,
     calib: &Calib,
+    unknown_summary: usize,
     summary_tokens: impl Fn(&str) -> Option<usize>,
 ) -> BudgetPlan {
     let tokens_of = |indices: &[usize]| calib.tokens(chars_of(records, indices));
@@ -861,7 +978,7 @@ pub fn plan_budget_calibrated(
         }
         let verbatim = tokens_of(part);
         let mask = calib.tokens(mask_chars_of(records, part)).min(verbatim);
-        let summary = summary_tokens(&key).unwrap_or(400).min(mask);
+        let summary = summary_tokens(&key).unwrap_or(unknown_summary).min(mask);
         // Parts touching this tool's own prior summaries are epoch material: consolidatable only
         // when every record is synthetic AND its provenance resolves back to raw (the digest was
         // buildable). Anything else — mixed parts, unresolvable provenance, epochs disabled —
@@ -1034,7 +1151,7 @@ pub fn cmd_extract(args: &[String]) -> i32 {
         .iter()
         .map(|sg| split_parts(&records, sg, split_threshold))
         .collect();
-    apply_tail_budget(&records, &segs, &mut plans, &seg_parts, tail_budget(&opts));
+    refine_plans(&records, &segs, &mut plans, &seg_parts, tail_budget(&opts));
     let tokens_of = |idx: &mut dyn Iterator<Item = usize>| -> usize {
         calib.tokens(idx.map(|i| visible_chars(&records[i])).sum())
     };
@@ -1829,12 +1946,7 @@ pub fn augment_summary(
     skip: &HashSet<String>,
     root: Option<&str>,
 ) -> String {
-    let rel = |p: &str| -> String {
-        root.and_then(|r| p.strip_prefix(r))
-            .map(|x| x.trim_start_matches('/').to_string())
-            .filter(|x| !x.is_empty())
-            .unwrap_or_else(|| p.to_string())
-    };
+    let rel = |p: &str| -> String { relative_to(p, root) };
     let mut out = summary.trim_end().to_string();
     let idx = segment_index(records, part);
     if let Some(files) = idx["files"].as_object() {
@@ -2001,7 +2113,7 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         .iter()
         .map(|sg| split_parts(&records, sg, split_threshold))
         .collect();
-    apply_tail_budget(&records, &segs, &mut plans, &seg_parts, tail_budget(&opts));
+    refine_plans(&records, &segs, &mut plans, &seg_parts, tail_budget(&opts));
 
     let summaries: Value = if mode == "summarize" {
         let summaries_path = PathBuf::from(&pos[1]);
@@ -2088,7 +2200,8 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
             allow_error_summarize,
             &epoch_map,
             &calib,
-            |key| resolve(key).map(|(s, _)| calib.tokens(s.len()) + 60),
+            unknown_summary_tokens(&cache, &calib),
+            |key| resolve(key).map(|(s, _)| calib.tokens(s.len()) + SUMMARY_OVERHEAD_TOKENS),
         )
     });
     if plan_only {
@@ -2169,13 +2282,10 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     let cwd = field_str(&records, "cwd");
     let git_branch = field_str(&records, "gitBranch");
     let version = field_str(&records, "version");
-    let model = records
-        .iter()
-        .find(|r| rec_type(r) == "assistant")
-        .and_then(|r| r.pointer("/message/model"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("claude-opus-4-7")
-        .to_string();
+    // Records assemble mints carry the model the session last ran: a resume that reads the model
+    // from the transcript must not land on the one the session started with.
+    let profile = ResumeProfile::of(&records);
+    let model = profile.model.clone().unwrap_or_else(|| "claude-opus-4-7".to_string());
     let mentions = Mentions::build(&records);
     // Carried paths are shown relative to the directory the session's edits share.
     let path_root = session_path_root(&records);
@@ -2302,7 +2412,7 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         "recompactGeneration": generation,
         "recompactSource": {"sessionId": orig_session_id, "path": src_abs},
         "recompactSnapshot": snapshot.clone().unwrap_or(Value::Null),
-        "recompactCalibration": json!({"model": calib.model}),
+        "recompactCalibration": profile.stamp(),
         "message": {
             "id": format!("msg_recompact_{}", uuid_v4().replace('-', "")),
             "role": "assistant",
@@ -2453,6 +2563,9 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
             if obj.contains_key("session_id") {
                 obj.insert("session_id".into(), Value::String(new_session.clone()));
             }
+            // A twin is not a branch: copied `forkedFrom` fields would make its source's parent
+            // treat it as one (lineage is tracked in the sidecar).
+            obj.remove("forkedFrom");
             // Strip stale `usage` metadata. `/context` reads the most recent assistant message's
             // usage (cache_read + cache_creation + input) rather than re-tokenizing — so verbatim
             // records copied from the source would otherwise report the ORIGINAL session's token
@@ -2588,7 +2701,7 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         "  new sessionId: {}\n  wrote: {}\n  resume with: {}",
         new_session,
         out_path.display(),
-        resume_command(&new_session, &resume_flags(&records))
+        resume_command(&new_session, &profile.flags())
     );
     // Record lineage next to the sessions themselves, so resolution needs no global state.
     if !orig_session_id.is_empty() {
@@ -2928,7 +3041,7 @@ pub fn build_units_full(
         .iter()
         .map(|sg| split_parts(records, sg, split))
         .collect();
-    apply_tail_budget(records, &segs, &mut plans, &seg_parts, tail_budget_tokens);
+    refine_plans(records, &segs, &mut plans, &seg_parts, tail_budget_tokens);
     let mut key_hashes = HashMap::new();
     let mut seg_keys = Vec::new();
     for (s, seg) in segs.iter().enumerate() {
@@ -3237,9 +3350,12 @@ fn call_claude_stdin(bin: &str, model: &str, prompt: &str) -> Result<String, Str
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn extract_json_object(s: &str) -> Option<Map<String, Value>> {
+pub fn extract_json_object(s: &str) -> Option<Map<String, Value>> {
     let start = s.find('{')?;
     let end = s.rfind('}')?;
+    if end < start {
+        return None; // truncated output: a closing brace before the first opening one
+    }
     serde_json::from_str::<Value>(&s[start..=end])
         .ok()?
         .as_object()
@@ -3513,73 +3629,100 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
             return (latest, 0);
         }
 
-        // Full-ladder pre-pass: find the units the budget plan wants summarized, fill the cache.
+        // Full-ladder pre-pass: plan exactly as assemble will (same units, same pricing: real
+        // lengths for cached summaries, the mechanical text for empty units, the cache's mean for
+        // the rest), summarize what the plan wants, and re-plan with the real lengths until it
+        // wants nothing new. A single pass is not enough: when real summaries cost more than the
+        // estimate, assemble's plan shifts onto units that were never summarized and refuses.
         let mut sums_path: Option<PathBuf> = None;
         let mut mask_path: Option<PathBuf> = None;
         if let Some(cfg) = &o.summarize {
             let u = build_units_full(&active, keep, split, true, tail_budget_tokens);
             let epoch_map = epoch_digests(&active, &u.segs, &u.seg_parts, &u.seg_keys, keep);
-            let cache: Map<String, Value> = fs::read_to_string(&cache_path)
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| v.as_object().cloned())
-                .unwrap_or_default();
-            let b = plan_budget_calibrated(
-                &active,
-                &u.segs,
-                &u.plans,
-                &u.seg_parts,
-                &u.seg_keys,
-                o.threshold.saturating_sub(calib.overhead),
-                true,
-                !o.error_floor,
-                &epoch_map,
-                &calib,
-                |key| {
-                    u.key_hashes
-                        .get(key)
-                        .and_then(|h| cache.get(h))
-                        .and_then(|v| v.as_str())
-                        .map(|s| calib.tokens(s.len()) + 60)
-                },
-            );
-            let mut work: Vec<(String, f32, String)> = Vec::new();
-            for unit in &b.units {
-                if unit.treatment != Treatment::Summarize {
-                    continue;
-                }
-                let h = &u.key_hashes[&unit.key];
-                if cache.contains_key(h) {
-                    continue;
-                }
-                let p: usize = unit
-                    .key
-                    .split('.')
-                    .nth(1)
-                    .and_then(|x| x.parse().ok())
-                    .unwrap_or(0);
-                let seg = &u.segs[unit.seg];
-                let part = &u.seg_parts[unit.seg][p];
-                if unit_is_empty(&active, part) {
-                    continue; // assemble fills these mechanically; a model would return nothing
-                }
-                // Epoch units summarize from RAW (via provenance); everything else from
-                // the current records.
-                let digest = match epoch_map.get(&unit.key) {
-                    Some(Some(d)) => d.clone(),
-                    _ => unit_digest(&active, seg, part),
+            let empty: HashSet<String> = u
+                .seg_parts
+                .iter()
+                .zip(u.seg_keys.iter())
+                .flat_map(|(parts, keys)| {
+                    parts
+                        .iter()
+                        .zip(keys.iter())
+                        .filter(|(part, _)| unit_is_empty(&active, part))
+                        .map(|(_, k)| k.clone())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let empty_cost = calib.tokens(EMPTY_UNIT_SUMMARY.len()) + SUMMARY_OVERHEAD_TOKENS;
+            let mut failed: HashSet<String> = HashSet::new(); // content hashes
+            const ROUNDS: usize = 5;
+            for round in 1..=ROUNDS {
+                let cache: Map<String, Value> = fs::read_to_string(&cache_path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    .and_then(|v| v.as_object().cloned())
+                    .unwrap_or_default();
+                let price = |key: &str| -> Option<usize> {
+                    if let Some(text) = u.key_hashes.get(key).and_then(|h| cache.get(h)).and_then(|v| v.as_str()) {
+                        return Some(calib.tokens(text.len()) + SUMMARY_OVERHEAD_TOKENS);
+                    }
+                    empty.contains(key).then_some(empty_cost)
                 };
-                work.push((unit.key.clone(), unit.salience, digest));
-            }
-            if !work.is_empty() {
+                let b = plan_budget_calibrated(
+                    &active,
+                    &u.segs,
+                    &u.plans,
+                    &u.seg_parts,
+                    &u.seg_keys,
+                    o.threshold.saturating_sub(calib.overhead),
+                    true,
+                    !o.error_floor,
+                    &epoch_map,
+                    &calib,
+                    unknown_summary_tokens(&cache, &calib),
+                    price,
+                );
+                let mut work: Vec<(String, f32, String)> = Vec::new();
+                for unit in &b.units {
+                    if unit.treatment != Treatment::Summarize || price(&unit.key).is_some() {
+                        continue;
+                    }
+                    let h = &u.key_hashes[&unit.key];
+                    if failed.contains(h) {
+                        continue;
+                    }
+                    let p: usize = unit
+                        .key
+                        .split('.')
+                        .nth(1)
+                        .and_then(|x| x.parse().ok())
+                        .unwrap_or(0);
+                    let seg = &u.segs[unit.seg];
+                    let part = &u.seg_parts[unit.seg][p];
+                    // Epoch units summarize from RAW (via provenance); everything else from
+                    // the current records.
+                    let digest = match epoch_map.get(&unit.key) {
+                        Some(Some(d)) => d.clone(),
+                        _ => unit_digest(&active, seg, part),
+                    };
+                    work.push((unit.key.clone(), unit.salience, digest));
+                }
+                if work.is_empty() {
+                    break;
+                }
+                if round == ROUNDS {
+                    // Out of rounds: whatever is still unwritten is masked instead.
+                    failed.extend(work.iter().map(|(k, _, _)| u.key_hashes[k].clone()));
+                    break;
+                }
                 eprintln!(
-                    "continue: summarizing {} unit(s) with {}{}",
+                    "continue: summarizing {} unit(s) with {}{}{}",
                     work.len(),
                     cfg.model,
                     cfg.escalate_with
                         .as_deref()
                         .map(|m| format!(" (escalating salience ≥ {} to {m})", cfg.escalate_above))
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    if round > 1 { format!(" (re-plan {round})") } else { String::new() }
                 );
                 let mut cache = cache;
                 let mut persist = |sums: &HashMap<String, String>| {
@@ -3602,11 +3745,14 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
                     eprintln!(
                         "continue: no summary came back for {missing:?}; those units will be masked instead"
                     );
-                    let hashes: Vec<&String> = missing.iter().filter_map(|k| u.key_hashes.get(k)).collect();
-                    let mp = std::env::temp_dir().join(format!("recompact-mask-{}.json", uuid_v4()));
-                    let _ = fs::write(&mp, serde_json::to_string(&hashes).unwrap_or_default());
-                    mask_path = Some(mp);
+                    failed.extend(missing.iter().filter_map(|k| u.key_hashes.get(k).cloned()));
                 }
+            }
+            if !failed.is_empty() {
+                let hashes: Vec<&String> = failed.iter().collect();
+                let mp = std::env::temp_dir().join(format!("recompact-mask-{}.json", uuid_v4()));
+                let _ = fs::write(&mp, serde_json::to_string(&hashes).unwrap_or_default());
+                mask_path = Some(mp);
             }
             let sp = std::env::temp_dir().join(format!("recompact-empty-{}.json", uuid_v4()));
             let _ = fs::write(&sp, "{}");
@@ -4111,6 +4257,14 @@ fn is_ground(r: &Value) -> bool {
     !truthy(r, "recompactSynthetic")
         && !truthy(r, "recompactMasked")
         && r.get("recompactImagesElided").is_none()
+        && !truthy(r, "recompactThinkingStripped")
+}
+
+/// Does this copy still show all of its text? Thinking-stripped records and user turns with
+/// elided images do (they are not originals, but a search of "what compaction removed" must not
+/// return text the session can already read).
+fn text_visible(r: &Value) -> bool {
+    !truthy(r, "recompactSynthetic") && !truthy(r, "recompactMasked")
 }
 
 /// Every `~/.claude/projects/*` dir, primary first. Sessions move between project dirs (a session
@@ -4294,7 +4448,11 @@ fn expand_synthetic(
         // Deleted transcript: the summary itself is the best copy left.
         return vec![rec.clone()];
     };
-    cache.entry(src.clone()).or_insert_with(|| load_jsonl(&src));
+    // Soft: this runs inside the long-lived recall server, where one unreadable ancestor must
+    // degrade a lookup, not exit the process.
+    cache
+        .entry(src.clone())
+        .or_insert_with(|| load_jsonl_soft(&src).unwrap_or_default());
     let covered: Vec<String> = rec
         .pointer("/recompactProvenance/coveredUuids")
         .and_then(|v| v.as_array())
@@ -4696,17 +4854,7 @@ pub fn load_jsonl_soft(path: &Path) -> Result<Vec<Value>, String> {
     fs::File::open(path)
         .and_then(|mut f| f.read_to_string(&mut buf))
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let mut out = Vec::new();
-    for (n, line) in buf.lines().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v = serde_json::from_str::<Value>(line)
-            .map_err(|e| format!("{}: line {} is not valid JSON: {e}", path.display(), n + 1))?;
-        out.push(v);
-    }
-    Ok(out)
+    parse_jsonl(&buf).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// The project transcript dir for an explicit working directory. `project_dir_from_cwd` reads the
@@ -5014,6 +5162,43 @@ pub fn lineage_files(start: &Path) -> Vec<PathBuf> {
     order
 }
 
+/// Every record uuid in a session's history: the records it holds in any form, plus everything
+/// its summaries replaced, following provenance through every older generation.
+fn history_uuids(start: &[Value]) -> HashSet<String> {
+    let mut known: HashSet<String> = start.iter().filter_map(rec_uuid).map(str::to_string).collect();
+    let mut frontier: Vec<Value> = start
+        .iter()
+        .filter(|r| truthy(r, "recompactSynthetic"))
+        .cloned()
+        .collect();
+    let mut expanded: HashSet<String> = HashSet::new();
+    let mut files: HashMap<PathBuf, Vec<Value>> = HashMap::new();
+    while let Some(syn) = frontier.pop() {
+        let Some(id) = rec_uuid(&syn).map(str::to_string) else { continue };
+        if !expanded.insert(id) || expanded.len() > 50_000 {
+            continue;
+        }
+        let Some(prov) = syn.get("recompactProvenance") else { continue };
+        let covered: HashSet<String> = prov
+            .get("coveredUuids")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|u| u.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        if let Some(src) = resolve_source(prov) {
+            let recs = files
+                .entry(src.clone())
+                .or_insert_with(|| load_jsonl_soft(&src).unwrap_or_default());
+            frontier.extend(
+                recs.iter()
+                    .filter(|r| truthy(r, "recompactSynthetic") && rec_uuid(r).is_some_and(|u| covered.contains(u)))
+                    .cloned(),
+            );
+        }
+        known.extend(covered);
+    }
+    known
+}
+
 /// Query terms: whitespace-separated words, or "quoted phrases", lowercased.
 fn query_terms(q: &str) -> Vec<String> {
     let mut terms = Vec::new();
@@ -5115,12 +5300,14 @@ pub fn recall_query(ctx: &RecallCtx, query: &str, session: Option<&str>, limit: 
     };
     let files = lineage_files(&start);
     let start_records = load_jsonl_soft(&start)?;
+    // The text the session already shows is not a search result.
     let visible: HashSet<String> = start_records
         .iter()
-        .filter(|r| is_ground(r))
+        .filter(|r| text_visible(r))
         .filter_map(rec_uuid)
         .map(str::to_string)
         .collect();
+    let known = history_uuids(&start_records);
     let mut seen: HashSet<String> = HashSet::new();
     // (terms matched, occurrences, file order, record) — ranked below.
     let mut hits: Vec<(usize, usize, usize, String, Value)> = Vec::new();
@@ -5130,6 +5317,11 @@ pub fn recall_query(ctx: &RecallCtx, query: &str, session: Option<&str>, limit: 
         let sid = stem_of(f);
         for r in records {
             let Some(u) = rec_uuid(&r).map(str::to_string) else { continue };
+            // Only this session's own history: an ancestor file also holds turns written after
+            // the twin was cut, and a branch's parent holds turns after the branch point.
+            if !known.contains(&u) {
+                continue;
+            }
             if !is_ground(&r) || truthy(&r, "recompactPreamble") || truthy(&r, "recompactLedger") {
                 continue;
             }

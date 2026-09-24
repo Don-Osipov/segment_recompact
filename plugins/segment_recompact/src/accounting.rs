@@ -194,7 +194,7 @@ pub fn calibrate(records: &[Value]) -> Calib {
     let model = records
         .iter()
         .rev()
-        .filter(|r| rec_type(r) == "assistant" && !truthy(r, "recompactSynthetic"))
+        .filter(|r| crate::is_real_assistant(r))
         .find_map(|r| r.pointer("/message/model").and_then(|v| v.as_str()))
         .filter(|m| m.starts_with("claude-"));
     let mut c = Calib::for_model(model);

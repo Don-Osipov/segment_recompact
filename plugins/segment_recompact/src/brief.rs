@@ -247,12 +247,7 @@ pub fn state_brief(records: &[Value]) -> Vec<String> {
             .iter()
             .take(12)
             .map(|(p, f)| {
-                let rel = root
-                    .as_deref()
-                    .and_then(|r| p.strip_prefix(r))
-                    .map(|x| x.trim_start_matches('/'))
-                    .filter(|x| !x.is_empty())
-                    .unwrap_or(p);
+                let rel = relative_to(p, root.as_deref());
                 let role = f.roles.join("+");
                 if f.count > 1 {
                     format!("`{rel}` ({role} ×{})", f.count)
@@ -438,64 +433,94 @@ pub fn describe_snapshot(s: &Value) -> String {
     )
 }
 
-/// Model and effort to resume with. A resume starts on the saved default model, and effort set
-/// with "(this session only)" does not survive it: in the sample, 9 of 56 resumed twins opened
-/// with the user re-running `/model` or `/effort` by hand.
-pub fn resume_flags(records: &[Value]) -> Vec<String> {
-    let mut flags = Vec::new();
-    let model = records
-        .iter()
-        .rev()
-        .filter(|r| rec_type(r) == "assistant" && !crate::truthy(r, "recompactSynthetic"))
-        .find_map(|r| r.pointer("/message/model").and_then(|v| v.as_str()))
-        .filter(|m| m.starts_with("claude-"));
-    let mut long_context = false;
-    let mut effort: Option<String> = None;
-    for r in records {
-        if let Some(u) = r.pointer("/message/usage") {
-            let get = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
-            if get("input_tokens")
-                + get("cache_creation_input_tokens")
-                + get("cache_read_input_tokens")
-                > 200_000
-            {
-                long_context = true;
-            }
-        }
-        if rec_type(r) == "user" {
-            let t = user_text(r);
-            if let Some(i) = t.find("Set effort level to ") {
-                let e: String = t[i + 20..]
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric())
-                    .collect();
-                if !e.is_empty() {
-                    effort = Some(e);
+/// Is this an assistant record a model actually produced (not one assemble minted)?
+pub fn is_real_assistant(r: &Value) -> bool {
+    rec_type(r) == "assistant"
+        && !crate::truthy(r, "recompactSynthetic")
+        && !crate::truthy(r, "recompactPreamble")
+        && !crate::truthy(r, "recompactLedger")
+}
+
+/// What a resume should restore: the model the session last ran, whether it ran with the 1M
+/// window, and effort set "for this session only". A resume starts on the saved default model and
+/// drops session-only effort: in the sample, 9 of 56 resumed twins opened with the user re-running
+/// `/model` or `/effort` by hand. A twin loses the evidence (usage is stripped, the `/effort`
+/// output may sit in a summarized unit), so assemble stamps the source's profile on the preamble
+/// and this falls back to it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResumeProfile {
+    pub model: Option<String>,
+    pub long_context: bool,
+    pub effort: Option<String>,
+}
+
+impl ResumeProfile {
+    pub fn of(records: &[Value]) -> ResumeProfile {
+        let stamp = records.iter().rev().find_map(|r| r.get("recompactCalibration"));
+        let model = records
+            .iter()
+            .rev()
+            .filter(|r| is_real_assistant(r))
+            .find_map(|r| r.pointer("/message/model").and_then(|v| v.as_str()))
+            .filter(|m| m.starts_with("claude-"))
+            .map(str::to_string)
+            .or_else(|| stamp.and_then(|s| s.get("model")).and_then(|v| v.as_str()).map(str::to_string));
+        let mut long_context = stamp
+            .and_then(|s| s.get("longContext"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let mut effort = stamp
+            .and_then(|s| s.get("effort"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        for r in records {
+            if let Some(u) = r.pointer("/message/usage") {
+                let get = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                if get("input_tokens") + get("cache_creation_input_tokens") + get("cache_read_input_tokens") > 200_000 {
+                    long_context = true;
                 }
             }
-            if t.contains("Set model to") && t.contains("1M context") {
-                long_context = true;
+            if rec_type(r) == "user" {
+                let t = user_text(r);
+                if let Some(i) = t.find("Set effort level to ") {
+                    let e: String = t[i + 20..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+                    if !e.is_empty() {
+                        effort = Some(e);
+                    }
+                }
+                if t.contains("Set model to") && t.contains("1M context") {
+                    long_context = true;
+                }
+            }
+            if let Some(m) = r.pointer("/attachment/model").and_then(|v| v.as_str()) {
+                if m.ends_with("[1m]") {
+                    long_context = true;
+                }
             }
         }
-        if let Some(m) = r.pointer("/attachment/model").and_then(|v| v.as_str()) {
-            if m.ends_with("[1m]") {
-                long_context = true;
-            }
+        ResumeProfile { model, long_context, effort }
+    }
+
+    pub fn flags(&self) -> Vec<String> {
+        let mut flags = Vec::new();
+        if let Some(m) = &self.model {
+            flags.push("--model".into());
+            flags.push(if self.long_context { format!("{m}[1m]") } else { m.clone() });
         }
+        if let Some(e) = &self.effort {
+            flags.push("--effort".into());
+            flags.push(e.clone());
+        }
+        flags
     }
-    if let Some(m) = model {
-        flags.push("--model".into());
-        flags.push(if long_context {
-            format!("{m}[1m]")
-        } else {
-            m.to_string()
-        });
+
+    pub fn stamp(&self) -> Value {
+        json!({"model": self.model, "longContext": self.long_context, "effort": self.effort})
     }
-    if let Some(e) = effort {
-        flags.push("--effort".into());
-        flags.push(e);
-    }
-    flags
+}
+
+pub fn resume_flags(records: &[Value]) -> Vec<String> {
+    ResumeProfile::of(records).flags()
 }
 
 /// Shell-safe rendering of a resume command.
@@ -728,6 +753,15 @@ pub fn session_start_context(input: &Value) -> Option<String> {
         }
     }
     Some(lines.join("\n"))
+}
+
+/// `path` relative to `root` when it lies inside it (at a directory boundary: `/repo/src-gen/x`
+/// is not inside `/repo/src`), else unchanged.
+pub fn relative_to(path: &str, root: Option<&str>) -> String {
+    root.and_then(|r| path.strip_prefix(&format!("{}/", r.trim_end_matches('/'))))
+        .filter(|x| !x.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| path.to_string())
 }
 
 pub fn short_id(id: &str) -> &str {
