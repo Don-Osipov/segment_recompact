@@ -489,3 +489,55 @@ exit 7
         "{spawns}"
     );
 }
+
+// ------------------------------------------------------------------------------ setup
+
+#[test]
+fn install_adds_one_block_replaces_it_on_rerun_and_uninstall_removes_it() {
+    let dir = tmp_dir();
+    let rc = dir.join(".zshrc");
+    fs::write(
+        &rc,
+        "export PATH=\"$HOME/bin:$PATH\"\nalias comax='claude --model opus'\n",
+    )
+    .unwrap();
+    let rc_arg = rc.to_str().unwrap().to_string();
+    assert_eq!(cmd_install(&["--rc".into(), rc_arg.clone()]), 0);
+    let once = fs::read_to_string(&rc).unwrap();
+    assert!(once.contains("alias comax="), "existing lines kept");
+    assert!(once.contains("claude() {") && once.contains(" shell \"$@\""));
+    assert!(
+        once.contains("command claude \"$@\""),
+        "falls back to plain claude"
+    );
+    assert_eq!(cmd_install(&["--rc".into(), rc_arg.clone()]), 0);
+    assert_eq!(fs::read_to_string(&rc).unwrap(), once, "idempotent");
+    assert_eq!(cmd_uninstall(&["--rc".into(), rc_arg.clone()]), 0);
+    let after = fs::read_to_string(&rc).unwrap();
+    assert!(
+        !after.contains("recompact") && after.contains("alias comax="),
+        "{after}"
+    );
+
+    // A file that already defines claude is left alone.
+    fs::write(&rc, "claude() { echo mine; }\n").unwrap();
+    assert_eq!(cmd_install(&["--rc".into(), rc_arg]), 1);
+    assert_eq!(
+        fs::read_to_string(&rc).unwrap(),
+        "claude() { echo mine; }\n"
+    );
+}
+
+#[test]
+fn the_binary_and_the_plugin_manifest_carry_the_same_version() {
+    // The launcher script downloads the release named after plugin.json's version.
+    let manifest: Value = serde_json::from_str(
+        &fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/.claude-plugin/plugin.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+}

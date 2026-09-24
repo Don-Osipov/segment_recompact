@@ -12,19 +12,14 @@ with an orientation note. User turns stay verbatim. Older agent work becomes a s
 you or by a headless model) or a masked copy whose bulky tool output is replaced by an addressable
 marker. Everything removed can be read back with `recall`.
 
-Helper binary: `"${CLAUDE_PLUGIN_ROOT}/bin/recompact"` (also on PATH as `recompact`). Build it if
-missing (needs a Rust toolchain); remove the old binary first, because copying over a signed macOS
-binary gets it killed on launch:
-
-```bash
-[ -x "${CLAUDE_PLUGIN_ROOT}/bin/recompact" ] || ( cd "${CLAUDE_PLUGIN_ROOT}" && cargo build --release \
-  && mkdir -p bin && rm -f bin/recompact && cp target/release/recompact bin/recompact )
-```
+Helper: `recompact` (the plugin's `bin/` is on PATH). On first use it fetches the binary for
+the plugin's version; `recompact version` confirms it runs.
 
 ## What do you need?
 
 | Situation | Do this |
 |---|---|
+| The user typed `/recompact setup` (or asks to make compaction automatic) | Run `recompact install` and relay what it prints: they open a new terminal once, and from then on `/recompact` and large contexts compact in place. `recompact uninstall` undoes it. |
 | The user typed a bare `/recompact` (or asks to compact **this** session) | Run `recompact handoff` in Bash and relay what it prints. **Compact this session** below. |
 | You are inside a compacted session (preamble "This transcript was compacted by segment_recompact", footers `[recompact summary … · recall <id>]`, markers `[recompact: elided …]`) | Read **Waking up in a twin** below. Do not compact again. |
 | You need an exact detail a summary or marker dropped | `recall` tool: `query="words"` to search, `selector="<id>"` to read one item |
@@ -224,12 +219,9 @@ it and resumes the session as it was. Defaults can also come from the environmen
 `RECOMPACT_AT`, `RECOMPACT_TARGET`, `RECOMPACT_WINDOW`, `RECOMPACT_SUMMARIZE_WITH` (`mask` for
 none), `RECOMPACT_AUTO=0`.
 
-To route every `claude` through it (aliases like `claude --model opus` included), add to
-`~/.zshrc`:
-
-```zsh
-claude() { if [ -x "$HOME/.local/bin/recompact" ]; then "$HOME/.local/bin/recompact" shell "$@"; else command claude "$@"; fi; }
-```
+`recompact install` routes every interactive `claude` through it (aliases like `claude --model
+opus` included) by adding a marked block to `~/.zshrc` or `~/.bashrc`; the block falls back to
+plain claude if the launcher is ever missing.
 
 Outside the launcher, a Stop hook says once per 100k of growth when a session is past the size
 where the launcher would compact it.

@@ -1,22 +1,12 @@
 {
   "hooks": {
-    "Setup": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "cd \"${CLAUDE_PLUGIN_ROOT}\" && cargo build --release && mkdir -p bin && rm -f bin/recompact && cp target/release/recompact bin/recompact && chmod +x bin/recompact"
-          }
-        ]
-      }
-    ],
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "[ -x \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook session-start || true",
-            "timeout": 15
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook session-start 2>/dev/null || true",
+            "timeout": 30
           }
         ]
       }
@@ -26,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$RECOMPACT_SHELL\" ] && [ -x \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook user-prompt-submit || true",
+            "command": "[ -n \"$RECOMPACT_SHELL\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook user-prompt-submit 2>/dev/null || true",
             "timeout": 10
           }
         ]
@@ -37,8 +27,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -x \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook stop || true",
-            "timeout": 10
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook stop 2>/dev/null || true",
+            "timeout": 30
           }
         ]
       }
@@ -49,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$RECOMPACT_SHELL\" ] && [ -x \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook post-tool-use || true",
+            "command": "[ -n \"$RECOMPACT_SHELL\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook post-tool-use 2>/dev/null || true",
             "timeout": 5
           }
         ]

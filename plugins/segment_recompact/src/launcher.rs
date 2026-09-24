@@ -551,8 +551,8 @@ fn suggest(session: &str, transcript: &Path) -> Option<Value> {
     let _ = fs::create_dir_all(&dir);
     write_json(&mark, &json!({"tokens": live}));
     Some(json!({"systemMessage": format!(
-        "recompact: this session is at {} tokens. Type /recompact to compact it, or start claude with \
-`recompact shell` so it happens by itself.", fmt_k(live))}))
+        "recompact: this session is at {} tokens. Type /recompact to compact it; run `/recompact setup` \
+once to have it happen by itself.", fmt_k(live))}))
 }
 
 fn prewarm_running(marker: &Path) -> Option<u32> {
@@ -788,7 +788,7 @@ pub fn cmd_handoff(args: &[String]) -> i32 {
     println!("{cmd}");
     eprintln!(
         "handoff: exit this session (/exit) and run the command above{}. \
-Run claude as `recompact shell` next time and this happens in place.",
+Run `recompact install` once and this happens in place from then on.",
         if copied {
             " (it is on the clipboard)"
         } else {
@@ -1581,4 +1581,172 @@ fn prune_stale_states(root: &Path) {
             let _ = fs::remove_dir_all(e.path());
         }
     }
+}
+
+// ------------------------------------------------------------------------------------ setup
+
+const BLOCK_START: &str = "# >>> recompact >>>";
+const BLOCK_END: &str = "# <<< recompact <<<";
+
+fn recompact_home() -> PathBuf {
+    std::env::var("RECOMPACT_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| home().join(".claude").join("recompact"))
+}
+
+/// The shell startup file `install` writes to, from `$SHELL`.
+fn rc_file() -> Result<PathBuf, String> {
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let name = Path::new(&shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    match name {
+        "zsh" => Ok(home().join(".zshrc")),
+        "bash" => {
+            // macOS terminals start login shells, which read .bash_profile.
+            let profile = home().join(".bash_profile");
+            if cfg!(target_os = "macos") && profile.exists() {
+                Ok(profile)
+            } else {
+                Ok(home().join(".bashrc"))
+            }
+        }
+        other => Err(format!(
+            "shell `{other}` is not supported by `recompact install`; define `claude` to run \
+`{} shell \"$@\"` yourself",
+            recompact_home().join("bin").join("recompact").display()
+        )),
+    }
+}
+
+/// The shell block `install` writes: interactive `claude` runs through the launcher, and falls
+/// back to plain claude whenever the launcher is missing.
+pub fn shell_block(launcher: &Path) -> String {
+    let l = launcher.display();
+    format!(
+        "{BLOCK_START}\n\
+# Interactive claude runs through recompact: /recompact and large contexts compact in place.\n\
+# Remove this block (or run `recompact uninstall`) to undo.\n\
+claude() {{\n\
+  if [ -x \"{l}\" ]; then\n\
+    \"{l}\" shell \"$@\"\n\
+  else\n\
+    command claude \"$@\"\n\
+  fi\n\
+}}\n\
+{BLOCK_END}\n"
+    )
+}
+
+/// Remove the managed block; `None` when there is none.
+pub fn strip_block(text: &str) -> Option<String> {
+    let start = text.find(BLOCK_START)?;
+    let end = text[start..].find(BLOCK_END)? + start + BLOCK_END.len();
+    let end = if text[end..].starts_with('\n') {
+        end + 1
+    } else {
+        end
+    };
+    let mut out = text[..start].trim_end_matches('\n').to_string();
+    let rest = text[end..].trim_start_matches('\n');
+    if !rest.is_empty() {
+        out.push_str("\n\n");
+        out.push_str(rest);
+    }
+    out.push('\n');
+    Some(out)
+}
+
+/// Add or replace the managed block. Refuses when the file defines `claude` some other way.
+pub fn with_block(text: &str, block: &str) -> Result<String, String> {
+    let base = strip_block(text).unwrap_or_else(|| text.to_string());
+    let defines_claude = base.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("claude()")
+            || t.starts_with("claude ()")
+            || t.starts_with("function claude")
+            || t.starts_with("alias claude=")
+    });
+    if defines_claude {
+        return Err("it already defines `claude`; remove that definition first".into());
+    }
+    let mut out = base.trim_end_matches('\n').to_string();
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(block);
+    Ok(out)
+}
+
+/// `recompact install [--rc <file>]`: make interactive `claude` run through the launcher.
+pub fn cmd_install(args: &[String]) -> i32 {
+    let (_, opts) = parse_opts(args);
+    let rc = match opts.get("rc").and_then(|v| v.as_str()) {
+        Some(p) => PathBuf::from(p),
+        None => match rc_file() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("install: {e}");
+                return 1;
+            }
+        },
+    };
+    let launcher = recompact_home().join("bin").join("recompact");
+    let text = fs::read_to_string(&rc).unwrap_or_default();
+    let updated = match with_block(&text, &shell_block(&launcher)) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("install: not changing {}: {e}", rc.display());
+            return 1;
+        }
+    };
+    if updated == text {
+        println!("recompact is already set up in {}.", rc.display());
+        return 0;
+    }
+    if !text.is_empty() {
+        let _ = fs::write(rc.with_extension("recompact-backup"), &text);
+    }
+    if let Err(e) = fs::write(&rc, &updated) {
+        eprintln!("install: cannot write {}: {e}", rc.display());
+        return 1;
+    }
+    println!(
+        "Set up in {}. Open a new terminal (or `source {}`), then start claude as usual: \
+/recompact and large contexts now compact in place. Undo with `recompact uninstall`.",
+        rc.display(),
+        rc.display()
+    );
+    0
+}
+
+/// `recompact uninstall [--rc <file>]`: remove what `install` added.
+pub fn cmd_uninstall(args: &[String]) -> i32 {
+    let (_, opts) = parse_opts(args);
+    let rc = match opts.get("rc").and_then(|v| v.as_str()) {
+        Some(p) => PathBuf::from(p),
+        None => match rc_file() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("uninstall: {e}");
+                return 1;
+            }
+        },
+    };
+    let text = fs::read_to_string(&rc).unwrap_or_default();
+    match strip_block(&text) {
+        Some(t) => {
+            if let Err(e) = fs::write(&rc, t) {
+                eprintln!("uninstall: cannot write {}: {e}", rc.display());
+                return 1;
+            }
+            println!(
+                "Removed from {}. New terminals run plain claude.",
+                rc.display()
+            );
+        }
+        None => println!("Nothing to remove in {}.", rc.display()),
+    }
+    0
 }
