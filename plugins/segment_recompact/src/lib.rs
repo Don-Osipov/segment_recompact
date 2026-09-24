@@ -2643,7 +2643,7 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     // Persist explicitly-provided summaries into the cache, keyed by content hash, so the next
     // recompaction of this (continued) session reuses them for unchanged segments.
     if let Some(cp) = &cache_path {
-        let mut cache = cache.clone();
+        let mut cache = Map::new();
         for keys in &seg_keys {
             for key in keys {
                 if let (Some(text), Some(h)) = (
@@ -2659,8 +2659,7 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
                 let _ = fs::create_dir_all(parent);
             }
         }
-        if let Err(e) = fs::write(cp, serde_json::to_string_pretty(&Value::Object(cache)).unwrap())
-        {
+        if let Err(e) = write_cache_merged(cp, &cache) {
             eprintln!("warning: could not write summary cache {}: {e}", cp.display());
         }
     }
@@ -3486,6 +3485,9 @@ pub fn headless_summarize_partial(
             SUMMARIZE_WAVES
         );
         for wave in jobs.chunks(SUMMARIZE_WAVES) {
+            if cancelled() {
+                break;
+            }
             let outs: Vec<(Vec<String>, Result<String, String>)> = std::thread::scope(|sc| {
                 let handles: Vec<_> = wave
                     .iter()
@@ -3601,6 +3603,31 @@ pub fn summarize_cfg_from_opts(opts: &Map<String, Value>) -> Option<SummarizeCfg
         })
 }
 
+/// Set by `recompact shell` when the user presses Ctrl-C during a compaction: summarizing stops at
+/// the next batch boundary and nothing is assembled.
+pub static CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn cancelled() -> bool {
+    CANCEL.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Add entries to the summary cache without losing anyone else's. Several writers share one cache
+/// per project (continue, a background prewarm, other sessions), so merge with what is on disk
+/// now and replace the file in one rename; a reader never sees a half-written file.
+pub fn write_cache_merged(path: &Path, entries: &Map<String, Value>) -> std::io::Result<()> {
+    let mut merged: Map<String, Value> = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    for (k, v) in entries {
+        merged.insert(k.clone(), v.clone());
+    }
+    let tmp = path.with_extension(format!("json.tmp{}", std::process::id()));
+    fs::write(&tmp, serde_json::to_string_pretty(&Value::Object(merged)).unwrap())?;
+    fs::rename(&tmp, path)
+}
+
 /// Full-ladder pre-pass: plan exactly as assemble will (same units, same pricing: real lengths
 /// for cached summaries, the mechanical text for empty units, the cache's mean for the rest),
 /// summarize what the plan wants into the content-hash cache, and re-plan with the real lengths
@@ -3645,6 +3672,9 @@ pub fn summarize_for_plan(
     let mut failed: HashSet<String> = HashSet::new(); // content hashes
     const ROUNDS: usize = 5;
     for round in 1..=ROUNDS {
+        if cancelled() {
+            break;
+        }
         let cache: Map<String, Value> = fs::read_to_string(cache_path)
             .ok()
             .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -3713,19 +3743,14 @@ pub fn summarize_for_plan(
                 .unwrap_or_default(),
             if round > 1 { format!(" (re-plan {round})") } else { String::new() }
         );
-        let mut cache = cache;
         let mut persist = |sums: &HashMap<String, String>| {
-            for (k, text) in sums {
-                if let Some(h) = u.key_hashes.get(k) {
-                    cache.insert(h.clone(), Value::String(text.clone()));
-                }
-            }
-            if fs::write(
-                cache_path,
-                serde_json::to_string_pretty(&Value::Object(cache.clone())).unwrap(),
-            )
-            .is_err()
-            {
+            let fresh: Map<String, Value> = sums
+                .iter()
+                .filter_map(|(k, text)| {
+                    u.key_hashes.get(k).map(|h| (h.clone(), Value::String(text.clone())))
+                })
+                .collect();
+            if write_cache_merged(cache_path, &fresh).is_err() {
                 eprintln!("continue: warning: cannot write summary cache {}", cache_path.display());
             }
         };
@@ -3803,6 +3828,13 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
             sums_path = Some(sp);
         }
 
+        if cancelled() {
+            for p in sums_path.iter().chain(mask_path.iter()) {
+                let _ = fs::remove_file(p);
+            }
+            eprintln!("continue: cancelled");
+            return (latest, 130);
+        }
         let mut a_args: Vec<String> = vec![latest_file.to_string_lossy().into_owned()];
         if let Some(sp) = &sums_path {
             a_args.push(sp.to_string_lossy().into_owned());

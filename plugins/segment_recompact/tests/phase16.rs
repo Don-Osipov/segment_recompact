@@ -123,7 +123,14 @@ fn relaunch_keeps_flags_and_drops_the_prompt_and_session_selection() {
         "b",
         "-r",
         "abc",
+        "--append-system-prompt-file",
+        "rules.md",
         "--dangerously-skip-permissions",
+        "--permission-mode",
+        "plan",
+        "-w",
+        "feat",
+        "--tmux",
         "--settings=x.json",
         "fix the bug",
     ]));
@@ -133,9 +140,11 @@ fn relaunch_keeps_flags_and_drops_the_prompt_and_session_selection() {
             "--add-dir",
             "a",
             "b",
-            "--dangerously-skip-permissions",
-            "--settings",
-            "x.json"
+            "--append-system-prompt-file",
+            "rules.md",
+            // Bypass stays available; the session restores the mode it was actually in.
+            "--allow-dangerously-skip-permissions",
+            "--settings=x.json",
         ])
     );
     assert!(!is_passthrough(&args));
@@ -144,6 +153,8 @@ fn relaunch_keeps_flags_and_drops_the_prompt_and_session_selection() {
         &["mcp", "list"],
         &["--version"],
         &["plugin", "update", "x"],
+        // A flag the launcher cannot classify: run claude directly rather than risk mangling it.
+        &["--brand-new-flag", "value"],
     ] {
         assert!(
             is_passthrough(&parse_claude_args(&s(p))),
@@ -156,6 +167,39 @@ fn relaunch_keeps_flags_and_drops_the_prompt_and_session_selection() {
         "opus",
         "doctor this"
     ]))));
+}
+
+#[test]
+fn defaults_follow_the_context_window() {
+    // Transcripts log `claude-opus-5-5` for 1M sessions; only Haiku is assumed to be 200k.
+    assert_eq!(default_at_for("claude-opus-5-5", 10), 400_000);
+    assert_eq!(default_at_for("claude-opus-5-5[1m]", 10), 400_000);
+    assert_eq!(default_at_for("claude-haiku-4-5-20251001", 10), 140_000);
+    assert_eq!(
+        default_at_for("claude-haiku-4-5", 250_000),
+        400_000,
+        "past 200k it must be 1M"
+    );
+    assert_eq!(default_target(400_000), 120_000);
+    assert_eq!(
+        default_target(140_000),
+        70_000,
+        "far enough below the trigger"
+    );
+}
+
+#[test]
+fn cache_writes_merge_with_what_another_writer_saved() {
+    let dir = tmp_dir();
+    let p = dir.join("cache.json");
+    fs::write(&p, json!({"a": "first writer"}).to_string()).unwrap();
+    let mine: serde_json::Map<String, Value> = [("b".to_string(), json!("second writer"))]
+        .into_iter()
+        .collect();
+    write_cache_merged(&p, &mine).unwrap();
+    let got = read(p).unwrap();
+    assert_eq!(got["a"], "first writer");
+    assert_eq!(got["b"], "second writer");
 }
 
 #[test]
@@ -181,13 +225,6 @@ fn live_size_is_the_last_main_thread_usage_in_the_tail() {
         .write_all(b"{\"type\":\"assist")
         .unwrap();
     assert_eq!(live_tokens(&p), Some(61_000));
-    assert_eq!(default_at("claude-opus-5-5[1m]", 10), 400_000);
-    assert_eq!(default_at("claude-opus-5-5", 10), 140_000);
-    assert_eq!(
-        default_at("", 250_000),
-        400_000,
-        "past 200k the window must be 1M"
-    );
 }
 
 // ------------------------------------------------------------------------------ hooks
@@ -297,6 +334,10 @@ fn a_long_turn_is_asked_to_checkpoint_once_then_handed_off_with_a_continue() {
         &t,
     );
     let input = json!({"session_id": SESSION, "transcript_path": t, "tool_name": "Bash"});
+    // A subagent's tool call carries the parent's session id; it is not the one to stop.
+    let mut sub = input.clone();
+    sub["agent_id"] = json!("a1b2c3");
+    assert!(on_post_tool_use_in(Some(reload(&shell)), &sub).is_none());
     let out = on_post_tool_use_in(Some(reload(&shell)), &input).expect("nudged");
     assert!(out["hookSpecificOutput"]["additionalContext"]
         .as_str()
@@ -353,7 +394,8 @@ exit 0
         "--model",
         "opus",
         "--dangerously-skip-permissions",
-        "hello there",
+        "--",
+        "-hello there",
     ]));
     assert_eq!(rc, 0);
     let twin = lineage_latest(&dir, SESSION);
@@ -361,13 +403,16 @@ exit 0
     let spawns = fs::read_to_string(dir.join("spawns.log")).unwrap();
     let lines: Vec<&str> = spawns.lines().collect();
     assert_eq!(lines.len(), 2, "{spawns}");
-    assert!(lines[0].contains("hello there") && lines[0].contains("--model opus"));
+    assert!(lines[0].contains("-- -hello there") && lines[0].contains("--model opus"));
     assert!(lines[1].contains(&format!("--resume {twin}")), "{spawns}");
     assert!(
-        lines[1].contains("--dangerously-skip-permissions"),
+        lines[1].contains("--allow-dangerously-skip-permissions"),
         "{spawns}"
     );
-    assert!(lines[1].contains("--model"), "model carried: {spawns}");
+    assert!(
+        lines[1].contains("--model opus"),
+        "the launch model is kept: {spawns}"
+    );
     assert!(
         !lines[1].contains("hello there"),
         "the first prompt is not replayed: {spawns}"
@@ -396,6 +441,7 @@ fn a_session_resumed_over_the_threshold_is_compacted_before_it_opens() {
         &stub,
         "-r",
         SESSION,
+        "do the next thing",
     ]));
     assert_eq!(rc, 0);
     let twin = lineage_latest(&dir, SESSION);
@@ -403,6 +449,10 @@ fn a_session_resumed_over_the_threshold_is_compacted_before_it_opens() {
     let spawns = fs::read_to_string(dir.join("spawns.log")).unwrap();
     assert!(spawns.contains(&format!("--resume {twin}")), "{spawns}");
     assert_eq!(spawns.lines().count(), 1);
+    assert!(
+        spawns.contains("do the next thing"),
+        "the prompt survives: {spawns}"
+    );
 }
 
 #[test]
@@ -431,8 +481,11 @@ exit 7
     assert_eq!(rc, 7, "claude's own exit code comes back");
     let spawns = fs::read_to_string(dir.join("spawns.log")).unwrap();
     assert_eq!(spawns.lines().count(), 2, "{spawns}");
+    // No session was ever reported, so there is nothing to resume by id, and `--continue`
+    // could open another terminal's session: claude starts fresh with the same flags.
+    let second = spawns.lines().nth(1).unwrap();
     assert!(
-        spawns.lines().nth(1).unwrap().contains("--continue"),
+        !second.contains("--continue") && !second.contains("--resume"),
         "{spawns}"
     );
 }

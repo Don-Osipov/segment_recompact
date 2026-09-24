@@ -46,7 +46,7 @@ recompact handoff [--continue-after]
   ends, the launcher stops claude, compacts the session, and resumes the twin in the same
   terminal. Reply in one line ("Compacting when this turn ends.") and end your turn. A bare
   `/recompact` typed by the user never reaches you there: a hook takes it before the model runs.
-- **Without the launcher**, it compacts now (Haiku summaries, toward 120k) and prints a
+- **Without the launcher**, it compacts now (Haiku summaries) and prints a
   `claude --resume …` command, also copied to the clipboard. Tell the user to `/exit` and paste
   it, and mention that starting claude through `recompact shell` makes this automatic.
 - **Autonomous work:** at a clean checkpoint in a long task, you may queue your own handoff with
@@ -198,22 +198,30 @@ recompact shell [--at T] [--target T] [--mask] [--no-auto] [claude arguments...]
 ```
 
 A drop-in for `claude`: every argument it does not know goes to claude (`recompact shell --model
-opus --effort max`, `recompact shell -r <id>`). Print-mode, `--help`, and subcommands run claude
-directly. It stays in the background and does three things:
+opus --effort max`, `recompact shell -r <id>`). Print mode, `--help`, subcommands, and any flag it
+cannot classify run claude directly, unwrapped. It stays in the background and does three things:
 
 - **Typed `/recompact`:** compacts and resumes in the same terminal, no model turn spent.
-- **Automatic:** when a turn ends with the context at or over `--at` (default 400k on 1M-context
-  models, else 140k), it compacts toward `--target` (default 120k) and resumes. It waits while
-  background tasks run or session crons are scheduled, and says so once. From half of `--at`, a
-  background prewarm keeps the summary cache warm, so the handoff itself usually takes seconds.
-- **Long autonomous turns:** past the checkpoint size (`--at` + 150k on 1M models, + 30k
-  otherwise), a hook asks the agent to reach a checkpoint and end its turn; after the handoff the
-  resumed session is told to continue. An active `/goal` is continued the same way.
+- **Automatic:** when a turn ends with the context at or over `--at` (default 400k on a 1M
+  window, 140k on 200k), it compacts toward `--target` (default half of `--at`, at most 120k) and
+  resumes. It waits while background tasks run or session crons are scheduled, and says so once.
+  From half of `--at`, a background prewarm keeps the summary cache warm, so the handoff itself
+  usually takes seconds.
+- **Long autonomous turns:** past the checkpoint size (`--at` + 150k on 1M; on 200k, 30k more but
+  under Claude Code's own compaction), a hook asks the main agent (not subagents) to reach a
+  checkpoint and end its turn; the resumed session is told to continue. An active `/goal` is
+  continued the same way.
+
+Transcripts do not record the context window: Haiku counts as 200k, other models as 1M (what the
+`opus` alias gives on current plans); set `RECOMPACT_WINDOW=200k` if yours differs.
 
 Resuming a session that is already over `--at` compacts it before it opens. The relaunch keeps
-every flag except the session-selecting ones; model and effort come from the session itself.
-Ctrl-C during a compaction cancels it and resumes the session unchanged. Defaults can also come
-from the environment: `RECOMPACT_AT`, `RECOMPACT_TARGET`, `RECOMPACT_SUMMARIZE_WITH` (`mask` for
+every flag except the session-selecting ones and `--permission-mode` (the session restores the
+mode it was in; `--dangerously-skip-permissions` becomes `--allow-dangerously-skip-permissions`).
+It keeps the model you launched with, unless the session switched model family mid-way, and the
+session's effort. It runs in the directory claude started in. Ctrl-C during a compaction cancels
+it and resumes the session as it was. Defaults can also come from the environment:
+`RECOMPACT_AT`, `RECOMPACT_TARGET`, `RECOMPACT_WINDOW`, `RECOMPACT_SUMMARIZE_WITH` (`mask` for
 none), `RECOMPACT_AUTO=0`.
 
 To route every `claude` through it (aliases like `claude --model opus` included), add to

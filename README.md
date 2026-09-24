@@ -57,7 +57,7 @@ recompact shell --model opus --effort max
 
 Under it, a typed `/recompact` compacts and resumes in the same terminal without spending a model
 turn, and a turn that ends over the threshold (400k on 1M-context models, else 140k) does the same
-automatically. A background prewarm writes most summaries ahead of time, so a handoff usually
+automatically (the window is assumed 1M except on Haiku; `RECOMPACT_WINDOW=200k` overrides). A background prewarm writes most summaries ahead of time, so a handoff usually
 takes seconds. To make plain `claude` use it, add to `~/.zshrc`:
 
 ```zsh
