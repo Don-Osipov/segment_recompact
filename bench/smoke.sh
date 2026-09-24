@@ -28,10 +28,10 @@ cleanup_dirs=()
 cleanup() { for d in "${cleanup_dirs[@]:-}"; do rm -rf "$d"; done; }
 trap cleanup EXIT
 
+# Callers run this in $(…), a subshell, so it cannot register cleanup itself: the caller does.
 new_workdir() {
   local w="$HOME/.recompact-bench-$$-$RANDOM"
   mkdir -p "$w"
-  cleanup_dirs+=("$w" "$(project_dir_for "$w")")
   echo "$w"
 }
 
@@ -45,6 +45,7 @@ run_claude() { # cwd prompt [extra claude args...]
 scenario_summarize() {
   local work proj seed sid codeword src newid reply
   work="$(new_workdir)"
+  cleanup_dirs+=("$work" "$(project_dir_for "$work")")
   proj="$(project_dir_for "$work")"
 
   seed="$(run_claude "$work" "Invent a codeword of the form ANIMAL-NUMBER (e.g. FALCON-7). State it once clearly. I will ask for it later.")"
@@ -72,6 +73,7 @@ scenario_summarize() {
 scenario_mask() {
   local work proj seed sid src newid reply
   work="$(new_workdir)"
+  cleanup_dirs+=("$work" "$(project_dir_for "$work")")
   proj="$(project_dir_for "$work")"
 
   seed="$(run_claude "$work" "Use the Bash tool to run exactly: seq 1 200 . Then tell me the sum of the first 3 numbers it printed." --allowedTools "Bash(seq:*)")"
