@@ -41,6 +41,9 @@ terminal and use claude as always:
   place and carries on, through as many handoffs as it takes; long autonomous turns are asked to
   reach a checkpoint first. Everything else stays untouched: automatic compaction is off by
   default. Set `RECOMPACT_WINDOW=200k` if your Opus or Sonnet plan has a 200k window.
+- Background shells, monitors, and scheduled prompts (`/loop`) keep working: compaction records
+  them, and the resumed session starts them again. A build or test still running in the
+  background is waited for first.
 - `/recompact off` turns it off for that session, `/recompact on 600k` changes its size,
   `/recompact status` shows where it stands, and `/recompact default on` makes it the default for
   new sessions. They answer instantly, without a model turn.

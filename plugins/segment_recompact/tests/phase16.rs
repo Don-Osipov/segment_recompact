@@ -336,12 +336,13 @@ fn background_work_defers_the_handoff_and_says_so_once() {
     let t = big_session(&dir, 180_000);
     let shell = shell_state(json!({"at": 150_000}), &t);
     let mut input = stop_input(&t);
-    input["background_tasks"] = json!([{"id": "b1"}]);
+    input["background_tasks"] = json!([{"id": "b1", "type": "shell", "status": "running",
+        "command": "pnpm build", "description": "build"}]);
     let out = on_stop_in(Some(reload(&shell)), &input).expect("explains the wait");
     assert!(out["systemMessage"]
         .as_str()
         .unwrap()
-        .contains("background tasks"));
+        .contains("waits for 1 background job"));
     assert!(read(shell.dir.join("request.json")).is_none());
     assert!(
         on_stop_in(Some(reload(&shell)), &input).is_none(),
@@ -352,6 +353,66 @@ fn background_work_defers_the_handoff_and_says_so_once() {
     assert!(read(shell.dir.join("request.json")).is_none());
     on_stop_in(Some(reload(&shell)), &stop_input(&t)).expect("handoff");
     assert!(read(shell.dir.join("request.json")).is_some());
+}
+
+#[test]
+fn monitors_and_wakeups_do_not_block_and_are_restarted_after_the_handoff() {
+    let dir = tmp_dir();
+    let t = big_session(&dir, 180_000);
+    // Explicitly on, so no warning turn: the handoff is due now.
+    let shell = shell_state(json!({"auto": true, "at": 150_000}), &t);
+    let mut input = stop_input(&t);
+    input["background_tasks"] = json!([
+        {"id": "m1", "type": "shell", "status": "running",
+         "command": "while true; do gh run list -L 1; sleep 60; done", "description": "CI monitor"},
+        {"id": "d1", "type": "shell", "status": "completed", "command": "pnpm test"}
+    ]);
+    input["session_crons"] = json!([{"id": "c1", "schedule": "*/30 * * * *", "recurring": true,
+        "prompt": "check the deploy status"}]);
+    let out = on_stop_in(Some(reload(&shell)), &input).expect("handoff, not a wait");
+    assert!(out["systemMessage"]
+        .as_str()
+        .unwrap()
+        .contains("2 background task(s) and wakeup(s) will be restarted"));
+    let req = read(shell.dir.join("request.json")).unwrap();
+    assert_eq!(
+        req["carry"]["tasks"].as_array().unwrap().len(),
+        1,
+        "finished work is not restarted"
+    );
+    let prompt = restore_prompt(&req["carry"], false).unwrap();
+    assert!(
+        prompt.contains("while true; do gh run list -L 1; sleep 60; done"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("`check the deploy status` on `*/30 * * * *`"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("CronCreate") && prompt.contains("wait for the user"),
+        "{prompt}"
+    );
+    assert!(restore_prompt(&req["carry"], true)
+        .unwrap()
+        .contains("continue the work"));
+    assert!(restore_prompt(&json!({"tasks": [], "crons": []}), true).is_none());
+}
+
+#[test]
+fn a_finite_job_is_waited_for_only_up_to_the_checkpoint() {
+    let dir = tmp_dir();
+    let t = big_session(&dir, 320_000);
+    let shell = shell_state(
+        json!({"auto": true, "at": 150_000, "checkpoint_at": 300_000}),
+        &t,
+    );
+    let mut input = stop_input(&t);
+    input["background_tasks"] = json!([{"id": "b1", "type": "shell", "status": "running",
+        "command": "cargo build --release"}]);
+    on_stop_in(Some(reload(&shell)), &input).expect("handoff past the checkpoint");
+    let req = read(shell.dir.join("request.json")).unwrap();
+    assert_eq!(req["carry"]["tasks"][0]["command"], "cargo build --release");
 }
 
 #[test]
@@ -437,7 +498,7 @@ D="$(dirname "$0")"
 echo "spawn $*" >> "$D/spawns.log"
 n=$(wc -l < "$D/spawns.log")
 if [ "$n" -eq 1 ]; then
-  printf '{{"session":"{SESSION}","transcript":"{t}","cwd":"{d}","reason":"manual","force":true,"ready":true,"kick":false}}' > "$RECOMPACT_SHELL/request.json"
+  printf '{{"session":"{SESSION}","transcript":"{t}","cwd":"{d}","reason":"manual","force":true,"ready":true,"kick":false,"carry":{{"tasks":[{{"command":"tail -f app.log","description":"log watch"}}],"crons":[]}}}}' > "$RECOMPACT_SHELL/request.json"
   trap 'exit 143' TERM
   sleep 30 & wait $!
   exit 0
@@ -478,6 +539,11 @@ exit 0
     assert!(
         lines[1].contains("--model opus"),
         "the launch model is kept: {spawns}"
+    );
+    assert!(
+        lines[1].contains("Start again the ones that are still needed")
+            && lines[1].contains("tail -f app.log"),
+        "the stopped work is restored: {spawns}"
     );
     assert!(
         !lines[1].contains("hello there"),
