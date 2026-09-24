@@ -267,8 +267,20 @@ fn a_turn_ending_over_the_threshold_requests_a_handoff() {
     let dir = tmp_dir();
     let t = big_session(&dir, 180_000);
     let shell = shell_state(json!({"auto": true, "at": 150_000}), &t);
+    // First a warning, and nothing else: never a surprise.
+    let warn = on_stop_in(Some(reload(&shell)), &stop_input(&t)).expect("warned");
+    let text = warn["systemMessage"].as_str().unwrap();
+    assert!(
+        text.contains("180k") && text.contains("next turn") && text.contains("/recompact off"),
+        "{text}"
+    );
+    assert!(read(shell.dir.join("request.json")).is_none());
+    // The next turn's end hands off.
     let out = on_stop_in(Some(reload(&shell)), &stop_input(&t)).expect("handoff requested");
-    assert!(out["systemMessage"].as_str().unwrap().contains("180k"));
+    assert!(out["systemMessage"]
+        .as_str()
+        .unwrap()
+        .contains("compacting"));
     let req = read(shell.dir.join("request.json")).unwrap();
     assert_eq!(req["reason"], "auto");
     assert_eq!(req["ready"], true);
@@ -316,8 +328,31 @@ fn background_work_defers_the_handoff_and_says_so_once() {
         on_stop_in(Some(reload(&shell)), &input).is_none(),
         "said once"
     );
-    // Once the tasks are done, the next stop hands off.
-    assert!(on_stop_in(Some(reload(&shell)), &stop_input(&t)).is_some());
+    // Once the tasks are done: the warning, then the handoff.
+    on_stop_in(Some(reload(&shell)), &stop_input(&t)).expect("warned");
+    assert!(read(shell.dir.join("request.json")).is_none());
+    on_stop_in(Some(reload(&shell)), &stop_input(&t)).expect("handoff");
+    assert!(read(shell.dir.join("request.json")).is_some());
+}
+
+#[test]
+fn a_session_opened_over_the_size_gets_room_before_any_warning() {
+    let dir = tmp_dir();
+    let t = big_session(&dir, 612_000);
+    let shell = shell_state(json!({"auto": true, "at": 400_000}), &t);
+    let mut session: Value = read(shell.dir.join("session.json")).unwrap();
+    session["start_tokens"] = json!(612_000);
+    fs::write(shell.dir.join("session.json"), session.to_string()).unwrap();
+    assert!(
+        on_stop_in(Some(reload(&shell)), &stop_input(&t)).is_none(),
+        "opened as it is"
+    );
+    // 100k past where it opened, the usual warning comes.
+    let t2 = big_session(&dir, 715_000);
+    let mut input = stop_input(&t2);
+    input["transcript_path"] = json!(t2);
+    let warn = on_stop_in(Some(reload(&shell)), &input).expect("warned");
+    assert!(warn["systemMessage"].as_str().unwrap().contains("715k"));
 }
 
 #[test]
@@ -432,9 +467,9 @@ exit 0
 }
 
 #[test]
-fn a_session_resumed_over_the_threshold_is_compacted_before_it_opens() {
+fn a_resumed_session_opens_as_it_is_however_big() {
     let dir = tmp_dir();
-    big_session(&dir, 300_000);
+    big_session(&dir, 900_000);
     let stub = write_stub(
         &dir,
         "claude-stub.sh",
@@ -456,14 +491,11 @@ fn a_session_resumed_over_the_threshold_is_compacted_before_it_opens() {
         "do the next thing",
     ]));
     assert_eq!(rc, 0);
-    let twin = lineage_latest(&dir, SESSION);
-    assert_ne!(twin, SESSION);
+    assert_eq!(lineage_latest(&dir, SESSION), SESSION, "nothing compacted");
     let spawns = fs::read_to_string(dir.join("spawns.log")).unwrap();
-    assert!(spawns.contains(&format!("--resume {twin}")), "{spawns}");
-    assert_eq!(spawns.lines().count(), 1);
     assert!(
-        spawns.contains("do the next thing"),
-        "the prompt survives: {spawns}"
+        spawns.contains(&format!("-r {SESSION} do the next thing")),
+        "{spawns}"
     );
 }
 

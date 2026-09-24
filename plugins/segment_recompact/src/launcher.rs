@@ -354,6 +354,9 @@ pub fn on_session_start(input: &Value) {
             "transcript": get_s(input, "transcript_path"),
             "model": get_s(input, "model"),
             "source": get_s(input, "source"),
+            "start_tokens": get_s(input, "transcript_path")
+                .and_then(|t| live_status(Path::new(t)))
+                .map(|(t, _)| t),
         }),
     );
     let start = shell.dir.join("start.json");
@@ -431,9 +434,17 @@ fn thresholds(shell: &Shell, model: &str, live: usize) -> (usize, usize, usize) 
         get_u(&shell.config, "checkpoint_at").unwrap_or_else(|| default_checkpoint(at, window));
     let target = get_u(&shell.config, "target").unwrap_or_else(|| default_target(at));
     // After a handoff that could not get far below the trigger, wait for real growth before the
-    // next one instead of compacting every turn.
+    // next one instead of compacting every turn. Likewise a session that was already over the
+    // size when it opened: the user chose to resume it as it is.
     let rearm = get_u(&shell.config, "rearm").unwrap_or(0);
-    (at.max(rearm), checkpoint.max(rearm), target)
+    let opened = shell
+        .session()
+        .and_then(|s| get_u(&s, "start_tokens"))
+        .filter(|&t| t >= at)
+        .map(|t| t + (at / 4).max(100_000))
+        .unwrap_or(0);
+    let floor = rearm.max(opened);
+    (at.max(floor), checkpoint.max(floor), target)
 }
 
 /// Stop: the turn is over and the transcript complete, the safe moment to hand off.
@@ -499,6 +510,19 @@ pub fn on_stop_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
         return None;
     }
     let kick = nudged_at(&shell, session).is_some();
+    // Never a surprise: the first time a turn ends over the size, say what will happen and how
+    // to stop it; compact when the next turn ends. An agent past its checkpoint request is
+    // mid-task with no one typing, so it goes now.
+    let warned = shell.dir.join("warned.json");
+    if !kick
+        && read_json(&warned).and_then(|w| get_s(&w, "session").map(|s| s == session)) != Some(true)
+    {
+        write_json(&warned, &json!({"session": session, "tokens": live}));
+        return Some(json!({"systemMessage": format!(
+            "recompact: this session is at {} (≥ {}). It compacts in place when your next turn ends. \
+/recompact off prevents that; /recompact does it now.",
+            fmt_k(live), fmt_k(at))}));
+    }
     request(&shell, input, "auto", kick, false, true);
     Some(json!({"systemMessage": format!(
         "recompact: context is {} (≥ {}); compacting and resuming here.", fmt_k(live), fmt_k(at))}))
@@ -1096,13 +1120,6 @@ pub fn carry_args(args: &[Arg]) -> Vec<String> {
     flatten(&kept)
 }
 
-fn positionals(args: &[Arg]) -> Vec<String> {
-    args.iter()
-        .filter(|a| a.flag.is_none())
-        .flat_map(|a| a.values.iter().cloned())
-        .collect()
-}
-
 fn flag_value<'a>(args: &'a [Arg], names: &[&str]) -> Option<&'a str> {
     args.iter()
         .rev()
@@ -1303,47 +1320,18 @@ pub fn cmd_shell(args: &[String]) -> i32 {
     let mut rearm = 0usize;
     let mut next_args: Vec<String> = claude_args.clone();
 
-    // Resuming a session that is already over the trigger: compact it before opening it.
+    // A resumed session opens as it is, however big: compaction only ever follows a warning.
     let auto = auto_on(&json!({"auto": l.auto}));
     say(if auto {
         "auto-compaction on · /recompact off to turn it off"
     } else {
         "auto-compaction off · /recompact on to turn it on"
     });
-    if let Some(id) = flag_value(&parsed, &["-r", "--resume"]) {
-        if auto {
-            let path = match &l.dir {
-                Some(d) => Some(d.join(format!("{id}.jsonl"))),
-                None => locate_session(None, id),
-            };
-            if let Some(path) = path.filter(|p| p.exists()) {
-                let (live, model) = live_status(&path).unwrap_or((0, String::new()));
-                let at = user_at()
-                    .or(l.at)
-                    .unwrap_or_else(|| default_at_for(&model, live));
-                if live >= at {
-                    say(&format!(
-                        "{} is at {} (≥ {}); compacting before resuming it",
-                        short_id(id),
-                        fmt_k(live),
-                        fmt_k(at)
-                    ));
-                    let req = json!({"session": id, "transcript": path, "reason": "auto", "force": false});
-                    if let Some((twin, est)) = run_handoff(&req, &copts, at) {
-                        rearm = if est > 0 { rearm_for(est, at) } else { 0 };
-                        let mut a = relaunch_args(&origin, &twin, &path, None);
-                        a.extend(positionals(&parsed));
-                        next_args = a;
-                    }
-                }
-            }
-        }
-    }
 
     let mut cycles = 0usize;
     loop {
         cycles += 1;
-        for f in ["request.json", "nudged.json", "session.json"] {
+        for f in ["request.json", "nudged.json", "session.json", "warned.json"] {
             let _ = fs::remove_file(state.join(f));
         }
         let config = |child: u32| {

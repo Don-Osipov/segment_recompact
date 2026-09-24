@@ -79,6 +79,13 @@ fn the_switch_turns_auto_compaction_off_and_on_for_every_session() {
         "this session runs under the launcher: {text}"
     );
     assert_eq!(user_settings()["at"], 300_000);
+    // A warning first, then the handoff at the end of the next turn.
+    let warn = on_stop_in(Some(shell()), &stop).unwrap();
+    assert!(warn["systemMessage"]
+        .as_str()
+        .unwrap()
+        .contains("next turn"));
+    assert!(!state.join("request.json").exists());
     assert!(on_stop_in(Some(shell()), &stop).is_some());
     assert_eq!(
         serde_json::from_str::<Value>(&fs::read_to_string(state.join("request.json")).unwrap())
