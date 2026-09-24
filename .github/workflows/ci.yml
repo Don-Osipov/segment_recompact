@@ -15,4 +15,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release
-      - run: cargo test --release
+      - run: cargo test --release < /dev/null
+      - name: launcher script runs the build, and versions agree
+        run: |
+          sh -n bin/recompact
+          sh -n ../../install.sh
+          want=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' .claude-plugin/plugin.json | head -n 1)
+          got=$(RECOMPACT_HOME="$RUNNER_TEMP/rc" ./bin/recompact version)
+          echo "plugin.json $want, binary: $got"
+          [ "$got" = "recompact $want" ]

@@ -1,0 +1,100 @@
+#!/bin/sh
+# recompact launcher: runs the recompact binary that matches this plugin's version.
+#
+# Plugin installs carry no binary, so on first use this fetches the release asset for this
+# version and platform from GitHub (checksum-verified) into ~/.claude/recompact/bin. A local
+# cargo build (target/release) wins, for development; cargo is the last resort.
+set -u
+
+self="$0"
+while [ -L "$self" ]; do
+  link="$(readlink "$self")"
+  case "$link" in
+    /*) self="$link" ;;
+    *) self="$(dirname "$self")/$link" ;;
+  esac
+done
+root="$(cd "$(dirname "$self")/.." && pwd)"
+self="$root/bin/recompact"
+
+repo="Don-Osipov/segment_recompact"
+home="${RECOMPACT_HOME:-$HOME/.claude/recompact}"
+version="$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$root/.claude-plugin/plugin.json" | head -n 1)"
+
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) target=aarch64-apple-darwin ;;
+  Darwin-x86_64) target=x86_64-apple-darwin ;;
+  Linux-x86_64) target=x86_64-unknown-linux-gnu ;;
+  Linux-aarch64 | Linux-arm64) target=aarch64-unknown-linux-gnu ;;
+  *) target=unknown ;;
+esac
+
+# A stable path for the shell integration (`recompact install`): repointed when it is missing,
+# dangling, or names another version, so a plugin update carries it along.
+mkdir -p "$home/bin" 2>/dev/null
+cur="$(readlink "$home/bin/recompact" 2>/dev/null)"
+if [ ! -x "$cur" ] ||
+  [ "$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$(dirname "$cur")/../.claude-plugin/plugin.json" 2>/dev/null | head -n 1)" != "$version" ]; then
+  ln -sfn "$self" "$home/bin/.recompact.$$" 2>/dev/null &&
+    mv -f "$home/bin/.recompact.$$" "$home/bin/recompact" 2>/dev/null
+fi
+
+run() {
+  exec "$@"
+}
+
+if [ -n "${RECOMPACT_BIN:-}" ] && [ -x "$RECOMPACT_BIN" ]; then
+  run "$RECOMPACT_BIN" "$@"
+fi
+if [ -x "$root/target/release/recompact" ]; then
+  run "$root/target/release/recompact" "$@"
+fi
+cached="$home/bin/recompact-$version-$target"
+if [ -x "$cached" ]; then
+  run "$cached" "$@"
+fi
+
+sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d ' ' -f 1
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d ' ' -f 1
+  fi
+}
+
+fetch() {
+  command -v curl >/dev/null 2>&1 || return 1
+  [ "$target" != unknown ] || return 1
+  base="https://github.com/$repo/releases/download/v$version"
+  tmp="$cached.part.$$"
+  sums="$cached.sums.$$"
+  curl -fsSL --max-time 60 -o "$tmp" "$base/recompact-$target" &&
+    curl -fsSL --max-time 30 -o "$sums" "$base/SHA256SUMS" || {
+    rm -f "$tmp" "$sums"
+    return 1
+  }
+  want="$(grep " recompact-$target\$" "$sums" | cut -d ' ' -f 1)"
+  got="$(sha256 "$tmp")"
+  rm -f "$sums"
+  if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    echo "recompact: checksum mismatch for recompact-$target v$version; not installing it" >&2
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod +x "$tmp" && mv -f "$tmp" "$cached"
+}
+
+build() {
+  command -v cargo >/dev/null 2>&1 || return 1
+  echo "recompact: building v$version with cargo (first run only)" >&2
+  cargo build --release --quiet --manifest-path "$root/Cargo.toml" \
+    --target-dir "$home/build" >&2 &&
+    cp "$home/build/release/recompact" "$cached.part.$$" &&
+    chmod +x "$cached.part.$$" && mv -f "$cached.part.$$" "$cached"
+}
+
+if fetch || build; then
+  run "$cached" "$@"
+fi
+echo "recompact: no binary for $target v$version (download failed and cargo is not installed)" >&2
+exit 127

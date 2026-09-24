@@ -23,52 +23,58 @@ value is a disciplined process plus correct structural surgery.
 
 ## Install
 
-**Prerequisite: a Rust toolchain** (`cargo`, from [rustup.rs](https://rustup.rs)). No prebuilt
-binary ships with the plugin; the helper is compiled from source at install time, so without
-`cargo` the install produces a plugin that cannot run. macOS and Linux only (the build hook is a
-POSIX shell command).
+One line, on macOS or Linux, with Claude Code installed:
 
 ```bash
-claude plugin marketplace add Don-Osipov/segment_recompact
+curl -fsSL https://raw.githubusercontent.com/Don-Osipov/segment_recompact/main/install.sh | sh
+```
+
+It installs the plugin, fetches the prebuilt binary for your platform (checksum-verified; no Rust
+needed), and adds a small `claude` function to your shell startup file. Open a new terminal and
+use claude as always:
+
+- Type `/recompact` to compact the current session. It resumes in the same terminal.
+- When a turn ends with the context at 400k tokens (140k on Haiku), the same happens by itself.
+  Set `RECOMPACT_WINDOW=200k` if your Opus or Sonnet plan has a 200k window.
+- Long autonomous turns are asked to checkpoint, then compacted and told to continue.
+
+Anything removed stays readable through the `recall` tool. `claude -p`, subcommands, and flags the
+launcher does not recognize run plain claude. To undo the shell change:
+`~/.claude/recompact/bin/recompact uninstall`.
+
+Already have the plugin (for example through a team's settings)? Type `/recompact setup` once
+inside claude instead.
+
+### Share with a team
+
+Add this to a repository's `.claude/settings.json`. Everyone who trusts the folder gets the
+plugin and its updates; each person then types `/recompact setup` once for in-place compaction:
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "segment-recompact": {
+      "source": { "source": "git", "url": "https://github.com/Don-Osipov/segment_recompact.git" }
+    }
+  },
+  "enabledPlugins": { "segment-recompact@segment-recompact": true }
+}
+```
+
+### Manual install and development
+
+```bash
+claude plugin marketplace add https://github.com/Don-Osipov/segment_recompact.git
 claude plugin install segment-recompact@segment-recompact
+recompact install        # inside claude, the plugin's bin/ is on PATH; or /recompact setup
 ```
 
-The marketplace source can be a GitHub `owner/repo`, a git URL, or a local path
-(`claude plugin marketplace add /path/to/segment_recompact`), which is the one to use if you are
-hacking on the tool: a directory-sourced marketplace picks up your edits with no reinstall.
-
-The plugin's `Setup` hook runs `cargo build --release` and places the binary at `bin/recompact`.
-(The skill also builds it on first use if it's missing, so a skipped Setup run is self-healing.)
-The plugin's `bin/` is added to PATH, so `recompact` works as a bare command; the skill still
-invokes it by full path, since shell variables do not persist between invocations.
-
-Then, in any session:
-
-```
-/recompact
-```
-
-For compaction that happens by itself, start claude through the launcher. It passes every other
-argument to claude, so aliases keep working:
-
-```
-recompact shell --model opus --effort max
-```
-
-Under it, a typed `/recompact` compacts and resumes in the same terminal without spending a model
-turn, and a turn that ends over the threshold (400k on 1M-context models, else 140k) does the same
-automatically (the window is assumed 1M except on Haiku; `RECOMPACT_WINDOW=200k` overrides). A background prewarm writes most summaries ahead of time, so a handoff usually
-takes seconds. To make plain `claude` use it, add to `~/.zshrc`:
-
-```zsh
-claude() { if [ -x "$HOME/.local/bin/recompact" ]; then "$HOME/.local/bin/recompact" shell "$@"; else command claude "$@"; fi; }
-```
-
-To confirm the install before relying on it, `recompact` with no arguments prints the usage block:
-`extract`, `assemble`, `verify`, `probe`, `rehydrate`, `continue`, `shell`, `handoff`, `resume`, and `scan`.
-A binary listing only `extract` and `assemble` is a stale build from an early version.
-
-To pick up later changes, `claude plugin update segment-recompact@segment-recompact`.
+`bin/recompact` is a launcher script: it runs `target/release/recompact` when you have built one
+(`cargo build --release` in `plugins/segment_recompact`), and otherwise downloads the release
+binary for the plugin's version into `~/.claude/recompact/bin`. Every version bump merged to
+`main` publishes that release. For development, add the marketplace as a local path
+(`claude plugin marketplace add /path/to/segment_recompact`) so edits apply without reinstalling.
+`recompact version` prints the running version.
 
 ## How it works
 

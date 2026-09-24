@@ -1,14 +1,41 @@
 name: release
 
+# Every version in plugin.json gets a release with prebuilt binaries: the plugin's bin/recompact
+# launcher downloads the one matching its version on first use. A push to main that bumps the
+# version publishes it; pushing a v* tag rebuilds that tag.
 on:
   push:
+    branches: [main]
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      needed: ${{ steps.v.outputs.needed }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' plugins/segment_recompact/.claude-plugin/plugin.json | head -n 1)
+          tag="v$version"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = tag ] || ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "needed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "needed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: version
+    if: needs.version.outputs.needed == 'true'
     strategy:
       matrix:
         include:
@@ -16,6 +43,8 @@ jobs:
             targets: "aarch64-apple-darwin x86_64-apple-darwin"
           - os: ubuntu-latest
             targets: "x86_64-unknown-linux-gnu"
+          - os: ubuntu-24.04-arm
+            targets: "aarch64-unknown-linux-gnu"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -23,7 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --release
+      - run: cargo test --release < /dev/null
       - name: build targets
         run: |
           mkdir -p dist
@@ -32,6 +61,24 @@ jobs:
             cargo build --release --target "$t"
             cp "target/$t/release/recompact" "dist/recompact-$t"
           done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.os }}
+          path: plugins/segment_recompact/dist/recompact-*
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: cd dist && sha256sum recompact-* > SHA256SUMS && cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          files: plugins/segment_recompact/dist/recompact-*
+          tag_name: ${{ needs.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            dist/recompact-*
+            dist/SHA256SUMS

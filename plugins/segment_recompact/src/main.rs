@@ -4,8 +4,8 @@ use std::env;
 use std::process::exit;
 
 use recompact::{
-    cmd_assemble, cmd_continue, cmd_extract, cmd_handoff, cmd_hook, cmd_mcp, cmd_prewarm, cmd_probe, cmd_recall,
-    cmd_rehydrate, cmd_resume, cmd_scan, cmd_shell, cmd_verify, USAGE,
+    cmd_assemble, cmd_continue, cmd_extract, cmd_handoff, cmd_hook, cmd_install, cmd_mcp, cmd_prewarm, cmd_probe, cmd_recall,
+    cmd_rehydrate, cmd_resume, cmd_scan, cmd_shell, cmd_uninstall, cmd_verify, USAGE,
 };
 
 fn main() {
@@ -25,6 +25,12 @@ fn main() {
         "hook" => cmd_hook(&args[2..]),
         "handoff" => cmd_handoff(&args[2..]),
         "prewarm" => cmd_prewarm(&args[2..]),
+        "install" => cmd_install(&args[2..]),
+        "uninstall" => cmd_uninstall(&args[2..]),
+        "version" | "--version" | "-V" => {
+            println!("recompact {}", env!("CARGO_PKG_VERSION"));
+            0
+        }
         "continue" => cmd_continue(&args[2..]),
         "shell" => cmd_shell(&args[2..]),
         "resume" => cmd_resume(&args[2..]),
