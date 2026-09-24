@@ -2259,20 +2259,19 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         .unwrap_or("")
         .to_string();
     let snapshot = git_snapshot(&last_cwd);
+    // Older twins never stamped a generation; each generation that left summaries behind shows up
+    // as a distinct provenance source.
+    let sources: HashSet<&str> = records
+        .iter()
+        .filter_map(|r| r.pointer("/recompactProvenance/sourceSessionId").and_then(|v| v.as_str()))
+        .collect();
     let generation = prior_preamble
         .as_ref()
         .and_then(|p| p.get("recompactGeneration").and_then(|v| v.as_u64()))
-        .map(|g| g + 1)
-        .unwrap_or_else(|| {
-            if records
-                .iter()
-                .any(|r| truthy(r, "recompactSynthetic") || truthy(r, "recompactMasked"))
-            {
-                2
-            } else {
-                1
-            }
-        });
+        .unwrap_or(0)
+        .max(sources.len() as u64)
+        .max(u64::from(records.iter().any(|r| truthy(r, "recompactMasked"))))
+        + 1;
     let assembled_at = now_unix();
     let preamble_text = preamble_text(&PreambleInput {
         path_root: path_root.as_deref(),
