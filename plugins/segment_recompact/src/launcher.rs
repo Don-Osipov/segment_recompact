@@ -379,8 +379,111 @@ fn request(shell: &Shell, input: &Value, reason: &str, kick: bool, force: bool, 
             "kick": kick,
             "force": force,
             "ready": ready,
+            "carry": carry_for(shell, hook_session(input)),
         }),
     );
+}
+
+// ------------------------------------------------------------------------------------ carry
+
+/// Restarting claude ends its background shells and monitors and drops its scheduled wakeups
+/// (measured: all processes gone after SIGTERM). The Stop hook sees them all, with commands and
+/// schedules, so a handoff records them and the resumed session is asked to start them again.
+fn remember_background(shell: &Shell, session: &str, input: &Value) {
+    let tasks: Vec<Value> = input
+        .get("background_tasks")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter(|t| get_s(t, "status").is_none_or(|s| s == "running"))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let crons = input
+        .get("session_crons")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    write_json(
+        &shell.dir.join("background.json"),
+        &json!({"session": session, "tasks": tasks, "crons": crons}),
+    );
+}
+
+fn carry_for(shell: &Shell, session: Option<&str>) -> Value {
+    read_json(&shell.dir.join("background.json"))
+        .filter(|b| session.is_some() && get_s(b, "session") == session)
+        .map(|b| json!({"tasks": b["tasks"], "crons": b["crons"]}))
+        .unwrap_or(json!({"tasks": [], "crons": []}))
+}
+
+/// A background command with no natural end (a watcher or poll loop): waiting for it to finish
+/// would mean never compacting, so it is restarted instead.
+pub fn is_open_ended(task: &Value) -> bool {
+    let cmd = get_s(task, "command").unwrap_or("").to_lowercase();
+    let desc = get_s(task, "description").unwrap_or("").to_lowercase();
+    [
+        "while true",
+        "while :",
+        "tail -f",
+        "tail -F",
+        "--watch",
+        "watch ",
+        "sleep infinity",
+        "until false",
+    ]
+    .iter()
+    .any(|p| cmd.contains(&p.to_lowercase()))
+        || ["monitor", "watch", "poll", "tail"]
+            .iter()
+            .any(|w| desc.contains(w))
+}
+
+fn carry_items(carry: &Value) -> Vec<String> {
+    let mut items = Vec::new();
+    for t in carry["tasks"].as_array().into_iter().flatten() {
+        let cmd = get_s(t, "command").unwrap_or("?");
+        let short: String = cmd.chars().take(160).collect();
+        items.push(format!(
+            "background command `{short}`{}",
+            get_s(t, "description")
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default()
+        ));
+    }
+    for c in carry["crons"].as_array().into_iter().flatten() {
+        items.push(format!(
+            "scheduled prompt `{}` on `{}`{}",
+            get_s(c, "prompt").unwrap_or("?"),
+            get_s(c, "schedule").unwrap_or("?"),
+            if c.get("recurring") == Some(&json!(false)) {
+                " (one-off)"
+            } else {
+                " (recurring)"
+            }
+        ));
+    }
+    items
+}
+
+/// The prompt a resumed session gets when compaction stopped background work.
+pub fn restore_prompt(carry: &Value, then_continue: bool) -> Option<String> {
+    let items = carry_items(carry);
+    if items.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Recompact compacted this session and restarted Claude, which stopped: {}. Start again the \
+ones that are still needed, exactly as before (Bash with run_in_background or Monitor for \
+commands, CronCreate for scheduled prompts; check CronList first so none is doubled){}",
+        items.join("; "),
+        if then_continue {
+            ", then continue the work from where you left off."
+        } else {
+            ", then stop and wait for the user."
+        }
+    ))
 }
 
 /// UserPromptSubmit: a bare `/recompact` under the launcher is handled without the model. The
@@ -415,9 +518,17 @@ pub fn on_prompt_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
         return None;
     }
     request(&shell, input, "manual", false, true, true);
+    let restart = carry_items(&carry_for(&shell, Some(session))).len();
     Some(json!({
         "decision": "block",
-        "reason": "recompact: compacting this session; it resumes here in a moment."
+        "reason": format!(
+            "recompact: compacting this session; it resumes here in a moment{}.",
+            if restart > 0 {
+                format!(", and restarts its {restart} background task(s) and wakeup(s)")
+            } else {
+                String::new()
+            }
+        )
     }))
 }
 
@@ -471,6 +582,7 @@ pub fn on_stop_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
     if !shell.tracks(session) {
         return None;
     }
+    remember_background(&shell, session, input);
     // A handoff the agent queued during the turn goes now.
     if let Some(mut req) = read_json(&shell.dir.join("request.json")) {
         if get_s(&req, "session") == Some(session) && req.get("ready") != Some(&json!(true)) {
@@ -486,7 +598,7 @@ pub fn on_stop_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
         return None;
     }
     let (live, model) = live_status(&transcript)?;
-    let (at, _, target) = thresholds(&shell, session, &model, live);
+    let (at, checkpoint, target) = thresholds(&shell, session, &model, live);
     if live < at {
         // From halfway on, keep the summary cache warm in the background, so the handoff (or a
         // manual /recompact) finds almost every summary already written.
@@ -495,25 +607,22 @@ pub fn on_stop_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
         }
         return None;
     }
-    let busy = input
-        .get("background_tasks")
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty());
-    let crons = input
-        .get("session_crons")
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty());
-    if busy || crons {
-        // Stopping claude would kill its background work or drop its scheduled wakeups.
+    // Wakeups and open-ended monitors are restarted after the handoff; a job with an end (a
+    // build, a test run) is worth waiting for, up to the checkpoint size.
+    let finite: Vec<Value> = carry_for(&shell, Some(session))["tasks"]
+        .as_array()
+        .map(|a| a.iter().filter(|t| !is_open_ended(t)).cloned().collect())
+        .unwrap_or_default();
+    if !finite.is_empty() && live < checkpoint {
         let mark = shell
             .dir
             .join(format!("deferred-{}.json", short_id(session)));
         if read_json(&mark).is_none() {
             write_json(&mark, &json!({"tokens": live}));
             return Some(json!({"systemMessage": format!(
-                "recompact: context is {} (≥ {}), but {}; compaction waits. Type /recompact to do it now.",
-                fmt_k(live), fmt_k(at),
-                if busy { "background tasks are running and would be stopped" } else { "this session's scheduled wakeups would be lost" })}));
+                "recompact: context is {} (≥ {}); compaction waits for {} background job(s) to finish \
+(until {} at most, then they are restarted). Type /recompact to do it now.",
+                fmt_k(live), fmt_k(at), finite.len(), fmt_k(checkpoint))}));
         }
         return None;
     }
@@ -534,8 +643,10 @@ pub fn on_stop_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
             fmt_k(live), fmt_k(at))}));
     }
     request(&shell, input, "auto", kick, false, true);
+    let restart = carry_items(&carry_for(&shell, Some(session))).len();
     Some(json!({"systemMessage": format!(
-        "recompact: context is {} (≥ {}); compacting and resuming here.", fmt_k(live), fmt_k(at))}))
+        "recompact: context is {} (≥ {}); compacting and resuming here{}.", fmt_k(live), fmt_k(at),
+        if restart > 0 { format!("; {restart} background task(s) and wakeup(s) will be restarted") } else { String::new() })}))
 }
 
 /// PostToolUse: deep into a single long turn, ask the agent to reach a checkpoint so the handoff
@@ -1339,7 +1450,13 @@ pub fn cmd_shell(args: &[String]) -> i32 {
     let mut cycles = 0usize;
     loop {
         cycles += 1;
-        for f in ["request.json", "nudged.json", "session.json", "warned.json"] {
+        for f in [
+            "request.json",
+            "nudged.json",
+            "session.json",
+            "warned.json",
+            "background.json",
+        ] {
             let _ = fs::remove_file(state.join(f));
         }
         let config = |child: u32| {
@@ -1423,7 +1540,21 @@ pub fn cmd_shell(args: &[String]) -> i32 {
             carry_session_setting(from, &twin);
         }
         let kick = req.get("kick") == Some(&json!(true));
-        next_args = relaunch_args(&origin, &twin, &transcript, kick.then_some(l.kick.as_str()));
+        let mut carry = req.get("carry").cloned().unwrap_or(json!({}));
+        // Scheduled prompts belong to the session id: resuming the same session brings them
+        // back by themselves (measured), so only a new twin needs them recreated.
+        if get_s(&req, "session") == Some(twin.as_str()) {
+            carry["crons"] = json!([]);
+        }
+        let restore = restore_prompt(&carry, kick);
+        if !carry_items(&carry).is_empty() {
+            say(&format!(
+                "the resumed session restarts: {}",
+                carry_items(&carry).join("; ")
+            ));
+        }
+        let prompt = restore.or_else(|| kick.then(|| l.kick.clone()));
+        next_args = relaunch_args(&origin, &twin, &transcript, prompt.as_deref());
     }
 }
 

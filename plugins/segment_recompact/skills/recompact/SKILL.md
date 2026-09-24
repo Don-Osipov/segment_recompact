@@ -221,6 +221,14 @@ A bare `/recompact` always compacts, on or off.
 A session switched on (or started with `--auto`) compacts at the end of the turn that crosses its
 size; one that is on only because of the default gets the one-line notice first.
 
+**Background work across a compaction.** Restarting claude ends its background shells and
+monitors, and a new twin has no scheduled prompts. So a handoff records them (the Stop hook lists
+each command and schedule), and the resumed session gets a prompt to start them again, then
+continue or wait for the user. Open-ended work (watch loops, `tail -f`, monitors, scheduled
+prompts) never delays a handoff. A finite background job (a build, a test run) is waited for,
+until the checkpoint size at most, then restarted the same way. If you wake up to that prompt,
+restart only what is still needed, and check `CronList` before recreating a scheduled prompt.
+
 Transcripts do not record the context window: Haiku counts as 200k, other models as 1M (what the
 `opus` alias gives on current plans); set `RECOMPACT_WINDOW=200k` if yours differs.
 
