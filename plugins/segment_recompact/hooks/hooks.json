@@ -5,7 +5,19 @@
         "hooks": [
           {
             "type": "command",
-            "command": "cd \"${CLAUDE_PLUGIN_ROOT}\" && cargo build --release && mkdir -p bin && cp target/release/recompact bin/recompact && chmod +x bin/recompact"
+            "command": "cd \"${CLAUDE_PLUGIN_ROOT}\" && cargo build --release && mkdir -p bin && rm -f bin/recompact && cp target/release/recompact bin/recompact && chmod +x bin/recompact"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "resume|fork",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -x \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook session-start || true",
+            "timeout": 15
           }
         ]
       }

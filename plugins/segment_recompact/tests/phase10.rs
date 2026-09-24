@@ -85,15 +85,13 @@ fn preamble_present_last_and_regenerated_not_duplicated() {
     let preambles: Vec<&Value> = twin.iter().filter(|r| truthy(r, "recompactPreamble")).collect();
     assert_eq!(preambles.len(), 1, "exactly one preamble");
     let text = preambles[0].pointer("/message/content/0/text").and_then(|v| v.as_str()).unwrap();
-    assert!(text.contains("recompact rehydrate"), "recovery command taught: {text}");
+    assert!(text.contains("recall(query="), "search recall taught: {text}");
+    assert!(text.contains("recompact recall"), "shell fallback taught: {text}");
     assert!(text.contains("recompact continue"), "self-compaction taught");
     assert!(text.contains(SESSION), "names its source session");
-    // Last conversation record: only the `last-prompt` resume pointer may follow it.
+    // Last conversation record: only uuid-less metadata (title, `last-prompt`) may follow it.
     let pos = twin.iter().position(|r| truthy(r, "recompactPreamble")).unwrap();
-    let last_conv = twin
-        .iter()
-        .rposition(|r| r.get("type").and_then(|v| v.as_str()) != Some("last-prompt"))
-        .unwrap();
+    let last_conv = twin.iter().rposition(|r| r.get("uuid").is_some()).unwrap();
     assert_eq!(pos, last_conv, "preamble lands last, got position {pos} of {}", twin.len());
 
     // Second generation: the old preamble is stripped and a fresh one minted — never two.
@@ -107,14 +105,17 @@ fn preamble_present_last_and_regenerated_not_duplicated() {
 }
 
 #[test]
-fn summary_footer_names_its_part_key() {
+fn summary_footer_names_its_part_key_and_a_project_wide_selector() {
     let dir = tmp_dir();
     let src = write_session(&dir, format!("{SESSION}.jsonl").as_str(), &two_segment_session());
     let twin = assemble(&dir, &src, &json!({"0": "Did the research."}));
     let synth = twin.iter().find(|r| truthy(r, "recompactSynthetic")).expect("synthetic exists");
     let text = synth.pointer("/message/content/0/text").and_then(|v| v.as_str()).unwrap();
+    // The selector is the summary record's own uuid prefix: it survives every later generation
+    // and resolves without knowing which file the reader is in.
+    let uuid = synth["uuid"].as_str().unwrap();
     assert!(
-        text.ends_with("[recompact summary 0 — rehydratable]"),
+        text.ends_with(&format!("[recompact summary 0 · recall {}]", &uuid[..8])),
         "footer carries the selector: {text}"
     );
 }

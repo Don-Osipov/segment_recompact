@@ -15,6 +15,13 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
+mod accounting;
+mod anchor;
+mod brief;
+pub use accounting::*;
+pub use anchor::*;
+pub use brief::*;
+
 pub const TOOL_RESULT_TRUNC: usize = 1500;
 
 pub const USAGE: &str = "usage:\n  \
@@ -23,33 +30,41 @@ recompact assemble  <session.jsonl> <summaries.json> [--keep K] [--out <path>]\n
 recompact assemble  <session.jsonl> --mode mask [--keep K] [--out <path>]\n  \
 recompact verify    <assembled.jsonl> [--source <session.jsonl>]\n  \
 recompact probe     <session.jsonl>\n  \
+recompact recall    [id] [--query \"words\"] [--session S]   (read back what compaction\n                      \
+removed; inside Claude Code the current session is known)\n  \
 recompact rehydrate <compacted.jsonl> [part-key | ordinal | uuid | uuid-prefix>=8]\n  \
 recompact mcp       [project-dir]  (MCP stdio server exposing `recall`;\n                      \
 started by the plugin, not normally run by hand)\n  \
-recompact continue  <session.jsonl | sessionId> [--threshold T] [--keep K]\n                      \
-[--summarize-with M [--escalate-with M2] [--escalate-above S]]\n  \
+recompact hook      session-start  (SessionStart hook: orients a resumed twin;\n                      \
+installed by the plugin)\n  \
+recompact continue  [session.jsonl | sessionId] [--threshold T] [--keep K]\n                      \
+[--summarize-with M [--escalate-with M2] [--escalate-above S]]\n                      \
+(no session: the current Claude Code session)\n  \
 recompact shell     [sessionId] [--threshold T] [--goal G] [--auto]\n                      \
 [--summarize-with M ...] (continuous self-compacting session;\n                      \
 agent SIGTERM handoff auto-cycles; old summaries consolidate\n                      \
 into epochs re-derived from raw provenance)\n  \
 recompact resume    <session.jsonl | sessionId>\n  \
 recompact scan      [project-dir] [--estimate]\n\n\
-  --keep K       number of most-recent segments kept verbatim (default 1)\n  \
+  Token numbers are context tokens (what /context shows), calibrated from the\n  \
+  transcript's own usage records when it has them.\n\n\
+  --keep K       number of most-recent turns kept verbatim (default 1)\n  \
+  --tail-budget <tok>  cap on the verbatim tail (default 80000); an oversized\n                 \
+last turn keeps only its newest parts verbatim. 0 disables\n  \
   --mode mask    no-LLM compaction: keep every record, replace old tool-result\n                 \
 payloads with placeholders (errors kept verbatim, head+tail)\n  \
   --cache <path> summary cache keyed by segment content hash: unchanged\n                 \
 segments reuse their summaries on repeated recompactions\n  \
-  --split <tok>  split segments over this many tokens into parts at safe\n                 \
-seams, delegation boundaries first (default 20000; 0 disables).\n                 \
-Pass the same value to extract and assemble\n  \
+  --split <tok>  split turns bigger than this (model-visible tokens) into\n                 \
+parts at safe seams, delegation boundaries first (default 20000;\n                 \
+0 disables). Pass the same value to extract and assemble\n  \
   --target <tok> plan per-unit treatments (verbatim/mask/summarize) toward\n                 \
-this token budget; salience floors may exceed it, with reasons\n  \
+this budget; salience floors may exceed it, with reasons\n  \
   --plan         with --target: print the plan table and exit without\n                 \
 validating or writing anything\n  \
-  --summarize-errors  with --target: let the planner summarize error-bearing\n                 \
-units too (default: errors floor at mask). The supplied summary MUST\n                 \
-preserve the error evidence. Use when the errors are benign (e.g. a\n                 \
-grep exit 1 / no-match) and retaining them verbatim wastes budget";
+  --error-floor  keep error-bearing units at mask instead of summarizing them\n                 \
+(by default they may be summarized: their error text is carried\n                 \
+verbatim beneath the summary)";
 
 fn usage() -> i32 {
     eprintln!("{USAGE}");
@@ -67,7 +82,7 @@ pub fn rec_uuid(r: &Value) -> Option<&str> {
 pub fn truthy(r: &Value, k: &str) -> bool {
     r.get(k).and_then(|v| v.as_bool()).unwrap_or(false)
 }
-fn content(r: &Value) -> Option<&Value> {
+pub(crate) fn content(r: &Value) -> Option<&Value> {
     r.pointer("/message/content")
 }
 
@@ -279,6 +294,67 @@ pub fn has_agent_activity(records: &[Value], seg: &Segment) -> bool {
 pub struct SegPlan {
     pub kept_verbatim: bool,
     pub needs_summary: bool,
+    /// In the keep-K tail (kept for recency, not pinned for content).
+    pub tail: bool,
+    /// For a tail segment too big for the tail budget: the part indices kept verbatim (the most
+    /// recent ones). Its other parts compact like any older unit.
+    pub pinned_parts: Vec<usize>,
+}
+
+/// Default budget for the verbatim tail, in conversation tokens. Keep-K keeps whole turns, and
+/// one autonomous "continue" turn can run for hours: real twins carried final turns of 1-3 MB
+/// (one 557k tokens), which floored every compaction of them. Over budget, only the most recent
+/// parts of the tail stay verbatim.
+pub const DEFAULT_TAIL_BUDGET: usize = 80_000;
+
+pub fn tail_budget(opts: &Map<String, Value>) -> usize {
+    opts.get("tail-budget")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_TAIL_BUDGET)
+}
+
+/// Enforce the tail budget on the plan. Measured in visible chars at the fixed default ratio, not
+/// the session's calibration, so extract, assemble and continue always derive the same units.
+/// The newest part is always kept; `budget_tokens == 0` disables the budget.
+pub fn apply_tail_budget(
+    records: &[Value],
+    segs: &[Segment],
+    plans: &mut [SegPlan],
+    seg_parts: &[Vec<Vec<usize>>],
+    budget_tokens: usize,
+) {
+    if budget_tokens == 0 {
+        return;
+    }
+    let budget_chars = (budget_tokens as f64 * DEFAULT_CHARS_PER_TOKEN) as usize;
+    let mut used = 0usize;
+    let mut first = true;
+    for s in (0..segs.len()).rev() {
+        if !plans[s].tail {
+            break;
+        }
+        used += visible_chars(&records[segs[s].user_idx]);
+        let parts = &seg_parts[s];
+        let mut pinned: Vec<usize> = Vec::new();
+        for p in (0..parts.len()).rev() {
+            let c: usize = parts[p].iter().map(|&i| visible_chars(&records[i])).sum();
+            if first || used + c <= budget_chars {
+                used += c;
+                pinned.push(p);
+                first = false;
+            } else {
+                // Recency is contiguous: once one part misses, every older one does too.
+                used = budget_chars + 1;
+            }
+        }
+        if pinned.len() < parts.len() && has_agent_activity(records, &segs[s]) {
+            pinned.reverse();
+            plans[s].kept_verbatim = false;
+            plans[s].needs_summary = true;
+            plans[s].pinned_parts = pinned;
+        }
+    }
 }
 
 /// Stable identity of a run of records across recompaction passes. Envelope fields (sessionId,
@@ -336,12 +412,12 @@ const DELEGATION_TOOLS: &[&str] = &["Task", "Agent", "Workflow", "Skill"];
 /// ends a self-contained unit of delegated work) and otherwise once the part exceeds its budget.
 /// A segment at or under the threshold stays a single part. threshold 0 disables splitting.
 pub fn split_parts(records: &[Value], seg: &Segment, threshold: usize) -> Vec<Vec<usize>> {
-    let seg_tokens: usize = seg
-        .activity
-        .iter()
-        .map(|&i| serde_json::to_string(&records[i]).map(|s| s.len()).unwrap_or(0))
-        .sum::<usize>()
-        / 4;
+    // Sized by what the model sees, at the fixed default ratio (never the session's calibration,
+    // so every command cuts identical units). Raw record size is dominated by envelope and by
+    // unrendered attachments — current Claude Code writes ~200 KB prompt snapshots — which cut a
+    // two-line exchange into three units, two of them with nothing to summarize.
+    let rec_tokens = |i: usize| (visible_chars(&records[i]) as f64 / DEFAULT_CHARS_PER_TOKEN) as usize;
+    let seg_tokens: usize = seg.activity.iter().map(|&i| rec_tokens(i)).sum();
     if threshold == 0 || seg_tokens <= threshold {
         return vec![seg.activity.clone()];
     }
@@ -393,7 +469,7 @@ pub fn split_parts(records: &[Value], seg: &Segment, threshold: usize) -> Vec<Ve
             }
         }
         cur.push(i);
-        cur_tokens += serde_json::to_string(r).map(|s| s.len()).unwrap_or(0) / 4;
+        cur_tokens += rec_tokens(i);
         let seam_ok = pending.is_empty();
         if seam_ok
             && ((delegation_end && cur_tokens >= min_part) || cur_tokens >= part_budget)
@@ -441,6 +517,8 @@ pub fn plan_ex(records: &[Value], segs: &[Segment], keep: usize, epochs: bool) -
             SegPlan {
                 kept_verbatim,
                 needs_summary,
+                tail,
+                pinned_parts: Vec::new(),
             }
         })
         .collect()
@@ -479,32 +557,36 @@ pub fn load_jsonl(path: &Path) -> Vec<Value> {
 /// tokens, or thresholds fire on phantom mass and compaction chases weight it cannot remove.
 pub const IMAGE_EST_CHARS: usize = 6400;
 
-fn image_excess(v: &Value, acc: &mut usize) {
-    match v {
-        Value::Array(a) => a.iter().for_each(|x| image_excess(x, acc)),
-        Value::Object(o) => {
-            if o.get("type").and_then(|t| t.as_str()) == Some("image") {
-                if let Some(d) = o.get("source").and_then(|s| s.get("data")).and_then(|d| d.as_str()) {
-                    *acc += d.len().saturating_sub(IMAGE_EST_CHARS);
-                    return;
-                }
-            }
-            o.values().for_each(|x| image_excess(x, acc));
-        }
-        _ => {}
-    }
-}
-
-/// Serialized length for token math, with embedded images counted at flat visual weight.
-pub fn est_len(r: &Value) -> usize {
-    let total = serde_json::to_string(r).map(|s| s.len()).unwrap_or(0);
-    let mut excess = 0usize;
-    image_excess(r, &mut excess);
-    total.saturating_sub(excess)
-}
-
+/// Conversation tokens the model is sent for these records on resume, calibrated from their own
+/// `usage` records when they carry enough (see accounting.rs for the measurements behind this).
 pub fn approx_tokens(records: &[Value]) -> usize {
-    records.iter().map(est_len).sum::<usize>() / 4
+    calibrate(records).conv_tokens(records)
+}
+
+/// Calibration for a transcript: the model's tokenizer ratio (falling back to the model a
+/// previous assembly stamped, for a twin with no real turns left) and the live size.
+pub fn calibrate_lineage(records: &[Value]) -> Calib {
+    let mut c = calibrate(records);
+    if c.model.is_none() {
+        if let Some(m) = records
+            .iter()
+            .rev()
+            .find_map(|r| r.pointer("/recompactCalibration/model").and_then(|v| v.as_str()))
+        {
+            c.tokens_per_char = 1.0 / chars_per_token_for(m);
+            c.model = Some(m.to_string());
+        }
+    }
+    c
+}
+
+/// `calibrate_lineage` plus an explicit `--overhead` from the command line.
+pub fn calibrate_opts(records: &[Value], opts: &Map<String, Value>) -> Calib {
+    let mut c = calibrate_lineage(records);
+    if let Some(o) = opts.get("overhead").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()) {
+        c.overhead = o;
+    }
+    c
 }
 
 pub fn truncate(s: &str, n: usize) -> String {
@@ -543,7 +625,16 @@ fn last_prompt_text(records: &[Value]) -> Option<String> {
 // --------------------------------------------------------------------------------- arg plumbing
 
 pub fn parse_opts(args: &[String]) -> (Vec<String>, Map<String, Value>) {
-    const FLAGS: &[&str] = &["plan", "auto", "estimate", "epochs", "summarize-errors"]; // boolean flags take no value
+    // Boolean flags take no value.
+    const FLAGS: &[&str] = &[
+        "plan",
+        "auto",
+        "estimate",
+        "epochs",
+        "summarize-errors",
+        "error-floor",
+        "json",
+    ];
     let mut positional = Vec::new();
     let mut opts = Map::new();
     let mut i = 0;
@@ -605,21 +696,29 @@ pub struct BudgetPlan {
     pub allow_error_summarize: bool,
 }
 
-fn tokens_of(records: &[Value], indices: &[usize]) -> usize {
-    indices.iter().map(|&i| est_len(&records[i])).sum::<usize>() / 4
-}
-
-fn mask_tokens_of(records: &[Value], indices: &[usize]) -> usize {
+/// Visible chars a record set costs once emitted outside the keep tail (ceremony dropped).
+fn chars_of(records: &[Value], indices: &[usize]) -> usize {
     indices
         .iter()
+        .filter(|&&i| !is_ceremony(&records[i]))
+        .map(|&i| visible_chars(&records[i]))
+        .sum()
+}
+
+fn mask_chars_of(records: &[Value], indices: &[usize]) -> usize {
+    indices
+        .iter()
+        .filter(|&&i| !is_ceremony(&records[i]))
         .map(|&i| match mask_record(&records[i]) {
-            Masked::Unchanged => est_len(&records[i]),
-            Masked::Replaced(v) => est_len(&v),
+            Masked::Unchanged => visible_chars(&records[i]),
+            Masked::Replaced(v) => visible_chars(&v),
             Masked::Dropped => 0,
         })
-        .sum::<usize>()
-        / 4
+        .sum()
 }
+
+/// Fixed per-assembly cost of what assemble adds: the orientation preamble with its brief.
+const PREAMBLE_EST_TOKENS: usize = 1500;
 
 fn first_word_signals_correction(text: &str) -> bool {
     const MARKERS: &[&str] = &[
@@ -641,10 +740,11 @@ fn first_word_signals_correction(text: &str) -> bool {
 /// correction markers in the next human turn.
 ///
 /// The error floor (an error-bearing unit never demotes below mask) is a blunt proxy: it fires on
-/// any `is_error` result, and cannot tell a benign `grep` exit-1 from a load-bearing failure. When
-/// the operator judges the errors benign, `allow_error_summarize` lifts the veto so those units can
-/// be summarized like any other — they keep the +0.4 salience bump (demoted last), and their
-/// summary is obligated to preserve the error evidence.
+/// any `is_error` result, and cannot tell a benign `grep` exit-1 from a load-bearing failure —
+/// on real sessions it pinned 285k-546k tokens of mostly-successful work behind a few KB of
+/// no-match probes. Summaries of error-bearing units now carry their error text mechanically
+/// (see `error_evidence`), so `allow_error_summarize` is the CLI default; the units keep the +0.4
+/// salience bump and are demoted last. Passing false restores the hard floor.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_budget(
     records: &[Value],
@@ -658,12 +758,52 @@ pub fn plan_budget(
     epochs: &HashMap<String, Option<String>>,
     summary_tokens: impl Fn(&str) -> Option<usize>,
 ) -> BudgetPlan {
-    // Fixed cost: head + every genuine user turn + pinned/tail segments kept whole.
-    let mut fixed = 0usize;
+    plan_budget_calibrated(
+        records,
+        segs,
+        plans,
+        seg_parts,
+        seg_keys,
+        target,
+        allow_summarize,
+        allow_error_summarize,
+        epochs,
+        &Calib::for_model(None),
+        summary_tokens,
+    )
+}
+
+/// `plan_budget` with an explicit token calibration. `target` is conversation tokens: callers
+/// holding a context-level budget subtract `calib.overhead` first.
+#[allow(clippy::too_many_arguments)]
+pub fn plan_budget_calibrated(
+    records: &[Value],
+    segs: &[Segment],
+    plans: &[SegPlan],
+    seg_parts: &[Vec<Vec<usize>>],
+    seg_keys: &[Vec<String>],
+    target: usize,
+    allow_summarize: bool,
+    allow_error_summarize: bool,
+    epochs: &HashMap<String, Option<String>>,
+    calib: &Calib,
+    summary_tokens: impl Fn(&str) -> Option<usize>,
+) -> BudgetPlan {
+    let tokens_of = |indices: &[usize]| calib.tokens(chars_of(records, indices));
+    // Fixed cost: head + every genuine user turn + pinned/tail segments kept whole + the preamble.
+    // Tail activity keeps its ceremony attachments; everything older loses them.
+    let mut fixed = PREAMBLE_EST_TOKENS;
     for (s, seg) in segs.iter().enumerate() {
-        fixed += tokens_of(records, &[seg.user_idx]);
+        fixed += calib.tokens(visible_chars(&records[seg.user_idx]));
         if plans[s].kept_verbatim {
-            fixed += tokens_of(records, &seg.activity);
+            fixed += if plans[s].tail {
+                calib.tokens(seg.activity.iter().map(|&i| visible_chars(&records[i])).sum())
+            } else {
+                tokens_of(&seg.activity)
+            };
+        }
+        for &p in &plans[s].pinned_parts {
+            fixed += calib.tokens(seg_parts[s][p].iter().map(|&i| visible_chars(&records[i])).sum());
         }
     }
 
@@ -674,7 +814,9 @@ pub fn plan_budget(
             continue;
         }
         for p in 0..parts.len() {
-            unit_meta.push((s, p));
+            if !plans[s].pinned_parts.contains(&p) {
+                unit_meta.push((s, p));
+            }
         }
     }
     let file_sets: Vec<HashSet<String>> = unit_meta
@@ -717,8 +859,8 @@ pub fn plan_budget(
                 salience += 0.3;
             }
         }
-        let verbatim = tokens_of(records, part);
-        let mask = mask_tokens_of(records, part).min(verbatim);
+        let verbatim = tokens_of(part);
+        let mask = calib.tokens(mask_chars_of(records, part)).min(verbatim);
         let summary = summary_tokens(&key).unwrap_or(400).min(mask);
         // Parts touching this tool's own prior summaries are epoch material: consolidatable only
         // when every record is synthetic AND its provenance resolves back to raw (the digest was
@@ -801,10 +943,17 @@ pub fn plan_budget(
     }
 }
 
-fn print_budget_plan(b: &BudgetPlan) {
+fn print_budget_plan(b: &BudgetPlan, calib: &Calib) {
     eprintln!(
-        "plan: target {} tokens, fixed {} (head + user turns + pinned/tail)",
-        b.target, b.fixed_tokens
+        "plan: target {} context tokens = {} conversation + ~{} system/tools ({})",
+        b.target + calib.overhead,
+        b.target,
+        calib.overhead,
+        calib.describe()
+    );
+    eprintln!(
+        "plan: fixed {} (head + user turns + pinned/tail + preamble); unit costs below are conversation tokens",
+        b.fixed_tokens
     );
     eprintln!(
         "  {:<8} {:<9} {:<10} {:>10} {:>10}  floor",
@@ -823,13 +972,13 @@ fn print_budget_plan(b: &BudgetPlan) {
     }
     if b.planned_total > b.target {
         eprintln!(
-            "plan: total {} tokens, {} OVER target — floors and fixed cost hold; this is the price of retention",
+            "plan: total {} conversation tokens, {} OVER target — floors and fixed cost hold; this is the price of retention",
             b.planned_total,
             b.planned_total - b.target
         );
     } else {
         eprintln!(
-            "plan: total {} tokens (target {})",
+            "plan: total {} conversation tokens (target {})",
             b.planned_total, b.target
         );
     }
@@ -841,7 +990,7 @@ fn print_budget_plan(b: &BudgetPlan) {
             .count();
         if n > 0 {
             eprintln!(
-                "plan: --summarize-errors active — {n} error-bearing unit(s) will be summarized; their summaries MUST preserve the error evidence verbatim"
+                "plan: {n} error-bearing unit(s) will be summarized; their error text is carried verbatim beneath the summary (--error-floor keeps them masked instead)"
             );
         }
     }
@@ -873,11 +1022,25 @@ pub fn cmd_extract(args: &[String]) -> i32 {
 
     let loaded = load_jsonl(&src);
     let total_in_file = loaded.len();
-    let (records, off_path) = select_active_for_units(loaded);
+    let (active, off_path) = select_active(loaded);
+    let calib = calibrate_opts(&active, &opts);
+    let records: Vec<Value> = active
+        .into_iter()
+        .filter(|r| !truthy(r, "recompactPreamble"))
+        .collect();
     let (head, segs) = segment(&records);
-    let plans = plan(&records, &segs, keep);
+    let mut plans = plan(&records, &segs, keep);
+    let seg_parts: Vec<Vec<Vec<usize>>> = segs
+        .iter()
+        .map(|sg| split_parts(&records, sg, split_threshold))
+        .collect();
+    apply_tail_budget(&records, &segs, &mut plans, &seg_parts, tail_budget(&opts));
+    let tokens_of = |idx: &mut dyn Iterator<Item = usize>| -> usize {
+        calib.tokens(idx.map(|i| visible_chars(&records[i])).sum())
+    };
 
     let mut needs_keys: Vec<String> = Vec::new();
+    let mut mechanical_keys: Vec<String> = Vec::new();
     let mut seg_json = Vec::new();
     for (s, seg) in segs.iter().enumerate() {
         // Map tool_use ids to names segment-wide so each result can be labeled with the tool
@@ -898,7 +1061,7 @@ pub fn cmd_extract(args: &[String]) -> i32 {
             }
         }
         let mut seen_results: HashSet<String> = HashSet::new();
-        let parts = split_parts(&records, seg, split_threshold);
+        let parts = &seg_parts[s];
         let split = parts.len() > 1;
 
         let mut parts_json: Vec<Value> = Vec::new();
@@ -920,20 +1083,24 @@ pub fn cmd_extract(args: &[String]) -> i32 {
                 activity.extend(render_record(&records[i], &tool_names, &mut seen_results));
             }
             let key = if split { format!("{s}.{p}") } else { s.to_string() };
+            let pinned = plans[s].kept_verbatim || plans[s].pinned_parts.contains(&p);
+            let empty = unit_is_empty(&records, part);
+            if plans[s].needs_summary && !pinned {
+                if empty {
+                    mechanical_keys.push(key.clone());
+                } else {
+                    needs_keys.push(key.clone());
+                }
+            }
             parts_json.push(json!({
                 "key": key,
+                "kept_verbatim": pinned,
+                "no_agent_activity": empty,
                 "covered_uuids": covered,
                 "content_hash": part_content_hash(&records, seg, part, p == 0),
-                "approx_tokens": approx_tokens(
-                    &part.iter().map(|&i| records[i].clone()).collect::<Vec<_>>()
-                ),
+                "approx_tokens": tokens_of(&mut part.iter().copied()),
                 "activity": activity,
             }));
-        }
-        if plans[s].needs_summary {
-            for pj in &parts_json {
-                needs_keys.push(pj["key"].as_str().unwrap_or_default().to_string());
-            }
         }
 
         let mut seg_obj = json!({
@@ -944,18 +1111,14 @@ pub fn cmd_extract(args: &[String]) -> i32 {
             "kept_verbatim": plans[s].kept_verbatim,
             "content_hash": segment_content_hash(&records, seg),
             "derived_index": segment_index(&records, &seg.activity),
-            "approx_tokens": approx_tokens(
-                &std::iter::once(seg.user_idx)
-                    .chain(seg.activity.iter().copied())
-                    .map(|i| records[i].clone())
-                    .collect::<Vec<_>>()
-            ),
+            "approx_tokens": tokens_of(&mut std::iter::once(seg.user_idx).chain(seg.activity.iter().copied())),
         });
-        if split {
+        if split || !plans[s].pinned_parts.is_empty() {
             seg_obj["parts"] = Value::Array(parts_json);
         } else if let Some(single) = parts_json.pop() {
             seg_obj["covered_uuids"] = single["covered_uuids"].clone();
             seg_obj["activity"] = single["activity"].clone();
+            seg_obj["no_agent_activity"] = single["no_agent_activity"].clone();
         }
         seg_json.push(seg_obj);
     }
@@ -979,10 +1142,12 @@ pub fn cmd_extract(args: &[String]) -> i32 {
         "total_records": records.len(),
         "off_path_dropped": off_path,
         "head_record_count": head.len(),
-        "approx_tokens_total": approx_tokens(&records),
+        "approx_tokens_total": calib.context_tokens(&records),
+        "token_calibration": calib.describe(),
         "keep_verbatim_last": keep,
         "split_threshold": split_threshold,
         "segments_needing_summary": needs_keys,
+        "segments_summarized_mechanically": mechanical_keys,
         "segments": seg_json,
     });
 
@@ -997,14 +1162,20 @@ pub fn cmd_extract(args: &[String]) -> i32 {
     }
 
     eprintln!(
-        "extract: {} records in file, {} on active path ({} off-path dropped) → {} segments ({} head, ~{} tokens). Summaries needed for {:?}. Worksheet: {}",
+        "extract: {} records in file, {} on active path ({} off-path dropped) → {} segments ({} head), context ~{} tokens ({}). Summaries needed for {:?}{}. Worksheet: {}",
         total_in_file,
         records.len(),
         off_path,
         segs.len(),
         head.len(),
-        approx_tokens(&records),
+        calib.context_tokens(&records),
+        calib.describe(),
         needs_keys,
+        if mechanical_keys.is_empty() {
+            String::new()
+        } else {
+            format!(" (plus {} with no agent activity, summarized mechanically)", mechanical_keys.len())
+        },
         out.display()
     );
     0
@@ -1118,6 +1289,8 @@ pub const MASK_ERROR_BUDGET: usize = 2000;
 /// tool_use input string fields above this length get head+tail truncated (a 50KB Write payload
 /// is on disk already; history only needs its shape).
 pub const MASK_INPUT_FIELD_MAX: usize = 2000;
+/// Characters of a masked result's head kept in its marker.
+pub const MASK_PREVIEW_CHARS: usize = 60;
 /// Non-error results at or under this length stay verbatim: a placeholder would not be smaller,
 /// and short results ("ok", a count, a path) are usually the load-bearing part of the exchange.
 pub const MASK_RESULT_MIN: usize = 500;
@@ -1189,7 +1362,16 @@ pub fn mask_record(r: &Value) -> Masked {
                         if chars <= MASK_RESULT_MIN {
                             continue; // short results stay verbatim; a placeholder would not be smaller
                         }
-                        format!("[recompact: elided {chars}-char result; rehydrate {sel} to recover it]")
+                        // A one-line head preview (ARC's stub design): enough to tell a git status
+                        // from a test log without spending a recall on it.
+                        let head: String = text
+                            .split_whitespace()
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                            .chars()
+                            .take(MASK_PREVIEW_CHARS)
+                            .collect();
+                        format!("[recompact: elided {chars}-char result, begins \"{head}…\"; rehydrate {sel} to recover it]")
                     };
                     if let Some(obj) = b.as_object_mut() {
                         obj.insert("content".into(), Value::String(replacement));
@@ -1266,6 +1448,164 @@ pub fn mask_record(r: &Value) -> Masked {
         Masked::Replaced(m)
     } else {
         Masked::Unchanged
+    }
+}
+
+/// Attachment types that are harness ceremony once their turn has passed: per-turn reminders,
+/// tool/skill/agent/environment announcements, and CLAUDE.md copies. Resume re-announces the
+/// current version of every stateful one — verified by resuming a twin with them stripped: the
+/// first new turn gained fresh `instructions`, `skill_listing`, `deferred_tools_delta`,
+/// `agent_listing_delta`, `mcp_instructions_delta`, `environment`, `model` and `date`
+/// attachments — so dropping old copies outside the keep tail loses nothing and swaps stale text
+/// for current text. Their rendered text is replayed on resume (removing 102 of them cut 18k real
+/// tokens from an 86k twin). Types not listed here are kept: human messages sent mid-turn arrive
+/// as `queued_command` attachments, and unknown types fail open.
+const CEREMONY_ATTACHMENTS: &[&str] = &[
+    "agent_listing_delta",
+    "auto_mode",
+    "auto_mode_exit",
+    "bash_output_audience_note",
+    "batching_reminder_sent",
+    "budget_usd",
+    "command_permissions",
+    "credential_org",
+    "date",
+    "date_change",
+    "deferred_tools_delta",
+    "diagnostics",
+    "edited_text_file",
+    "environment",
+    "hook_cancelled",
+    "hook_non_blocking_error",
+    "hook_success",
+    "hook_system_message",
+    "instructions",
+    "mcp_instructions_delta",
+    "model",
+    "nested_memory",
+    "output_style",
+    "output_style_instructions",
+    "prompt_snapshot",
+    "read_truncation_notice",
+    "remote_session_change",
+    "session_context",
+    "silent_turn_reminder",
+    "skill_listing",
+    "task_reminder",
+    "thinking_drop",
+    "todo_reminder",
+    "total_tokens_reminder",
+    "ultrathink_effort",
+];
+
+/// Marker that opens this tool's own SessionStart orientation; a stale one is ceremony too.
+pub const ORIENT_MARKER: &str = "[recompact orientation]";
+
+pub fn attachment_type(r: &Value) -> Option<&str> {
+    if rec_type(r) != "attachment" {
+        return None;
+    }
+    r.pointer("/attachment/type").and_then(|v| v.as_str())
+}
+
+pub fn is_ceremony(r: &Value) -> bool {
+    match attachment_type(r) {
+        Some(t) if CEREMONY_ATTACHMENTS.contains(&t) => true,
+        Some("hook_additional_context") => {
+            serde_json::to_string(r.get("attachment").unwrap_or(&Value::Null))
+                .map_or(false, |s| s.contains(ORIENT_MARKER))
+        }
+        _ => false,
+    }
+}
+
+/// A message the human typed while the agent was working. Claude Code delivers it as a
+/// `queued_command` attachment rather than a user record, so it is the only model-visible copy
+/// of that instruction ("lets not land anything yet, keep unmerged" was one): it must survive
+/// every treatment verbatim, exactly like a user turn. Messages from peer agents carry
+/// `origin.kind: "peer"` and `isMeta`, and are delivered content like any other.
+pub fn is_human_queued(r: &Value) -> bool {
+    attachment_type(r) == Some("queued_command")
+        && r.pointer("/attachment/commandMode").and_then(|v| v.as_str()) == Some("prompt")
+        && !r
+            .pointer("/attachment/isMeta")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        && r.pointer("/attachment/origin/kind")
+            .and_then(|v| v.as_str())
+            .map_or(true, |k| k == "human")
+}
+
+pub fn human_queued_text(r: &Value) -> String {
+    match r.pointer("/attachment/prompt") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Emission-time trimming, applied to every record assemble copies:
+/// - persisted thinking is removed everywhere. It never reaches the model on resume (Claude Code
+///   strips it; two resumes differing only in thinking hit the same prompt cache), and a thinking
+///   block replayed after rewritten history is exactly what strict preserved-thinking checks
+///   reject;
+/// - outside the keep tail, ceremony attachments are dropped (see `CEREMONY_ATTACHMENTS`).
+pub fn trim_record(r: &Value, outside_tail: bool) -> Masked {
+    if outside_tail && is_ceremony(r) {
+        return Masked::Dropped;
+    }
+    let has_thinking = r
+        .pointer("/message/content")
+        .and_then(|c| c.as_array())
+        .is_some_and(|a| {
+            a.iter().any(|b| {
+                matches!(
+                    b.get("type").and_then(|v| v.as_str()),
+                    Some("thinking") | Some("redacted_thinking")
+                )
+            })
+        });
+    if !has_thinking {
+        return Masked::Unchanged;
+    }
+    let mut m = r.clone();
+    if let Some(blocks) = m.pointer_mut("/message/content").and_then(|c| c.as_array_mut()) {
+        blocks.retain(|b| {
+            !matches!(
+                b.get("type").and_then(|v| v.as_str()),
+                Some("thinking") | Some("redacted_thinking")
+            )
+        });
+        if blocks.is_empty() {
+            return Masked::Dropped;
+        }
+    }
+    if let Some(obj) = m.as_object_mut() {
+        obj.insert("recompactThinkingStripped".into(), Value::Bool(true));
+    }
+    Masked::Replaced(m)
+}
+
+/// Push a record through trimming, then (for the mask lane) masking.
+fn emit_trimmed(out: &mut Vec<Value>, r: &Value, outside_tail: bool, mask: bool) {
+    let trimmed = match trim_record(r, outside_tail) {
+        Masked::Dropped => return,
+        Masked::Unchanged => None,
+        Masked::Replaced(v) => Some(v),
+    };
+    let base = trimmed.as_ref().unwrap_or(r);
+    if !mask {
+        out.push(base.clone());
+        return;
+    }
+    match mask_record(base) {
+        Masked::Unchanged => out.push(base.clone()),
+        Masked::Replaced(v) => out.push(v),
+        Masked::Dropped => {}
     }
 }
 
@@ -1400,9 +1740,199 @@ pub fn cmd_assemble(args: &[String]) -> i32 {
     }
 }
 
+/// Summary for a unit in which no agent acted (system notices, resume scaffolding). A model asked
+/// to summarize nothing returns nothing, and one such unit used to abort a whole `continue` run
+/// after every other summary had been paid for.
+pub const EMPTY_UNIT_SUMMARY: &str =
+    "(No agent actions in this span: only harness records such as system notices or resume scaffolding.)";
+
+/// Does this unit contain anything an agent said or did?
+pub fn unit_is_empty(records: &[Value], part: &[usize]) -> bool {
+    part.iter().all(|&i| {
+        let r = &records[i];
+        if truthy(r, "recompactSynthetic")
+            || truthy(r, "isCompactSummary")
+            || is_human_queued(r)
+            || delivered_kind(r).is_some()
+        {
+            return false;
+        }
+        match content(r) {
+            Some(Value::Array(blocks)) => !blocks.iter().any(|b| {
+                match b.get("type").and_then(|v| v.as_str()) {
+                    Some("text") => {
+                        rec_type(r) == "assistant"
+                            && b.get("text").and_then(|t| t.as_str()).is_some_and(|t| !t.trim().is_empty())
+                    }
+                    Some("tool_use") | Some("tool_result") | Some("image") => true,
+                    _ => false,
+                }
+            }),
+            Some(Value::String(t)) => rec_type(r) != "assistant" || t.trim().is_empty(),
+            _ => true,
+        }
+    })
+}
+
+/// This plugin's own skill body, injected when /recompact is invoked (~21k chars of procedure).
+/// Once the compaction it drove has run, it is pure weight — and left in the tail it makes the
+/// resumed model's most recent "instruction" the compaction procedure itself.
+pub fn is_own_skill_body(r: &Value) -> bool {
+    rec_type(r) == "user"
+        && truthy(r, "isMeta")
+        && first_text(r).is_some_and(|t| {
+            t.starts_with("Base directory for this skill:") && t.contains("skills/recompact")
+        })
+}
+
+/// The model-visible selector line closing every summary. The uuid prefix is the summary
+/// record's own, which survives every later generation unchanged and resolves project-wide, so
+/// `recall` never needs to know which file the reader is in. Part keys alone did not: all five
+/// real recall calls in the month before this change used one, and all five failed.
+pub fn summary_footer(key: &str, uuid: &str) -> String {
+    format!("[recompact summary {key} · recall {}]", uuid.get(..8).unwrap_or(uuid))
+}
+
+/// Bring an inherited summary's footer to the current form, idempotently. Only the footer line
+/// is touched; summary prose is never rewritten.
+fn upgrade_footer(r: &mut Value) {
+    let key = r
+        .pointer("/recompactProvenance/part")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let uuid = rec_uuid(r).unwrap_or("").to_string();
+    let Some(slot) = r.pointer_mut("/message/content/0/text") else {
+        return;
+    };
+    let Some(text) = slot.as_str().map(str::to_string) else {
+        return;
+    };
+    if text.contains(" · recall ") {
+        return;
+    }
+    let body = match text.rfind("\n[recompact summary ") {
+        Some(i) if text[i..].contains("rehydratable]") => text[..i].to_string(),
+        _ => text,
+    };
+    *slot = Value::String(format!("{body}\n{}", summary_footer(&key, &uuid)));
+}
+
+/// Mechanical additions beneath a summary: files the unit changed, its errors verbatim, and the
+/// identifiers later turns still use. Each line is only emitted for what the summary text does
+/// not already contain.
+pub fn augment_summary(
+    records: &[Value],
+    part: &[usize],
+    summary: &str,
+    mentions: &Mentions,
+    root: Option<&str>,
+) -> String {
+    let rel = |p: &str| -> String {
+        root.and_then(|r| p.strip_prefix(r))
+            .map(|x| x.trim_start_matches('/').to_string())
+            .filter(|x| !x.is_empty())
+            .unwrap_or_else(|| p.to_string())
+    };
+    let mut out = summary.trim_end().to_string();
+    let idx = segment_index(records, part);
+    if let Some(files) = idx["files"].as_object() {
+        let changed: Vec<String> = files
+            .iter()
+            .filter(|(_, roles)| {
+                roles
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|x| x == "edited" || x == "written"))
+            })
+            .map(|(p, _)| p.clone())
+            .filter(|p| {
+                let base = p.rsplit('/').next().unwrap_or(p);
+                !summary.contains(base)
+            })
+            .collect();
+        if !changed.is_empty() {
+            let shown: Vec<String> = changed.iter().take(8).map(|p| format!("`{}`", rel(p))).collect();
+            let more = changed.len().saturating_sub(8);
+            out.push_str(&format!(
+                "\n⟨carried⟩ files changed: {}{}",
+                shown.join(", "),
+                if more > 0 { format!(", +{more} more") } else { String::new() }
+            ));
+        }
+    }
+    for (tool, err) in error_evidence(records, part, 3, 300) {
+        let probe: String = err.chars().take(40).collect();
+        if !summary.contains(probe.trim()) {
+            out.push_str(&format!("\n⟨carried⟩ error from {tool}: {err}"));
+        }
+    }
+    let anchors = hindsight_anchors(records, part, mentions, &out, 12, 480);
+    if !anchors.is_empty() {
+        let shown: Vec<String> = anchors.iter().map(|a| format!("`{}`", rel(a))).collect();
+        out.push_str(&format!("\n⟨carried⟩ used later: {}", shown.join(", ")));
+    }
+    out
+}
+
+/// ACE's "context collapse": a ledger rewritten wholesale sheds items a pass at a time. Warn when
+/// a new ledger drops identifiers the previous one carried, so the drop is a decision, not drift.
+fn ledger_collapse_warning(records: &[Value], new_ledger: &str) {
+    let Some(old) = records
+        .iter()
+        .rev()
+        .find(|r| truthy(r, "recompactLedger"))
+        .and_then(|r| r.pointer("/message/content/0/text").and_then(|v| v.as_str()))
+    else {
+        return;
+    };
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    identifiers(old, &mut a);
+    identifiers(new_ledger, &mut b);
+    let kept: HashSet<&String> = b.iter().collect();
+    let mut dropped: Vec<&String> = a.iter().filter(|x| !kept.contains(x)).collect();
+    dropped.sort();
+    dropped.dedup();
+    if !dropped.is_empty() {
+        let shown: Vec<String> = dropped.iter().take(12).map(|x| format!("`{x}`")).collect();
+        eprintln!(
+            "warning: the new ledger drops {} identifier(s) the previous ledger carried: {}{} — confirm they are obsolete",
+            dropped.len(),
+            shown.join(", "),
+            if dropped.len() > 12 { ", …" } else { "" }
+        );
+    }
+}
+
+/// The session's display title, carried to the twin with a generation suffix. Twins used to carry
+/// none, so `claude --resume "<title>"` silently reopened the uncompacted original.
+fn title_record(records: &[Value], new_session: &str, generation: u64) -> Option<Value> {
+    let title = records.iter().rev().find_map(|r| match rec_type(r) {
+        "custom-title" => r.get("customTitle").and_then(|v| v.as_str()),
+        "agent-name" => r.get("agentName").and_then(|v| v.as_str()),
+        _ => None,
+    });
+    let title = title.or_else(|| {
+        records
+            .iter()
+            .rev()
+            .find(|r| rec_type(r) == "ai-title")
+            .and_then(|r| r.get("aiTitle").and_then(|v| v.as_str()))
+    })?;
+    let base = match title.rfind(" (recompact") {
+        Some(i) if title.ends_with(')') => &title[..i],
+        _ => title,
+    };
+    Some(json!({
+        "type": "custom-title",
+        "customTitle": format!("{base} (recompact {generation})"),
+        "sessionId": new_session,
+    }))
+}
+
 /// Core of assemble, returning the new session id and output path (None for --plan previews).
 fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     let (pos, opts) = parse_opts(args);
+    let flag = |k: &str| opts.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
     let mode = opts
         .get("mode")
         .and_then(|v| v.as_str())
@@ -1429,28 +1959,48 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         .get("target")
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<usize>().ok());
-    let plan_only = opts.get("plan").and_then(|v| v.as_bool()).unwrap_or(false);
+    let plan_only = flag("plan");
     if plan_only && target.is_none() {
         eprintln!("error: --plan requires --target <tokens>");
         return Err(2);
     }
-    let allow_error_summarize = opts
-        .get("summarize-errors")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if allow_error_summarize && target.is_none() {
-        eprintln!("error: --summarize-errors requires --target <tokens>");
-        return Err(2);
-    }
-    let epochs_on = opts.get("epochs").and_then(|v| v.as_bool()).unwrap_or(false)
-        && target.is_some();
+    // Error-bearing units summarize by default: their error text rides beneath the summary
+    // verbatim. `--summarize-errors` (the old opt-in) is accepted and now a no-op;
+    // `--error-floor` restores the hard floor at mask.
+    let allow_error_summarize = !flag("error-floor");
+    // Content hashes of units a summarizer was asked for and never covered (continue writes
+    // them): those mask instead of failing the run. Only those — a unit that appeared because
+    // the session grew mid-run must still fail validation, so continue re-syncs and summarizes it.
+    let mask_units: HashSet<String> = opts
+        .get("mask-units")
+        .and_then(|v| v.as_str())
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let epochs_on = flag("epochs") && target.is_some();
 
-    let loaded = load_jsonl(&src);
+    let (active, _off_path) = select_active(load_jsonl(&src));
+    let calib = calibrate_opts(&active, &opts);
+    let prior_preamble = active
+        .iter()
+        .rev()
+        .find(|r| truthy(r, "recompactPreamble"))
+        .cloned();
     // Old orientation preambles are pure boilerplate for the PREVIOUS generation; strip them
     // wholesale (and mint a fresh one below), the same way every unit-hashing path must.
-    let (records, _off_path) = select_active_for_units(loaded);
+    let records: Vec<Value> = active
+        .into_iter()
+        .filter(|r| !truthy(r, "recompactPreamble"))
+        .collect();
     let (head, segs) = segment(&records);
-    let plans = plan_ex(&records, &segs, keep, epochs_on);
+    let mut plans = plan_ex(&records, &segs, keep, epochs_on);
+    let seg_parts: Vec<Vec<Vec<usize>>> = segs
+        .iter()
+        .map(|sg| split_parts(&records, sg, split_threshold))
+        .collect();
+    apply_tail_budget(&records, &segs, &mut plans, &seg_parts, tail_budget(&opts));
 
     let summaries: Value = if mode == "summarize" {
         let summaries_path = PathBuf::from(&pos[1]);
@@ -1472,12 +2022,9 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     // Summary cache keyed by content hash: on a repeated recompaction of a continued session,
     // unchanged segments (or parts of split segments) resolve from the cache and only new
     // material needs fresh work.
-    let seg_parts: Vec<Vec<Vec<usize>>> = segs
-        .iter()
-        .map(|sg| split_parts(&records, sg, split_threshold))
-        .collect();
     let mut key_hashes: HashMap<String, String> = HashMap::new();
     let mut seg_keys: Vec<Vec<String>> = Vec::new();
+    let mut empty_units: HashSet<String> = HashSet::new();
     for (s, seg) in segs.iter().enumerate() {
         let parts = &seg_parts[s];
         let split = parts.len() > 1;
@@ -1485,6 +2032,9 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         for (p, part) in parts.iter().enumerate() {
             let key = if split { format!("{s}.{p}") } else { s.to_string() };
             key_hashes.insert(key.clone(), part_content_hash(&records, seg, part, p == 0));
+            if unit_is_empty(&records, part) {
+                empty_units.insert(key.clone());
+            }
             keys.push(key);
         }
         seg_keys.push(keys);
@@ -1497,71 +2047,89 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
-    let get_summary = |key: &str| -> Option<String> {
+    // (text, source): source is "provided", "cache", or "mechanical".
+    let resolve = |key: &str| -> Option<(String, &'static str)> {
         summaries
             .get(key)
             .and_then(|v| v.as_str())
-            .map(String::from)
+            .map(|s| (s.to_string(), "provided"))
             .or_else(|| {
                 key_hashes
                     .get(key)
                     .and_then(|h| cache.get(h))
                     .and_then(|v| v.as_str())
-                    .map(String::from)
+                    .map(|s| (s.to_string(), "cache"))
+            })
+            .or_else(|| {
+                empty_units
+                    .contains(key)
+                    .then(|| (EMPTY_UNIT_SUMMARY.to_string(), "mechanical"))
             })
     };
 
     // With --target, the planner decides per-unit treatments; the budget is an objective, the
-    // salience floors are constraints, and floors win.
+    // salience floors are constraints, and floors win. The target is context tokens (what
+    // /context shows); the planner works in conversation tokens.
     let epoch_map = if epochs_on {
         epoch_digests(&records, &segs, &seg_parts, &seg_keys, keep)
     } else {
         HashMap::new()
     };
     let budget: Option<BudgetPlan> = target.map(|t| {
-        plan_budget(
+        plan_budget_calibrated(
             &records,
             &segs,
             &plans,
             &seg_parts,
             &seg_keys,
-            t,
+            t.saturating_sub(calib.overhead),
             mode == "summarize",
             allow_error_summarize,
             &epoch_map,
-            |key| get_summary(key).map(|s| s.len() / 4 + 60),
+            &calib,
+            |key| resolve(key).map(|(s, _)| calib.tokens(s.len()) + 60),
         )
     });
     if plan_only {
-        print_budget_plan(budget.as_ref().expect("checked above"));
+        print_budget_plan(budget.as_ref().expect("checked above"), &calib);
         return Ok(None); // preview only: nothing validated, nothing written
     }
-    let treatments: Option<HashMap<String, Treatment>> = budget
+    let mut treatments: Option<HashMap<String, Treatment>> = budget
         .as_ref()
         .map(|b| b.units.iter().map(|u| (u.key.clone(), u.treatment)).collect());
 
-    // Validate: every segment (or part) that needs a summary has one (masking needs none).
-    let mut cache_hits = 0usize;
+    // Validate: every unit that will be summarized has a summary (masking needs none).
+    let mut fallbacks: Vec<String> = Vec::new();
     if let Some(b) = &budget {
-        if !b.need_summaries.is_empty() {
+        let (maskable, missing): (Vec<String>, Vec<String>) = b
+            .need_summaries
+            .iter()
+            .cloned()
+            .partition(|k| key_hashes.get(k).is_some_and(|h| mask_units.contains(h)));
+        if !missing.is_empty() {
             eprintln!(
-                "error: the --target plan needs summaries for {:?}; run with --plan to preview, then provide them",
-                b.need_summaries
+                "error: the --target plan needs summaries for {missing:?}; run with --plan to preview, then provide them"
             );
             return Err(1);
+        }
+        if !maskable.is_empty() {
+            if let Some(tr) = treatments.as_mut() {
+                for k in &maskable {
+                    tr.insert(k.clone(), Treatment::Mask);
+                }
+            }
+            eprintln!("warning: no summary for {maskable:?}; masking those units instead");
+            fallbacks = maskable;
         }
     } else if mode == "summarize" {
         let mut missing: Vec<String> = Vec::new();
         for (s, p) in plans.iter().enumerate() {
-            if p.needs_summary {
-                for key in &seg_keys[s] {
-                    if summaries.get(key).and_then(|v| v.as_str()).is_some() {
-                        // explicit summary
-                    } else if key_hashes.get(key).and_then(|h| cache.get(h)).is_some() {
-                        cache_hits += 1;
-                    } else {
-                        missing.push(key.clone());
-                    }
+            if !p.needs_summary {
+                continue;
+            }
+            for (pi, key) in seg_keys[s].iter().enumerate() {
+                if !p.pinned_parts.contains(&pi) && resolve(key).is_none() {
+                    missing.push(key.clone());
                 }
             }
         }
@@ -1579,6 +2147,9 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     } else {
         None
     };
+    if let Some(l) = &ledger_text {
+        ledger_collapse_warning(&records, l);
+    }
     let drop_old_ledgers = ledger_text.is_some();
 
     let new_session = uuid_v4();
@@ -1604,6 +2175,9 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         .and_then(|v| v.as_str())
         .unwrap_or("claude-opus-4-7")
         .to_string();
+    let mentions = Mentions::build(&records);
+    // Carried paths are shown relative to the directory the session's edits share.
+    let path_root = session_path_root(&records);
 
     // Shared builder for synthetic summary records (classic mode and budget-planned units).
     let make_synthetic = |seg: &Segment, part: &[usize], key: &str, first: bool, summary: String| -> Value {
@@ -1622,12 +2196,18 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
                 covered.push(Value::String(u.to_string()));
             }
         }
+        let uuid = uuid_v4();
+        let text = format!(
+            "{}\n{}",
+            augment_summary(&records, part, &summary, &mentions, path_root.as_deref()),
+            summary_footer(key, &uuid)
+        );
         json!({
             "parentUuid": Value::Null,            // fixed up in the rechain pass
             "isSidechain": false,
             "userType": "external",
             "type": "assistant",
-            "uuid": uuid_v4(),
+            "uuid": uuid,
             "timestamp": ts,
             "sessionId": new_session,
             "cwd": cwd,
@@ -1647,46 +2227,49 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
                 "model": model,
                 "type": "message",
                 "stop_reason": "end_turn",
-                // The footer is the summary's model-visible selector: uuids and part keys live in
-                // the record envelope, which is never shown at inference time, so without this a
-                // resumed model cannot address the summary it is reading.
-                "content": [{ "type": "text", "text": format!("{summary}\n[recompact summary {key} — rehydratable]") }]
+                "content": [{ "type": "text", "text": text }]
             }
         })
     };
 
-    // Orientation preamble: the one paragraph every model resumed into this file is guaranteed
-    // to see. Everything else about the compaction (uuids, provenance, part keys) is envelope
-    // metadata invisible at inference time — this record is where a fresh agent learns that
-    // summaries are summaries, that elisions are recoverable, and which commands do it.
-    // It is emitted LAST (see the push after the segment loop): a resumed model reads it
-    // immediately before its own first turn, with nothing in between to displace it.
-    let project_dir = src
-        .canonicalize()
-        .unwrap_or(src.clone())
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let preamble_text = format!(
-        "This transcript was compacted by segment_recompact; you may be a fresh session resumed \
-         into it. How to read it:\n\
-         - Assistant blocks recapping past work in past tense are compaction SUMMARIES of real \
-         turns; each ends with \"[recompact summary <key> — rehydratable]\".\n\
-         - Markers like \"[recompact: elided ...; rehydrate <prefix>]\" are mechanically removed \
-         payloads (bulky tool results, old screenshots). Nothing is lost: originals live in \
-         untouched source transcripts.\n\
-         - Recover anything verbatim before re-deriving or re-searching it. Prefer the `recall` \
-         tool if you have it (the plugin serves one): pass the selector, no file path needed. \
-         Otherwise run `recompact rehydrate {new_session}.jsonl <selector>` in {project_dir}. The \
-         selector is a summary key or a uuid prefix from a marker; resolution follows provenance \
-         across all compaction generations, and uuid prefixes resolve across every session in the \
-         project. Either form with no selector lists every summary.\n\
-         - `recompact scan` shows this project's sessions, sizes, and lineage. If this session \
-         grows large, `recompact continue <session-id> --summarize-with haiku` compacts it \
-         (writes a fresh twin; originals are never modified). Under `recompact shell`, exiting \
-         with code 143 (SIGTERM) triggers automatic recompact-and-respawn.\n\
-         Source session: {orig_session_id}."
-    );
+    // Orientation preamble: the one message every model resumed into this file is guaranteed to
+    // see, emitted LAST — the recency peak, immediately before the resumed model's own first
+    // turn. It carries a mechanical brief of where the work stood (files, git, PRs, the user's
+    // standing instructions verbatim), because the envelope (uuids, provenance, snapshots) is
+    // never shown at inference time.
+    let last_cwd = records
+        .iter()
+        .rev()
+        .find_map(|r| r.get("cwd").and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_string();
+    let snapshot = git_snapshot(&last_cwd);
+    let generation = prior_preamble
+        .as_ref()
+        .and_then(|p| p.get("recompactGeneration").and_then(|v| v.as_u64()))
+        .map(|g| g + 1)
+        .unwrap_or_else(|| {
+            if records
+                .iter()
+                .any(|r| truthy(r, "recompactSynthetic") || truthy(r, "recompactMasked"))
+            {
+                2
+            } else {
+                1
+            }
+        });
+    let assembled_at = now_unix();
+    let preamble_text = preamble_text(&PreambleInput {
+        path_root: path_root.as_deref(),
+        new_session: &new_session,
+        source_session: &orig_session_id,
+        generation,
+        assembled_at,
+        snapshot: snapshot.as_ref(),
+        brief: state_brief(&records),
+        constraints: constraint_lane(&records),
+        last_check: last_check(&records),
+    });
     let preamble = json!({
         "parentUuid": Value::Null,
         "isSidechain": false,
@@ -1701,6 +2284,11 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         "gitBranch": git_branch,
         "version": version,
         "recompactPreamble": true,
+        "recompactAssembledAt": assembled_at,
+        "recompactGeneration": generation,
+        "recompactSource": {"sessionId": orig_session_id, "path": src_abs},
+        "recompactSnapshot": snapshot.clone().unwrap_or(Value::Null),
+        "recompactCalibration": json!({"model": calib.model}),
         "message": {
             "id": format!("msg_recompact_{}", uuid_v4().replace('-', "")),
             "role": "assistant",
@@ -1711,15 +2299,17 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         }
     });
 
+    let keep_rec = |i: usize| -> bool {
+        rec_uuid(&records[i]).is_some()
+            && !(drop_old_ledgers && truthy(&records[i], "recompactLedger"))
+            && !is_own_skill_body(&records[i])
+    };
     let mut out: Vec<Value> = Vec::new();
 
     // Head: keep only records that carry a uuid (drop ephemeral scaffolding like queue-operation).
     for &i in &head {
-        if drop_old_ledgers && truthy(&records[i], "recompactLedger") {
-            continue; // superseded by the new ledger
-        }
-        if rec_uuid(&records[i]).is_some() {
-            out.push(records[i].clone());
+        if keep_rec(i) {
+            emit_trimmed(&mut out, &records[i], true, false);
         }
     }
 
@@ -1752,15 +2342,17 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         })
     });
 
+    let (mut n_provided, mut n_cache, mut n_mech) = (0usize, 0usize, 0usize);
     for (s, seg) in segs.iter().enumerate() {
         if s == tail_start {
             if let Some(l) = ledger_pending.take() {
                 out.push(l);
             }
         }
+        let outside = s < tail_start;
         // User turns are pinned, but their embedded screenshots are not: outside the keep tail
         // the image bytes give way to markers (text verbatim; the original retains the pixels).
-        if s < tail_start {
+        if outside {
             match elide_images(&records[seg.user_idx]) {
                 Some(v) => out.push(v),
                 None => out.push(records[seg.user_idx].clone()),
@@ -1770,69 +2362,49 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         }
         if plans[s].kept_verbatim {
             for &i in &seg.activity {
-                if drop_old_ledgers && truthy(&records[i], "recompactLedger") {
-                    continue;
-                }
-                if rec_uuid(&records[i]).is_some() {
-                    out.push(records[i].clone());
+                if keep_rec(i) {
+                    emit_trimmed(&mut out, &records[i], outside, false);
                 }
             }
-        } else if let Some(tr) = &treatments {
-            // Budget-planned emission: each unit gets exactly the treatment the plan chose.
-            for (p, part) in seg_parts[s].iter().enumerate() {
-                let key = &seg_keys[s][p];
-                match tr.get(key.as_str()).copied().unwrap_or(Treatment::Verbatim) {
-                    Treatment::Verbatim => {
-                        for &i in part {
-                            if drop_old_ledgers && truthy(&records[i], "recompactLedger") {
-                                continue;
-                            }
-                            if rec_uuid(&records[i]).is_some() {
-                                out.push(records[i].clone());
-                            }
+            continue;
+        }
+        for (p, part) in seg_parts[s].iter().enumerate() {
+            let key = &seg_keys[s][p];
+            let pinned = plans[s].pinned_parts.contains(&p);
+            let treatment = if pinned || !plans[s].needs_summary {
+                Treatment::Verbatim
+            } else if let Some(tr) = &treatments {
+                tr.get(key.as_str()).copied().unwrap_or(Treatment::Verbatim)
+            } else if mode == "mask" {
+                Treatment::Mask
+            } else {
+                Treatment::Summarize
+            };
+            match treatment {
+                Treatment::Verbatim | Treatment::Mask => {
+                    for &i in part {
+                        if keep_rec(i) {
+                            emit_trimmed(&mut out, &records[i], !pinned, treatment == Treatment::Mask);
                         }
                     }
-                    Treatment::Mask => {
-                        for &i in part {
-                            if drop_old_ledgers && truthy(&records[i], "recompactLedger") {
-                                continue;
-                            }
-                            if rec_uuid(&records[i]).is_some() {
-                                match mask_record(&records[i]) {
-                                    Masked::Unchanged => out.push(records[i].clone()),
-                                    Masked::Replaced(v) => out.push(v),
-                                    Masked::Dropped => {}
-                                }
-                            }
+                }
+                Treatment::Summarize => {
+                    let (text, source) = resolve(key).expect("validated above");
+                    match source {
+                        "provided" => n_provided += 1,
+                        "cache" => n_cache += 1,
+                        _ => n_mech += 1,
+                    }
+                    // One synthetic record per part, carrying provenance to the exact raw records
+                    // it replaced, so recall can recover the verbatim originals.
+                    out.push(make_synthetic(seg, part, key, p == 0, text));
+                    // What the human typed mid-turn is a user turn in all but record type.
+                    for &i in part {
+                        if is_human_queued(&records[i]) {
+                            out.push(records[i].clone());
                         }
                     }
-                    Treatment::Summarize => {
-                        out.push(make_synthetic(seg, part, key, p == 0, get_summary(key).unwrap()));
-                    }
                 }
-            }
-        } else if plans[s].needs_summary && mode == "mask" {
-            // Mechanical lane: keep every record, elide stale tool-result payloads. Pairs stay
-            // atomic (both halves kept), so the structure the Messages API validates is intact.
-            for &i in &seg.activity {
-                if drop_old_ledgers && truthy(&records[i], "recompactLedger") {
-                    continue;
-                }
-                if rec_uuid(&records[i]).is_some() {
-                    match mask_record(&records[i]) {
-                        Masked::Unchanged => out.push(records[i].clone()),
-                        Masked::Replaced(v) => out.push(v),
-                        Masked::Dropped => {}
-                    }
-                }
-            }
-        } else if plans[s].needs_summary {
-            // One synthetic record per part (oversized segments split at delegation seams), each
-            // carrying provenance to the exact raw records it replaced, so `rehydrate` (or any
-            // future agent) can recover the verbatim originals from the untouched source.
-            for (p, part) in seg_parts[s].iter().enumerate() {
-                let key = &seg_keys[s][p];
-                out.push(make_synthetic(seg, part, key, p == 0, get_summary(key).unwrap()));
             }
         }
     }
@@ -1840,33 +2412,15 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     if let Some(l) = ledger_pending.take() {
         out.push(l); // keep >= segment count: the ledger still lands, at the end
     }
-    // The preamble closes the file — the recency-peak position, and the only one that survives a
-    // long transcript intact. It follows a completed turn (or the head, on a segment-less file),
-    // so it never lands between a tool_use and its tool_result.
+    // The preamble closes the file. It follows a completed turn (or the head, on a segment-less
+    // file), so it never lands between a tool_use and its tool_result.
     out.push(preamble);
 
-    // Summaries inherited from older generations predate the model-visible footer; annotate them
-    // at emission so every summary in the output names its selector. Idempotent and additive —
-    // the summary prose itself is never rewritten.
+    // Summaries inherited from older generations carry older footers (or none); bring every one
+    // to the current selector form. Idempotent, and the summary prose itself is never rewritten.
     for r in out.iter_mut() {
-        if !truthy(r, "recompactSynthetic") {
-            continue;
-        }
-        let key = r
-            .pointer("/recompactProvenance/part")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        if let (Some(key), Some(text)) = (
-            key,
-            r.pointer_mut("/message/content/0/text").and_then(|v| {
-                let s = v.as_str().map(str::to_string);
-                s.map(|s| (v, s))
-            }),
-        ) {
-            let (slot, s) = text;
-            if !s.contains("[recompact summary ") {
-                *slot = Value::String(format!("{s}\n[recompact summary {key} — rehydratable]"));
-            }
+        if truthy(r, "recompactSynthetic") {
+            upgrade_footer(r);
         }
     }
 
@@ -1881,6 +2435,9 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         if let Some(obj) = r.as_object_mut() {
             if obj.contains_key("sessionId") {
                 obj.insert("sessionId".into(), Value::String(new_session.clone()));
+            }
+            if obj.contains_key("session_id") {
+                obj.insert("session_id".into(), Value::String(new_session.clone()));
             }
             // Strip stale `usage` metadata. `/context` reads the most recent assistant message's
             // usage (cache_read + cache_creation + input) rather than re-tokenizing — so verbatim
@@ -1900,6 +2457,9 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     }
     let leaf = prev.clone().unwrap_or_default();
 
+    if let Some(t) = title_record(&records, &new_session, generation) {
+        out.push(t);
+    }
     // Fresh last-prompt tail pointing at the new leaf.
     let last_prompt = last_prompt_text(&records)
         .or_else(|| segs.last().map(|seg| user_text(&records[seg.user_idx])))
@@ -1947,15 +2507,14 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     // Persist explicitly-provided summaries into the cache, keyed by content hash, so the next
     // recompaction of this (continued) session reuses them for unchanged segments.
     if let Some(cp) = &cache_path {
-        let mut cache = cache;
-        for (s, pl) in plans.iter().enumerate() {
-            if pl.needs_summary {
-                for key in &seg_keys[s] {
-                    if let Some(text) = summaries.get(key).and_then(|v| v.as_str()) {
-                        if let Some(h) = key_hashes.get(key) {
-                            cache.insert(h.clone(), Value::String(text.to_string()));
-                        }
-                    }
+        let mut cache = cache.clone();
+        for keys in &seg_keys {
+            for key in keys {
+                if let (Some(text), Some(h)) = (
+                    summaries.get(key).and_then(|v| v.as_str()),
+                    key_hashes.get(key),
+                ) {
+                    cache.insert(h.clone(), Value::String(text.to_string()));
                 }
             }
         }
@@ -1970,16 +2529,59 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         }
     }
 
+    let mut turn_of_record = vec![0usize; records.len()];
+    for (s, seg) in segs.iter().enumerate() {
+        turn_of_record[seg.user_idx] = s + 1;
+        for &i in &seg.activity {
+            turn_of_record[i] = s + 1;
+        }
+    }
+    let (kept_ids, total_ids, missing_ids) = retention(
+        &mentions,
+        &visible_identifiers(&out, &mentions.vocab),
+        &|i| turn_of_record.get(i).copied().unwrap_or(0),
+    );
+    let pinned_tail: usize = plans.iter().map(|p| p.pinned_parts.len()).sum();
     eprintln!(
-        "assemble ({mode}): {} → {} records (~{} → ~{} tokens, keep last {} verbatim, {} summaries from cache).\n  new sessionId: {}\n  wrote: {}",
+        "assemble ({mode}): {} → {} records; context ~{} → ~{} tokens ({})",
         records.len(),
         out.len(),
-        approx_tokens(&records),
-        approx_tokens(&out),
-        keep,
-        cache_hits,
+        calib.context_tokens(&records),
+        calib.context_tokens(&out),
+        calib.describe()
+    );
+    eprintln!(
+        "  summaries: {n_provided} provided, {n_cache} from cache, {n_mech} mechanical{}; last {keep} turn(s) verbatim{}",
+        if fallbacks.is_empty() {
+            String::new()
+        } else {
+            format!(", {} masked for lack of one", fallbacks.len())
+        },
+        if pinned_tail > 0 {
+            format!(" (the oversized tail keeps its newest {pinned_tail} part(s); --tail-budget adjusts)")
+        } else {
+            String::new()
+        }
+    );
+    if total_ids > 0 {
+        eprintln!(
+            "  retention: {kept_ids}/{total_ids} cross-referenced identifiers still visible ({:.1}%){}",
+            100.0 * kept_ids as f64 / total_ids as f64,
+            if missing_ids.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; recall-only, e.g. {}",
+                    missing_ids.iter().map(|m| format!("`{}`", truncate(m, 40))).collect::<Vec<_>>().join(", ")
+                )
+            }
+        );
+    }
+    eprintln!(
+        "  new sessionId: {}\n  wrote: {}\n  resume with: {}",
         new_session,
-        out_path.display()
+        out_path.display(),
+        resume_command(&new_session, &resume_flags(&records))
     );
     // Record lineage next to the sessions themselves, so resolution needs no global state.
     if !orig_session_id.is_empty() {
@@ -2160,18 +2762,21 @@ fn resolve_session_arg(arg: &str) -> Result<(PathBuf, String), i32> {
             .unwrap_or_default();
         Ok((dir, id))
     } else {
-        let Some(dir) = project_dir_from_cwd() else {
-            eprintln!("error: cannot derive the project dir from the cwd");
-            return Err(1);
-        };
-        if !dir.exists() {
-            eprintln!(
-                "error: {arg} is not a file, and no project dir exists at {}",
-                dir.display()
-            );
-            return Err(1);
+        // A bare id: the cwd's project dir first, then every project dir — a session created in
+        // the main checkout and resumed from a worktree (or run from elsewhere) lives in another.
+        let cwd_dir = project_dir_from_cwd();
+        let hint = cwd_dir.as_ref().map(|d| d.join(format!("{arg}.jsonl")));
+        if let Some(found) = locate_session(hint.as_deref(), arg) {
+            let dir = found.parent().unwrap_or(Path::new(".")).to_path_buf();
+            return Ok((dir, arg.to_string()));
         }
-        Ok((dir, arg.to_string()))
+        match cwd_dir {
+            Some(dir) if dir.exists() => Ok((dir, arg.to_string())),
+            _ => {
+                eprintln!("error: {arg} is not a file, and no session by that id exists under ~/.claude/projects");
+                Err(1)
+            }
+        }
     }
 }
 
@@ -2254,12 +2859,25 @@ pub fn build_units(records: &[Value], keep: usize, split: usize) -> Units {
 }
 
 pub fn build_units_ex(records: &[Value], keep: usize, split: usize, epochs: bool) -> Units {
+    build_units_full(records, keep, split, epochs, DEFAULT_TAIL_BUDGET)
+}
+
+/// Units exactly as assemble will cut them, tail budget included — continue plans on these and
+/// then hands the same parameters to assemble, so the two can never disagree about unit keys.
+pub fn build_units_full(
+    records: &[Value],
+    keep: usize,
+    split: usize,
+    epochs: bool,
+    tail_budget_tokens: usize,
+) -> Units {
     let (_, segs) = segment(records);
-    let plans = plan_ex(records, &segs, keep, epochs);
+    let mut plans = plan_ex(records, &segs, keep, epochs);
     let seg_parts: Vec<Vec<Vec<usize>>> = segs
         .iter()
         .map(|sg| split_parts(records, sg, split))
         .collect();
+    apply_tail_budget(records, &segs, &mut plans, &seg_parts, tail_budget_tokens);
     let mut key_hashes = HashMap::new();
     let mut seg_keys = Vec::new();
     for (s, seg) in segs.iter().enumerate() {
@@ -2389,7 +3007,7 @@ fn epoch_lines(
     let Some(prov) = synth.get("recompactProvenance") else {
         return false;
     };
-    let Some(srcp) = prov.get("source").and_then(|v| v.as_str()).map(String::from) else {
+    let Some(srcp) = resolve_source(prov).map(|p| p.to_string_lossy().into_owned()) else {
         return false;
     };
     let covered: HashSet<String> = prov
@@ -2519,7 +3137,7 @@ pub fn epoch_digests(
     out
 }
 
-pub const SUMMARIZER_RUBRIC: &str = "You are compacting a Claude Code session transcript. For EACH unit below, write the replacement summary in first person past tense, as the assistant's own recap. Preserve exactly: decisions and their reasons, rejected approaches, discovered values/names/numbers/ids (quote them verbatim), errors and their outcomes, file paths. State success only where the activity shows it verified; mark observed-but-unverified as such. 3 to 6 sentences per unit. Return ONLY a JSON object mapping each unit key to its summary string.";
+pub const SUMMARIZER_RUBRIC: &str = "You are compacting a Claude Code session transcript. For EACH unit below, write the replacement summary in first person past tense, as the assistant's own recap, so that the NEXT user turn still makes sense after the raw activity is gone. Cover: what was asked; what I did; the outcome; decisions and why; approaches tried and rejected, with the reason (a successor that does not know X failed will try X again); and anything left unfinished at the end of the unit. Quote exact values, names, numbers, ids, and commands verbatim — paraphrase is where drift starts. Grade every outcome: write VERIFIED only when the activity shows proof (exit 0, test output, a query result), OBSERVED for partial or interrupted output, CLAIMED when I only asserted it; a killed, timed-out, or erroring command is never a success. Files changed and error text are appended beneath your summary mechanically, so spend your words on reasoning, decisions, and outcomes rather than lists. 3 to 8 sentences per unit. Return ONLY a JSON object mapping each unit key to its summary string.";
 
 const BATCH_MAX_UNITS: usize = 10;
 const BATCH_MAX_CHARS: usize = 120_000;
@@ -2636,11 +3254,27 @@ fn lookup_summary<'a>(obj: &'a Map<String, Value>, k: &str) -> Option<&'a str> {
 
 /// Summarize (key, salience, digest) units headlessly: contiguous batches so consecutive units
 /// share narrative context, salience-routed escalation to a stronger model for decision-bearing
-/// units, waves of concurrent calls, one retry round for stragglers. Returns key -> summary.
+/// units, waves of concurrent calls, one retry round for stragglers. Returns key -> summary, and
+/// fails if any unit is still missing.
 pub fn headless_summarize(
     units: &[(String, f32, String)],
     cfg: &SummarizeCfg,
 ) -> Result<HashMap<String, String>, String> {
+    let (result, missing) = headless_summarize_partial(units, cfg, &mut |_| {});
+    if !missing.is_empty() {
+        return Err(format!("missing summaries after retry: {missing:?}"));
+    }
+    Ok(result)
+}
+
+/// As `headless_summarize`, but hands every wave's results to `on_wave` as they land (so a
+/// caller can persist them — a run that fails on its last unit used to lose every summary it had
+/// paid for) and returns whatever is still missing instead of failing.
+pub fn headless_summarize_partial(
+    units: &[(String, f32, String)],
+    cfg: &SummarizeCfg,
+    on_wave: &mut dyn FnMut(&HashMap<String, String>),
+) -> (HashMap<String, String>, Vec<String>) {
     let mut result: HashMap<String, String> = HashMap::new();
     for _round in 0..2 {
         let remaining: Vec<&(String, f32, String)> = units
@@ -2700,18 +3334,16 @@ pub fn headless_summarize(
                     Err(e) => eprintln!("summarize: batch failed: {e}"),
                 }
             }
+            on_wave(&result);
             eprintln!("summarize: {}/{} units done", result.len(), units.len());
         }
     }
-    let missing: Vec<&str> = units
+    let missing: Vec<String> = units
         .iter()
-        .map(|(k, _, _)| k.as_str())
-        .filter(|k| !result.contains_key(*k))
+        .map(|(k, _, _)| k.clone())
+        .filter(|k| !result.contains_key(k))
         .collect();
-    if !missing.is_empty() {
-        return Err(format!("missing summaries after retry: {missing:?}"));
-    }
-    Ok(result)
+    (result, missing)
 }
 
 // ---------------------------------------------------------------------- continue (shared core)
@@ -2721,7 +3353,33 @@ pub struct ContinueOpts {
     pub keep: Option<String>,
     pub split: Option<String>,
     pub summarize: Option<SummarizeCfg>,
+    /// `--tail-budget`, passed through verbatim so continue and assemble cut identical units.
+    pub tail_budget: Option<String>,
+    /// `--error-floor`: keep error-bearing units at mask instead of summarizing them.
+    pub error_floor: bool,
+    /// `--overhead`: system+tools tokens of the environment the twin resumes into.
+    pub overhead: Option<String>,
 }
+
+/// Parse the continue/shell options shared by both commands.
+pub fn continue_opts_from(opts: &Map<String, Value>) -> ContinueOpts {
+    ContinueOpts {
+        threshold: opts
+            .get("threshold")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_THRESHOLD),
+        keep: opts.get("keep").and_then(|v| v.as_str()).map(String::from),
+        split: opts.get("split").and_then(|v| v.as_str()).map(String::from),
+        summarize: summarize_cfg_from_opts(opts),
+        tail_budget: opts.get("tail-budget").and_then(|v| v.as_str()).map(String::from),
+        error_floor: opts.get("error-floor").and_then(|v| v.as_bool()).unwrap_or(false),
+        overhead: opts.get("overhead").and_then(|v| v.as_str()).map(String::from),
+    }
+}
+
+/// Default compaction threshold, in context tokens (what `/context` reports).
+pub const DEFAULT_THRESHOLD: usize = 120_000;
 
 pub fn summarize_cfg_from_opts(opts: &Map<String, Value>) -> Option<SummarizeCfg> {
     opts.get("summarize-with")
@@ -2755,8 +3413,9 @@ pub fn summarize_cfg_from_opts(opts: &Map<String, Value>) -> Option<SummarizeCfg
 /// [42, 43]" after minutes of summarizing). So the plan → summarize → assemble → verify cycle
 /// RETRIES, re-syncing to the file's current state on each attempt; the content-hash cache makes
 /// all previously-summarized material free, so a retry only pays for the turns that appeared in
-/// the gap. Converges as soon as the source pauses growing for one cycle. Always returns a
-/// resumable id, plus an exit code for the CLI.
+/// the gap. Summaries are written to the cache after every wave, and a unit the summarizer never
+/// covers is masked rather than failing the run. Always returns a resumable id, plus an exit code
+/// for the CLI.
 pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String, i32) {
     let latest = lineage_latest(dir, start_id);
     let latest_file = dir.join(format!("{latest}.jsonl"));
@@ -2770,75 +3429,96 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
         .as_deref()
         .and_then(|s| s.parse().ok())
         .unwrap_or(DEFAULT_SPLIT_THRESHOLD);
+    let tail_budget_tokens: usize = o
+        .tail_budget
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_TAIL_BUDGET);
     let cache_path = dir.join(".recompact-summary-cache.json");
 
     const ATTEMPTS: usize = 3;
     for attempt in 1..=ATTEMPTS {
         // Unit keys built here must match the ones assemble computes below, so this shares
         // assemble's view of the records (preamble stripped) rather than the raw active path.
-        let (active, _) = select_active_for_units(load_jsonl(&latest_file));
-        let tokens = approx_tokens(&active);
-        if tokens <= o.threshold {
+        let (all, _) = select_active(load_jsonl(&latest_file));
+        let mut calib = calibrate_lineage(&all);
+        if let Some(ov) = o.overhead.as_deref().and_then(|s| s.parse().ok()) {
+            calib.overhead = ov;
+        }
+        let active: Vec<Value> = all
+            .into_iter()
+            .filter(|r| !truthy(r, "recompactPreamble"))
+            .collect();
+        // Whether to compact is decided on the live size (last usage, preserved thinking and
+        // all); the churn guard below compares estimates, like with like.
+        let current = calib.current_tokens(&active);
+        let tokens = calib.context_tokens(&active);
+        if current <= o.threshold {
             eprintln!(
-                "continue: ~{tokens} tokens ≤ threshold {}; nothing to compact",
-                o.threshold
+                "continue: ~{current} context tokens ≤ threshold {}; nothing to compact ({})",
+                o.threshold,
+                calib.describe()
             );
             return (latest, 0);
         }
 
         // Full-ladder pre-pass: find the units the budget plan wants summarized, fill the cache.
         let mut sums_path: Option<PathBuf> = None;
+        let mut mask_path: Option<PathBuf> = None;
         if let Some(cfg) = &o.summarize {
-            let u = build_units_ex(&active, keep, split, true);
+            let u = build_units_full(&active, keep, split, true, tail_budget_tokens);
             let epoch_map = epoch_digests(&active, &u.segs, &u.seg_parts, &u.seg_keys, keep);
             let cache: Map<String, Value> = fs::read_to_string(&cache_path)
                 .ok()
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
                 .and_then(|v| v.as_object().cloned())
                 .unwrap_or_default();
-            let b = plan_budget(
+            let b = plan_budget_calibrated(
                 &active,
                 &u.segs,
                 &u.plans,
                 &u.seg_parts,
                 &u.seg_keys,
-                o.threshold,
+                o.threshold.saturating_sub(calib.overhead),
                 true,
-                // Headless/autonomous compaction keeps the error floor: summarizing error
-                // evidence away is a judgment call for a supervising operator (`assemble
-                // --target --summarize-errors`), not something the unattended loop should do.
-                false,
+                !o.error_floor,
                 &epoch_map,
+                &calib,
                 |key| {
                     u.key_hashes
                         .get(key)
                         .and_then(|h| cache.get(h))
                         .and_then(|v| v.as_str())
-                        .map(|s| s.len() / 4 + 60)
+                        .map(|s| calib.tokens(s.len()) + 60)
                 },
             );
             let mut work: Vec<(String, f32, String)> = Vec::new();
             for unit in &b.units {
-                if unit.treatment == Treatment::Summarize {
-                    let h = &u.key_hashes[&unit.key];
-                    if !cache.contains_key(h) {
-                        let p: usize = unit
-                            .key
-                            .split('.')
-                            .nth(1)
-                            .and_then(|x| x.parse().ok())
-                            .unwrap_or(0);
-                        let seg = &u.segs[unit.seg];
-                        let part = &u.seg_parts[unit.seg][p];
-                        // Epoch units summarize from RAW (via provenance); everything else from
-                        // the current records.
-                        let digest = match epoch_map.get(&unit.key) {
-                            Some(Some(d)) => d.clone(),
-                            _ => unit_digest(&active, seg, part),
-                        };
-                        work.push((unit.key.clone(), unit.salience, digest));
-                    }
+                if unit.treatment != Treatment::Summarize {
+                    continue;
                 }
+                let h = &u.key_hashes[&unit.key];
+                if cache.contains_key(h) {
+                    continue;
+                }
+                let p: usize = unit
+                    .key
+                    .split('.')
+                    .nth(1)
+                    .and_then(|x| x.parse().ok())
+                    .unwrap_or(0);
+                let seg = &u.segs[unit.seg];
+                let part = &u.seg_parts[unit.seg][p];
+                if unit_is_empty(&active, part) {
+                    continue; // assemble fills these mechanically; a model would return nothing
+                }
+                // Epoch units summarize from RAW (via provenance); everything else from
+                // the current records.
+                let digest = match epoch_map.get(&unit.key) {
+                    Some(Some(d)) => d.clone(),
+                    _ => unit_digest(&active, seg, part),
+                };
+                work.push((unit.key.clone(), unit.salience, digest));
             }
             if !work.is_empty() {
                 eprintln!(
@@ -2850,27 +3530,31 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
                         .map(|m| format!(" (escalating salience ≥ {} to {m})", cfg.escalate_above))
                         .unwrap_or_default()
                 );
-                let sums = match headless_summarize(&work, cfg) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!("continue: summarize failed: {e}");
-                        return (latest, 1);
+                let mut cache = cache;
+                let mut persist = |sums: &HashMap<String, String>| {
+                    for (k, text) in sums {
+                        if let Some(h) = u.key_hashes.get(k) {
+                            cache.insert(h.clone(), Value::String(text.clone()));
+                        }
+                    }
+                    if fs::write(
+                        &cache_path,
+                        serde_json::to_string_pretty(&Value::Object(cache.clone())).unwrap(),
+                    )
+                    .is_err()
+                    {
+                        eprintln!("continue: warning: cannot write summary cache {}", cache_path.display());
                     }
                 };
-                let mut cache = cache;
-                for (k, text) in &sums {
-                    if let Some(h) = u.key_hashes.get(k) {
-                        cache.insert(h.clone(), Value::String(text.clone()));
-                    }
-                }
-                if fs::write(
-                    &cache_path,
-                    serde_json::to_string_pretty(&Value::Object(cache)).unwrap(),
-                )
-                .is_err()
-                {
-                    eprintln!("continue: cannot write summary cache");
-                    return (latest, 1);
+                let (_sums, missing) = headless_summarize_partial(&work, cfg, &mut persist);
+                if !missing.is_empty() {
+                    eprintln!(
+                        "continue: no summary came back for {missing:?}; those units will be masked instead"
+                    );
+                    let hashes: Vec<&String> = missing.iter().filter_map(|k| u.key_hashes.get(k)).collect();
+                    let mp = std::env::temp_dir().join(format!("recompact-mask-{}.json", uuid_v4()));
+                    let _ = fs::write(&mp, serde_json::to_string(&hashes).unwrap_or_default());
+                    mask_path = Some(mp);
                 }
             }
             let sp = std::env::temp_dir().join(format!("recompact-empty-{}.json", uuid_v4()));
@@ -2884,6 +3568,10 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
             a_args.push("--mode".into());
             a_args.push("summarize".into());
             a_args.push("--epochs".into());
+            if let Some(mp) = &mask_path {
+                a_args.push("--mask-units".into());
+                a_args.push(mp.to_string_lossy().into_owned());
+            }
             a_args.push("--cache".into());
             a_args.push(cache_path.to_string_lossy().into_owned());
         } else {
@@ -2892,15 +3580,23 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
         }
         a_args.push("--target".into());
         a_args.push(o.threshold.to_string());
-        for (flag, v) in [("keep", &o.keep), ("split", &o.split)] {
+        if o.error_floor {
+            a_args.push("--error-floor".into());
+        }
+        for (flag, v) in [
+            ("keep", &o.keep),
+            ("split", &o.split),
+            ("tail-budget", &o.tail_budget),
+            ("overhead", &o.overhead),
+        ] {
             if let Some(v) = v {
                 a_args.push(format!("--{flag}"));
                 a_args.push(v.clone());
             }
         }
         let assembled = run_assemble(&a_args);
-        if let Some(sp) = &sums_path {
-            let _ = fs::remove_file(sp);
+        for p in sums_path.iter().chain(mask_path.iter()) {
+            let _ = fs::remove_file(p);
         }
         let (new_id, new_file) = match assembled {
             Ok(Some(v)) => v,
@@ -2940,16 +3636,20 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
             return (latest, 1);
         }
         // Churn guard: a file that is already mostly incompressible must not spawn descendants
-        // every loop iteration.
+        // every loop iteration. The twin carries no usage yet, so it is measured with the
+        // source's calibration.
         let (na, _) = select_active(load_jsonl(&new_file));
-        let ntokens = approx_tokens(&na);
+        let ntokens = calib.context_tokens(&na);
         if ntokens * 100 >= tokens * 95 {
             let _ = fs::remove_file(&new_file);
             lineage_remove(dir, &new_id);
             eprintln!("continue: no meaningful reduction (~{tokens} → ~{ntokens}); keeping {latest}");
             return (latest, 0);
         }
-        eprintln!("continue: ~{tokens} → ~{ntokens} tokens; resume with: claude --resume {new_id}");
+        eprintln!(
+            "continue: ~{tokens} → ~{ntokens} context tokens; resume with: {}",
+            resume_command(&new_id, &resume_flags(&active))
+        );
         return (new_id, 0);
     }
     (latest, 1)
@@ -2959,23 +3659,14 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
 /// can do: ID=$(recompact continue "$ID"); claude -p --resume "$ID" "next step".
 pub fn cmd_continue(args: &[String]) -> i32 {
     let (pos, opts) = parse_opts(args);
-    if pos.is_empty() {
+    let Some(arg) = pos.first().cloned().or_else(current_session_id) else {
         return usage();
-    }
-    let (dir, start_id) = match resolve_session_arg(&pos[0]) {
+    };
+    let (dir, start_id) = match resolve_session_arg(&arg) {
         Ok(v) => v,
         Err(rc) => return rc,
     };
-    let o = ContinueOpts {
-        threshold: opts
-            .get("threshold")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(60_000),
-        keep: opts.get("keep").and_then(|v| v.as_str()).map(String::from),
-        split: opts.get("split").and_then(|v| v.as_str()).map(String::from),
-        summarize: summarize_cfg_from_opts(&opts),
-    };
+    let o = continue_opts_from(&opts);
     let (id, rc) = continue_session(&dir, &start_id, &o);
     println!("{id}");
     rc
@@ -3019,16 +3710,7 @@ pub fn cmd_shell(args: &[String]) -> i32 {
         .map(String::from)
         .or_else(|| std::env::var("RECOMPACT_CLAUDE_BIN").ok())
         .unwrap_or_else(|| "claude".into());
-    let copts = ContinueOpts {
-        threshold: opts
-            .get("threshold")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(60_000),
-        keep: opts.get("keep").and_then(|v| v.as_str()).map(String::from),
-        split: opts.get("split").and_then(|v| v.as_str()).map(String::from),
-        summarize: summarize_cfg_from_opts(&opts),
-    };
+    let copts = continue_opts_from(&opts);
     let mut first = true;
     let mut cycles = 0usize;
     loop {
@@ -3150,12 +3832,13 @@ pub fn cmd_scan(args: &[String]) -> i32 {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let (active, _) = select_active(load_jsonl(&path));
-        let tokens = approx_tokens(&active);
+        let calib = calibrate_opts(&active, &opts);
+        let tokens = calib.current_tokens(&active);
         // The mask estimate re-serializes every record; on big projects that is the slow part,
         // so it is opt-in via --estimate.
         let mask_est = if estimate {
             let indices: Vec<usize> = (0..active.len()).collect();
-            format!("{:>8}", mask_tokens_of(&active, &indices))
+            format!("{:>8}", calib.overhead + calib.tokens(mask_chars_of(&active, &indices)))
         } else {
             "       -".to_string()
         };
@@ -3167,6 +3850,9 @@ pub fn cmd_scan(args: &[String]) -> i32 {
         }
         if superseded.contains(id.as_str()) {
             flags.push("superseded");
+        }
+        if calib.live.is_none() {
+            flags.push("est");
         }
         let line = format!(
             "  {:<38} ~{:>8} tok  mask→~{}  turns={:<3} delivered={:<3} {}",
@@ -3209,6 +3895,8 @@ const KNOWN_RECORD_TYPES: &[&str] = &[
     "agent-name",
     "relocated",
     "worktree-state",
+    "atis-latch",
+    "cost-state",
 ];
 const KNOWN_BLOCK_TYPES: &[&str] = &[
     "text",
@@ -3360,13 +4048,85 @@ fn is_ground(r: &Value) -> bool {
         && r.get("recompactImagesElided").is_none()
 }
 
+/// Every `~/.claude/projects/*` dir, primary first. Sessions move between project dirs (a session
+/// created in the main checkout and resumed from a worktree relocates its file), so a recorded
+/// absolute path is a hint, never the only place to look.
+pub fn project_dirs_near(primary: &Path) -> Vec<PathBuf> {
+    let mut out = vec![primary.to_path_buf()];
+    if let Some(root) = primary.parent() {
+        if let Ok(entries) = fs::read_dir(root) {
+            let mut others: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir() && p != primary)
+                .collect();
+            others.sort();
+            out.extend(others);
+        }
+    }
+    out
+}
+
+/// Locate `<session>.jsonl`: `hint` if it exists, else the same file name in any project dir
+/// under the hint's projects root (or `~/.claude/projects`). Newest wins when several match.
+pub fn locate_session(hint: Option<&Path>, session: &str) -> Option<PathBuf> {
+    if let Some(h) = hint {
+        if h.exists() {
+            return Some(h.to_path_buf());
+        }
+    }
+    let name = format!("{}.jsonl", session.strip_suffix(".jsonl").unwrap_or(session));
+    let root = hint
+        .and_then(|h| h.parent())
+        .and_then(|d| d.parent())
+        .map(Path::to_path_buf)
+        .filter(|r| r.is_dir())
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".claude/projects"))
+        })?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for e in fs::read_dir(&root).ok()?.flatten() {
+        let p = e.path().join(&name);
+        if let Ok(t) = fs::metadata(&p).and_then(|m| m.modified()) {
+            if best.as_ref().map_or(true, |(bt, _)| t > *bt) {
+                best = Some((t, p));
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// The raw transcript a synthetic summary points at, surviving relocation: the recorded path, or
+/// the recorded session id wherever it lives now.
+pub fn resolve_source(prov: &Value) -> Option<PathBuf> {
+    let path = prov.get("source").and_then(|v| v.as_str()).map(PathBuf::from);
+    let sid = prov.get("sourceSessionId").and_then(|v| v.as_str()).unwrap_or("");
+    match (&path, sid.is_empty()) {
+        (Some(p), _) if p.exists() => Some(p.clone()),
+        (_, false) => locate_session(path.as_deref(), sid),
+        _ => None,
+    }
+}
+
 fn synth_sources(records: &[Value]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for r in records {
-        if let Some(s) = r.pointer("/recompactProvenance/source").and_then(|v| v.as_str()) {
-            let p = PathBuf::from(s);
-            if !out.contains(&p) {
-                out.push(p);
+        if let Some(prov) = r.get("recompactProvenance") {
+            if let Some(p) = resolve_source(prov) {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        // A mask-only twin has no summaries to point home, but its preamble names its source.
+        if let Some(src) = r.get("recompactSource") {
+            let prov = json!({"source": src.get("path"), "sourceSessionId": src.get("sessionId")});
+            if let Some(p) = resolve_source(&prov) {
+                if !out.contains(&p) {
+                    out.push(p);
+                }
             }
         }
     }
@@ -3437,11 +4197,22 @@ fn ground_truth_by_uuid(
     }
     for f in provenance_files(start, cache) {
         let records = cache[&f].clone();
-        if let Some(hit) = scan(&records, &mut fallback) {
+        if let Some(mut hit) = scan(&records, &mut fallback) {
+            stamp_origin(&mut hit, &f);
             return Some(hit);
         }
     }
     fallback
+}
+
+/// Transient note of which transcript a recalled copy came from, so recall can say where a
+/// verbatim original was found rather than naming the file the lookup started in. Never written.
+pub const RECALLED_FROM: &str = "__recalledFrom";
+
+fn stamp_origin(r: &mut Value, file: &Path) {
+    if let Some(o) = r.as_object_mut() {
+        o.insert(RECALLED_FROM.into(), Value::String(stem_of(file)));
+    }
 }
 
 /// Expand one synthetic to the raw records it stands for, following nested synthetics and
@@ -3454,13 +4225,10 @@ fn expand_synthetic(
     if depth == 0 {
         return vec![rec.clone()];
     }
-    let src = match rec.pointer("/recompactProvenance/source").and_then(|v| v.as_str()) {
-        Some(s) => PathBuf::from(s),
-        None => return vec![rec.clone()],
+    let Some(src) = rec.get("recompactProvenance").and_then(resolve_source) else {
+        // Deleted transcript: the summary itself is the best copy left.
+        return vec![rec.clone()];
     };
-    if !src.exists() {
-        return vec![rec.clone()]; // deleted transcript: the summary itself is the best copy left
-    }
     cache.entry(src.clone()).or_insert_with(|| load_jsonl(&src));
     let covered: Vec<String> = rec
         .pointer("/recompactProvenance/coveredUuids")
@@ -3480,7 +4248,9 @@ fn expand_synthetic(
             let u = u.to_string();
             out.push(ground_truth_by_uuid(&u, &source_records, cache).unwrap_or_else(|| r.clone()));
         } else {
-            out.push(r.clone());
+            let mut hit = r.clone();
+            stamp_origin(&mut hit, &src);
+            out.push(hit);
         }
     }
     out
@@ -3498,10 +4268,25 @@ pub fn rehydrate_select(compacted: &[Value], selector: &str) -> Result<Vec<Value
     };
     let mut cache: HashMap<PathBuf, Vec<Value>> = HashMap::new();
 
-    // Part-key / ordinal selectors address this file's own summaries.
-    let chosen: Option<&Value> = if let Some(hit) =
-        synths.iter().find(|r| part_of(r).as_deref() == Some(selector))
-    {
+    // Part-key / ordinal selectors address this file's own summaries. Summaries carried from
+    // older generations keep their original keys, so one key can name several summaries.
+    let key_hits: Vec<&&Value> = synths
+        .iter()
+        .filter(|r| part_of(r).as_deref() == Some(selector))
+        .collect();
+    if key_hits.len() > 1 {
+        let ids: Vec<String> = key_hits
+            .iter()
+            .filter_map(|r| rec_uuid(r))
+            .map(|u| u.get(..8).unwrap_or(u).to_string())
+            .collect();
+        return Err(format!(
+            "summary key {selector:?} is carried by {} summaries from different compaction generations; \
+             use the id from the footer you are reading: one of {ids:?}",
+            key_hits.len()
+        ));
+    }
+    let chosen: Option<&Value> = if let Some(hit) = key_hits.first().map(|r| **r) {
         Some(hit)
     } else if let Ok(n) = selector.parse::<usize>().ok().filter(|_| selector.len() < 8).ok_or(()) {
         // A numeric selector can also be an unsplit segment's part key (part "3"), handled above;
@@ -3597,7 +4382,11 @@ pub fn cmd_rehydrate(args: &[String]) -> i32 {
     match rehydrate_select(&compacted, &pos[1]) {
         Ok(records) => {
             for r in &records {
-                println!("{}", serde_json::to_string(r).unwrap());
+                let mut r = r.clone();
+                if let Some(o) = r.as_object_mut() {
+                    o.remove(RECALLED_FROM);
+                }
+                println!("{}", serde_json::to_string(&r).unwrap());
             }
             eprintln!("rehydrate: {} verbatim record(s) recovered", records.len());
             0
@@ -3779,6 +4568,21 @@ pub fn cmd_verify(args: &[String]) -> i32 {
         if ok && growth > 0 {
             eprintln!("note: source gained {growth} user turn(s) after assembly (session teardown or continued use); assembled turns match everything the assembly saw");
         }
+        // Messages typed mid-turn arrive as attachments, not user records, so the check above
+        // cannot see them; each one the assembly knew about must still be in the output.
+        let present: HashSet<&str> = new.iter().filter(|r| is_human_queued(r)).filter_map(rec_uuid).collect();
+        let lost: Vec<String> = src
+            .iter()
+            .filter(|r| is_human_queued(r))
+            .filter_map(rec_uuid)
+            .filter(|u| known.contains(*u) && !present.contains(u))
+            .map(|u| u.get(..8).unwrap_or(u).to_string())
+            .collect();
+        checks.push((
+            "mid-turn user messages preserved",
+            lost.is_empty(),
+            format!("missing {lost:?}"),
+        ));
     }
 
     let mut fails = 0;
@@ -3802,12 +4606,14 @@ pub fn cmd_verify(args: &[String]) -> i32 {
 // ---------------------------------------------------------------------------------------------
 // Recall: rehydration as a tool the model can call, not just an operator CLI.
 //
-// `rehydrate` already recovers anything a marker names, but only from a shell, and only once the
-// caller has answered "which .jsonl am I?" — a question a resumed session cannot answer reliably
-// (several sessions in one project dir are live at once, and their mtimes differ by seconds).
-// So uuid selectors resolve PROJECT-WIDE here: masking clones a record without re-minting its
-// uuid, which means one 8-char prefix names the same record in the twin and in every ancestor,
-// and any file holding it is a valid entry point into the provenance graph.
+// The first version resolved uuid prefixes project-wide but answered "which session am I?" by
+// guessing the newest file, and summary footers named part keys that only mean something inside
+// one file. In the month after it shipped, resumed sessions called it five times; all five
+// failed (a worktree session's server looked in the wrong project dir, a key resolved against
+// somebody else's newest session, a guessed session id was the twin's parent). Now the server
+// knows its session (Claude Code sets CLAUDE_CODE_SESSION_ID for it), every footer carries a
+// project-wide uuid selector, lookups fall back across project dirs, and `query` searches what
+// compaction removed so the model does not need an address at all.
 // ---------------------------------------------------------------------------------------------
 
 /// Per-response payload budget. ARC (arXiv:2607.25066) caps a recall at 8k chars and chunks the
@@ -3847,6 +4653,45 @@ pub fn project_dir_for(cwd: &Path) -> Option<PathBuf> {
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()?;
     Some(PathBuf::from(home).join(".claude/projects").join(munged))
+}
+
+/// Where recall looks, and for whom: the primary project dir (the others under the same root are
+/// searched when it has nothing) and the session being served, when known.
+pub struct RecallCtx {
+    pub dir: PathBuf,
+    pub session: Option<String>,
+}
+
+impl From<&Path> for RecallCtx {
+    fn from(dir: &Path) -> Self {
+        RecallCtx {
+            dir: dir.to_path_buf(),
+            session: None,
+        }
+    }
+}
+
+impl From<&PathBuf> for RecallCtx {
+    fn from(dir: &PathBuf) -> Self {
+        RecallCtx::from(dir.as_path())
+    }
+}
+
+impl From<PathBuf> for RecallCtx {
+    fn from(dir: PathBuf) -> Self {
+        RecallCtx { dir, session: None }
+    }
+}
+
+impl RecallCtx {
+    /// A session named by id or path, wherever it lives now.
+    pub fn session_file(&self, session: &str) -> Option<PathBuf> {
+        let p = PathBuf::from(session);
+        if session.ends_with(".jsonl") && p.exists() {
+            return Some(p);
+        }
+        locate_session(Some(&session_path(&self.dir, session)), session)
+    }
 }
 
 /// Every session in `dir` holding a record whose uuid matches `sel`, best entry point first:
@@ -3916,6 +4761,27 @@ pub fn find_uuid_sessions(dir: &Path, sel: &str) -> (Vec<PathBuf>, Vec<String>) 
     (hits.into_iter().map(|(_, _, p)| p).collect(), distinct)
 }
 
+/// `find_uuid_sessions` over the primary project dir, then — only when it holds nothing — every
+/// other project dir under the same root.
+fn find_uuid_anywhere(ctx: &RecallCtx, sel: &str) -> (Vec<PathBuf>, Vec<String>) {
+    let (found, distinct) = find_uuid_sessions(&ctx.dir, sel);
+    if !found.is_empty() {
+        return (found, distinct);
+    }
+    let mut all_found = Vec::new();
+    let mut all_distinct: Vec<String> = Vec::new();
+    for d in project_dirs_near(&ctx.dir).into_iter().skip(1) {
+        let (f, ds) = find_uuid_sessions(&d, sel);
+        all_found.extend(f);
+        for u in ds {
+            if !all_distinct.contains(&u) {
+                all_distinct.push(u);
+            }
+        }
+    }
+    (all_found, all_distinct)
+}
+
 /// What a recall resolved to, and where from — the caller reports the source so a model can tell
 /// a verbatim original from a degraded copy.
 pub struct Recalled {
@@ -3923,14 +4789,26 @@ pub struct Recalled {
     pub session: String,
 }
 
-/// Resolve a selector to verbatim records.
-///
-/// uuid / uuid-prefix selectors (what elision markers print) are project-wide: no session needed.
-/// Part keys and ordinals index one file's summary list, so they need a session — explicit when
-/// the caller knows it, newest-by-mtime otherwise, and the answer always says which was used
-/// because that fallback is a guess.
+const NO_SESSION_FOR_KEY: &str = "summary keys and ordinals index one session's summaries, and this \
+recall server does not know which session you are in. Use the 8-character id from the summary \
+footer (\"recall <id>\") instead — it resolves anywhere — or pass session=<session id>.";
+
+/// Resolve a selector to verbatim records, for a caller that knows only the project dir.
 pub fn recall_select(
     dir: &Path,
+    selector: &str,
+    session: Option<&str>,
+) -> Result<Recalled, String> {
+    recall_select_ctx(&RecallCtx::from(dir), selector, session)
+}
+
+/// Resolve a selector to verbatim records.
+///
+/// uuid / uuid-prefix selectors (what markers and footers print) need no session. Part keys and
+/// ordinals index one file's summary list: they resolve against the session named in the call,
+/// else the session the server serves — never a guess.
+pub fn recall_select_ctx(
+    ctx: &RecallCtx,
     selector: &str,
     session: Option<&str>,
 ) -> Result<Recalled, String> {
@@ -3941,18 +4819,21 @@ pub fn recall_select(
     // the project. Naming the wrong session should not make a resolvable uuid unresolvable.
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(sess) = session {
-        let p = session_path(dir, sess);
-        if !p.exists() {
-            return Err(format!(
-                "no session {sess:?} under {}. Uuid prefixes need no session at all — \
-                 pass the prefix alone.",
-                dir.display()
-            ));
+        match ctx.session_file(sess) {
+            Some(p) => candidates.push(p),
+            None => {
+                return Err(format!(
+                    "no session {sess:?} under {} or any sibling project dir. Uuid prefixes need no \
+                     session at all — pass the prefix alone.",
+                    ctx.dir.display()
+                ))
+            }
         }
+    } else if let Some(p) = ctx.session.as_deref().and_then(|s| ctx.session_file(s)) {
         candidates.push(p);
     }
     if uuidish {
-        let (found, distinct) = find_uuid_sessions(dir, selector);
+        let (found, distinct) = find_uuid_anywhere(ctx, selector);
         if distinct.len() > 1 {
             return Err(format!(
                 "{selector:?} is ambiguous: it prefixes {} different records ({}). \
@@ -3969,7 +4850,7 @@ pub fn recall_select(
             return Err(format!(
                 "uuid {selector:?} is not in any transcript under {}. \
                  Check the prefix against the marker that printed it.",
-                dir.display()
+                ctx.dir.parent().unwrap_or(&ctx.dir).display()
             ));
         }
         for f in found {
@@ -3978,12 +4859,7 @@ pub fn recall_select(
             }
         }
     } else if candidates.is_empty() {
-        // Keys and ordinals index one file's summary list, so there is nothing to search: fall
-        // back to the newest session and let the answer name which one that was.
-        let newest = newest_session(dir).ok_or_else(|| {
-            format!("no sessions under {} to resolve {selector:?} against", dir.display())
-        })?;
-        candidates.push(session_path(dir, &newest));
+        return Err(NO_SESSION_FOR_KEY.to_string());
     }
 
     let mut last_err = String::new();
@@ -3996,11 +4872,21 @@ pub fn recall_select(
             }
         };
         match rehydrate_select(&records, selector) {
-            Ok(records) => {
+            Ok(mut records) => {
+                // Name the transcript the originals came from, not the one the lookup began in.
+                let origin = records
+                    .iter()
+                    .find_map(|r| r.get(RECALLED_FROM).and_then(|v| v.as_str()).map(str::to_string))
+                    .unwrap_or_else(|| stem_of(path));
+                for r in records.iter_mut() {
+                    if let Some(o) = r.as_object_mut() {
+                        o.remove(RECALLED_FROM);
+                    }
+                }
                 return Ok(Recalled {
                     records,
-                    session: stem_of(path),
-                })
+                    session: origin,
+                });
             }
             Err(e) => last_err = e,
         }
@@ -4019,6 +4905,261 @@ fn stem_of(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+// ------------------------------------------------------------------------------ recall: query
+
+/// Every transcript the session descends from: synthetic provenance, the preamble's recorded
+/// source (mask-only twins have no summaries to point home), the lineage sidecar, and the
+/// session a `/branch` or `--fork-session` copy was forked from. Nearest first.
+pub fn lineage_files(start: &Path) -> Vec<PathBuf> {
+    let mut order: Vec<PathBuf> = vec![start.to_path_buf()];
+    let mut i = 0;
+    while i < order.len() && order.len() < 64 {
+        let cur = order[i].clone();
+        i += 1;
+        let Ok(records) = load_jsonl_soft(&cur) else { continue };
+        let mut next = synth_sources(&records);
+        if let Some(dir) = cur.parent() {
+            let id = stem_of(&cur);
+            if let Some(parent) = lineage_load(dir)
+                .get(&id)
+                .and_then(|v| v.get("parent"))
+                .and_then(|v| v.as_str())
+            {
+                if let Some(p) = locate_session(Some(&dir.join(format!("{parent}.jsonl"))), parent) {
+                    next.push(p);
+                }
+            }
+            if let Some(parent) = records
+                .iter()
+                .find_map(|r| r.pointer("/forkedFrom/sessionId").and_then(|v| v.as_str()))
+            {
+                if parent != id {
+                    if let Some(p) = locate_session(Some(&dir.join(format!("{parent}.jsonl"))), parent) {
+                        next.push(p);
+                    }
+                }
+            }
+        }
+        for p in next {
+            if !order.contains(&p) {
+                order.push(p);
+            }
+        }
+    }
+    order
+}
+
+/// Query terms: whitespace-separated words, or "quoted phrases", lowercased.
+fn query_terms(q: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    let mut rest = q.trim();
+    while !rest.is_empty() {
+        if let Some(stripped) = rest.strip_prefix('"') {
+            let end = stripped.find('"').unwrap_or(stripped.len());
+            let t = stripped[..end].trim().to_lowercase();
+            if !t.is_empty() {
+                terms.push(t);
+            }
+            rest = stripped.get(end + 1..).unwrap_or("").trim_start();
+        } else {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let t = rest[..end].trim_matches(|c: char| c == ',' || c == ';').to_lowercase();
+            if t.len() >= 2 {
+                terms.push(t);
+            }
+            rest = rest[end..].trim_start();
+        }
+    }
+    terms.dedup();
+    terms
+}
+
+fn snippet_around(text: &str, lower: &str, term: &str, width: usize) -> String {
+    let at = lower.find(term).unwrap_or(0);
+    // Char boundaries on both sides; lower/text share byte offsets only for ASCII, so re-find a
+    // safe boundary in `text`.
+    let mut start = at.saturating_sub(width / 2);
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = (at + term.len() + width / 2).min(text.len());
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    let body: String = text
+        .get(start..end)
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "{}{}{}",
+        if start > 0 { "…" } else { "" },
+        body,
+        if end < text.len() { "…" } else { "" }
+    )
+}
+
+fn record_kind(r: &Value) -> &'static str {
+    if is_human_queued(r) {
+        return "user (mid-turn)";
+    }
+    match rec_type(r) {
+        "assistant" => {
+            let tools = content(r)
+                .and_then(|c| c.as_array())
+                .is_some_and(|a| a.iter().any(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use")));
+            if tools {
+                "tool call"
+            } else {
+                "assistant"
+            }
+        }
+        "user" if is_genuine_user(r) => "user",
+        "user" => {
+            if content(r)
+                .and_then(|c| c.as_array())
+                .is_some_and(|a| a.iter().any(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_result")))
+            {
+                "tool result"
+            } else {
+                "delivered"
+            }
+        }
+        _ => "record",
+    }
+}
+
+/// Search the originals of everything compaction took out of this session's view: records its
+/// summaries replaced, originals of masked records, and older generations' material. Records the
+/// session still shows verbatim are skipped — the model can already see them.
+pub fn recall_query(ctx: &RecallCtx, query: &str, session: Option<&str>, limit: usize) -> Result<String, String> {
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return Err("query is empty: pass words or \"a quoted phrase\" to search for.".into());
+    }
+    let start = match session.or(ctx.session.as_deref()) {
+        Some(s) => ctx
+            .session_file(s)
+            .ok_or_else(|| format!("no session {s:?} under {} or any sibling project dir", ctx.dir.display()))?,
+        None => {
+            return Err("this recall server does not know which session you are in, so it cannot tell \
+                        what compaction removed from it; pass session=<session id>."
+                .into())
+        }
+    };
+    let files = lineage_files(&start);
+    let start_records = load_jsonl_soft(&start)?;
+    let visible: HashSet<String> = start_records
+        .iter()
+        .filter(|r| is_ground(r))
+        .filter_map(rec_uuid)
+        .map(str::to_string)
+        .collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    // (terms matched, occurrences, file order, record) — ranked below.
+    let mut hits: Vec<(usize, usize, usize, String, Value)> = Vec::new();
+    let mut searched = 0usize;
+    for (fi, f) in files.iter().enumerate() {
+        let Ok(records) = load_jsonl_soft(f) else { continue };
+        let sid = stem_of(f);
+        for r in records {
+            let Some(u) = rec_uuid(&r).map(str::to_string) else { continue };
+            if !is_ground(&r) || truthy(&r, "recompactPreamble") || truthy(&r, "recompactLedger") {
+                continue;
+            }
+            if visible.contains(&u) || !seen.insert(u.clone()) {
+                continue;
+            }
+            if rec_type(&r) == "attachment" && !is_human_queued(&r) {
+                continue;
+            }
+            searched += 1;
+            let text = if is_human_queued(&r) {
+                human_queued_text(&r)
+            } else {
+                payload_of(std::slice::from_ref(&r)).text
+            };
+            if text.is_empty() {
+                continue;
+            }
+            let lower = text.to_lowercase();
+            let matched = terms.iter().filter(|t| lower.contains(t.as_str())).count();
+            if matched == 0 {
+                continue;
+            }
+            let occ: usize = terms.iter().map(|t| lower.matches(t.as_str()).count().min(5)).sum();
+            hits.push((matched, occ, fi, sid.clone(), r));
+        }
+    }
+    if hits.is_empty() {
+        return Ok(format!(
+            "no match for {query:?} among {searched} record(s) compaction removed from view (searched {} transcript(s) of this session's lineage). \
+             Try fewer or different words; exact identifiers work best.",
+            files.len()
+        ));
+    }
+    // All terms first, then more occurrences, then nearer generations, then newer records.
+    hits.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(b.1.cmp(&a.1))
+            .then(a.2.cmp(&b.2))
+            .then_with(|| {
+                let ta = a.4.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+                let tb = b.4.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+                tb.cmp(ta)
+            })
+    });
+    let total = hits.len();
+    let rarest = terms
+        .iter()
+        .min_by_key(|t| hits.iter().filter(|h| {
+            let tx = payload_of(std::slice::from_ref(&h.4)).text.to_lowercase();
+            tx.contains(t.as_str())
+        }).count())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = format!(
+        "{total} match(es) for {query:?} in what compaction removed ({} transcript(s) searched){}:\n",
+        files.len(),
+        if total > limit { format!("; best {limit} shown") } else { String::new() }
+    );
+    for (matched, _, _, sid, r) in hits.into_iter().take(limit) {
+        let u = rec_uuid(&r).unwrap_or("????????");
+        let text = if is_human_queued(&r) {
+            human_queued_text(&r)
+        } else {
+            payload_of(std::slice::from_ref(&r)).text
+        };
+        let lower = text.to_lowercase();
+        let term = if lower.contains(rarest.as_str()) {
+            rarest.clone()
+        } else {
+            terms.iter().find(|t| lower.contains(t.as_str())).cloned().unwrap_or_default()
+        };
+        let ts = r
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .map(|t| t.get(..16).unwrap_or(t).replace('T', " "))
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "- {} · {} · {} · session {}{}: {}\n",
+            u.get(..8).unwrap_or(u),
+            record_kind(&r),
+            ts,
+            short_id(&sid),
+            if matched < terms.len() { format!(" ({matched}/{} terms)", terms.len()) } else { String::new() },
+            snippet_around(&text, &lower, &term, 300)
+        ));
+        if out.chars().count() > RECALL_CHUNK_CHARS - 400 {
+            out.push_str("… (budget reached; narrow the query)\n");
+            break;
+        }
+    }
+    out.push_str("recall(selector=\"<id>\") returns any of these in full.");
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------------------------
 // MCP server: `recall` as a tool the model calls mid-inference.
 //
@@ -4029,18 +5170,20 @@ fn stem_of(p: &Path) -> String {
 
 /// What the client is told the tool is for. This reaches the model through `tools/list` without a
 /// skill load, so it has to teach the whole convention in a paragraph.
-const RECALL_DESC: &str = "Recover the verbatim original behind a compaction marker in this \
-session's transcript. If you see \"[recompact: elided ...; rehydrate <prefix>]\", \
-\"[recompact: image elided ...]\", or a summary ending \"[recompact summary <key> — rehydratable]\", \
-the full content still exists untouched and this returns it. Recall before re-deriving: re-running \
-a search or a tool call costs more than reading back what it already produced, and guessing at an \
-elided detail is how a compacted session goes wrong. Call with no selector to list what is \
-recallable.";
+const RECALL_DESC: &str = "Read back anything compaction removed from this session, verbatim. \
+Two ways in: (1) query — words or an exact identifier; searches the originals behind every \
+summary and elision marker in this session's history and returns matching snippets with ids. \
+(2) selector — the id a marker or summary footer printed (\"[recompact: elided …; rehydrate \
+<id>]\", \"[recompact summary <key> · recall <id>]\"); returns that item in full. Use this before \
+re-running a search, re-reading a file, or guessing at a detail a summary dropped: reading back \
+what the session already produced is cheaper and exact. Call with no arguments to list this \
+session's summaries.";
 
 const INSTRUCTIONS: &str = "This session's transcript may have been compacted by \
-segment_recompact. Markers of the form \"[recompact: ...; rehydrate <prefix>]\" and summaries \
-ending \"[recompact summary <key> — rehydratable]\" mark content that was removed from context \
-but still exists verbatim. Use the recall tool to read it back rather than re-deriving it.";
+segment_recompact. Summaries ending \"[recompact summary <key> · recall <id>]\" and markers \
+like \"[recompact: elided …; rehydrate <id>]\" stand for content that still exists verbatim. \
+Use the recall tool — query=\"words\" to search it, selector=\"<id>\" to read one item — rather \
+than re-deriving it.";
 
 fn rpc_result(id: Value, result: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "result": result})
@@ -4068,6 +5211,11 @@ fn payload_of(records: &[Value]) -> Payload {
     let mut text = String::new();
     let mut images = Vec::new();
     for r in records {
+        if is_human_queued(r) {
+            text.push_str(&human_queued_text(r));
+            text.push('\n');
+            continue;
+        }
         let Some(content) = r.pointer("/message/content") else {
             continue;
         };
@@ -4162,12 +5310,11 @@ fn chunk_of(text: &str, chunk: usize) -> Result<(String, usize), String> {
 /// detail a walk through every chunk — the cost recall exists to avoid.
 fn digest_of(records: &[Value]) -> String {
     let mut out = format!(
-        "{} records. Recall any single one by its uuid prefix:\n",
+        "{} records. Recall any single one by its id:\n",
         records.len()
     );
     for r in records {
         let uuid = rec_uuid(r).unwrap_or("????????");
-        let kind = r.get("type").and_then(|v| v.as_str()).unwrap_or("?");
         let p = payload_of(std::slice::from_ref(r));
         let preview = p.text.replace('\n', " ");
         let imgs = if p.images.is_empty() {
@@ -4176,23 +5323,26 @@ fn digest_of(records: &[Value]) -> String {
             format!(" [{} image(s)]", p.images.len())
         };
         out.push_str(&format!(
-            "  {} {kind}{imgs} — {}\n",
+            "  {} {}{imgs} — {}\n",
             uuid.get(..8).unwrap_or(uuid),
+            record_kind(r),
             truncate(&preview, 120)
         ));
     }
     out
 }
 
-fn list_summaries(dir: &Path, session: Option<&str>) -> Value {
-    let path = match session {
-        Some(s) => session_path(dir, s),
-        None => match newest_session(dir) {
-            Some(s) => session_path(dir, &s),
-            None => {
-                return tool_text(format!("no sessions under {}", dir.display()), true);
-            }
-        },
+fn list_summaries(ctx: &RecallCtx, session: Option<&str>) -> Value {
+    let Some(path) = session
+        .or(ctx.session.as_deref())
+        .and_then(|s| ctx.session_file(s))
+    else {
+        return tool_text(
+            "this recall server does not know which session you are in; pass session=<session id> \
+             to list its summaries. Ids printed in markers and footers need no session."
+                .to_string(),
+            true,
+        );
     };
     let records = match load_jsonl_soft(&path) {
         Ok(r) => r,
@@ -4205,15 +5355,15 @@ fn list_summaries(dir: &Path, session: Option<&str>) -> Value {
     if synths.is_empty() {
         return tool_text(
             format!(
-                "{} holds no compaction summaries; nothing to recall by key or ordinal. \
-                 Uuid prefixes from markers still resolve project-wide.",
+                "{} holds no compaction summaries. Ids from elision markers still resolve, and \
+                 query= searches everything compaction removed.",
                 stem_of(&path)
             ),
             false,
         );
     }
     let mut out = format!("{} summaries in {}:\n", synths.len(), stem_of(&path));
-    for (n, r) in synths.iter().enumerate() {
+    for r in &synths {
         let part = r
             .pointer("/recompactProvenance/part")
             .and_then(|v| v.as_str())
@@ -4227,28 +5377,39 @@ fn list_summaries(dir: &Path, session: Option<&str>) -> Value {
             .pointer("/message/content/0/text")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let id = rec_uuid(r).map(|u| u.get(..8).unwrap_or(u)).unwrap_or("?");
         out.push_str(&format!(
-            "  [{n}] part {part} covers {covered} records: {}\n",
+            "  {id} (part {part}, {covered} records): {}\n",
             truncate(&text.replace('\n', " "), 100)
         ));
     }
     tool_text(out, false)
 }
 
-fn call_recall(dir: &Path, args: &Value) -> Value {
+fn call_recall(ctx: &RecallCtx, args: &Value) -> Value {
     let selector = args.get("selector").and_then(|v| v.as_str());
-    let session = args.get("session").and_then(|v| v.as_str());
+    let query = args.get("query").and_then(|v| v.as_str());
+    let session = args
+        .get("session")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
     let chunk = args
         .get("chunk")
         .and_then(|v| v.as_u64())
         .unwrap_or(1)
         .max(1) as usize;
 
+    if let Some(q) = query.filter(|q| !q.trim().is_empty()) {
+        return match recall_query(ctx, q, session, 12) {
+            Ok(t) => tool_text(t, false),
+            Err(e) => tool_text(e, true),
+        };
+    }
     let Some(selector) = selector.filter(|s| !s.trim().is_empty()) else {
-        return list_summaries(dir, session);
+        return list_summaries(ctx, session);
     };
 
-    let recalled = match recall_select(dir, selector, session) {
+    let recalled = match recall_select_ctx(ctx, selector.trim(), session) {
         Ok(r) => r,
         Err(e) => return tool_text(e, true),
     };
@@ -4313,21 +5474,26 @@ fn tools_list() -> Value {
         "name": "recall",
         "title": "Recall compacted content",
         "description": RECALL_DESC,
+        "annotations": {"readOnlyHint": true, "openWorldHint": false},
         "inputSchema": {
             "type": "object",
             "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Words, an exact identifier, or \"a quoted phrase\" to search for in everything compaction removed from this session (originals behind summaries and markers, across all compaction generations). Returns ranked snippets with ids."
+                },
                 "selector": {
                     "type": "string",
-                    "description": "The handle a marker printed: an 8+ character uuid prefix (from \"rehydrate <prefix>\"), a summary key (from \"[recompact summary <key> ...]\"), or a listing ordinal. Omit to list what is recallable."
+                    "description": "An id a marker or footer printed (8+ hex characters, e.g. from \"recall 1a2b3c4d\" or \"rehydrate 1a2b3c4d\"); returns that item in full. Summary keys like \"12.3\" also work within one session."
                 },
                 "chunk": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "1-based chunk for payloads too large to return at once. Defaults to 1; the response says how many there are."
+                    "description": "1-based chunk for a payload too large to return at once. Defaults to 1; the response says how many there are."
                 },
                 "session": {
                     "type": "string",
-                    "description": "Session id to resolve against. Only needed for summary keys and ordinals; uuid prefixes resolve across the whole project."
+                    "description": "Session id to resolve against. Rarely needed: the server already knows the session it serves, and ids resolve everywhere."
                 }
             }
         }
@@ -4336,7 +5502,12 @@ fn tools_list() -> Value {
 
 /// Serve MCP over any line-oriented pair of streams. Generic rather than bound to stdio so the
 /// tests can drive it in-process, as every other test in this crate does.
-pub fn mcp_serve<R: std::io::BufRead, W: Write>(input: R, mut output: W, dir: &Path) -> i32 {
+pub fn mcp_serve<R: std::io::BufRead, W: Write, C: Into<RecallCtx>>(
+    input: R,
+    mut output: W,
+    ctx: C,
+) -> i32 {
+    let ctx: RecallCtx = ctx.into();
     for line in input.lines() {
         let Ok(line) = line else { break };
         let line = line.trim();
@@ -4384,7 +5555,7 @@ pub fn mcp_serve<R: std::io::BufRead, W: Write>(input: R, mut output: W, dir: &P
                         .pointer("/params/arguments")
                         .cloned()
                         .unwrap_or_else(|| json!({}));
-                    rpc_result(id, call_recall(dir, &args))
+                    rpc_result(id, call_recall(&ctx, &args))
                 } else {
                     rpc_error(id, -32602, &format!("unknown tool: {name}"))
                 }
@@ -4404,19 +5575,95 @@ pub fn mcp_serve<R: std::io::BufRead, W: Write>(input: R, mut output: W, dir: &P
     0
 }
 
+/// The session a process runs inside, when Claude Code says so (it exports the id to MCP servers
+/// and to Bash tool subprocesses alike).
+pub fn current_session_id() -> Option<String> {
+    std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+fn recall_ctx_from(args_dir: Option<&str>) -> Option<RecallCtx> {
+    let dir = args_dir
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("CLAUDE_PROJECT_DIR").ok().and_then(|d| project_dir_for(Path::new(&d))))
+        .or_else(|| std::env::current_dir().ok().and_then(|d| project_dir_for(&d)))?;
+    let session = current_session_id();
+    // The session file decides the project dir when the two disagree (worktree resumes move it).
+    let dir = session
+        .as_deref()
+        .and_then(|s| locate_session(Some(&session_path(&dir, s)), s))
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or(dir);
+    Some(RecallCtx { dir, session })
+}
+
 /// Serve MCP on stdio. Started automatically by the plugin; not normally run by hand.
 pub fn cmd_mcp(args: &[String]) -> i32 {
     let (pos, _opts) = parse_opts(args);
-    let dir = pos
-        .first()
-        .map(PathBuf::from)
-        .or_else(|| std::env::var("CLAUDE_PROJECT_DIR").ok().and_then(|d| project_dir_for(Path::new(&d))))
-        .or_else(|| std::env::current_dir().ok().and_then(|d| project_dir_for(&d)));
-    let Some(dir) = dir else {
+    let Some(ctx) = recall_ctx_from(pos.first().map(String::as_str)) else {
         eprintln!("error: cannot resolve a project transcript dir (set CLAUDE_PROJECT_DIR)");
         return 1;
     };
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
-    mcp_serve(stdin.lock(), stdout.lock(), &dir)
+    mcp_serve(stdin.lock(), stdout.lock(), ctx)
+}
+
+/// `recall` from a shell: the same engine as the MCP tool, printed. Inside a Claude Code Bash
+/// tool the session is known from the environment, exactly as the server knows it.
+pub fn cmd_recall(args: &[String]) -> i32 {
+    let (pos, opts) = parse_opts(args);
+    let Some(mut ctx) = recall_ctx_from(opts.get("dir").and_then(|v| v.as_str())) else {
+        eprintln!("error: cannot resolve a project transcript dir");
+        return 1;
+    };
+    if let Some(s) = opts.get("session").and_then(|v| v.as_str()) {
+        ctx.session = Some(s.to_string());
+    }
+    let mut call = json!({});
+    if let Some(q) = opts.get("query").and_then(|v| v.as_str()) {
+        call["query"] = json!(q);
+    }
+    if let Some(sel) = pos.first() {
+        call["selector"] = json!(sel);
+    }
+    if let Some(c) = opts.get("chunk").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()) {
+        call["chunk"] = json!(c);
+    }
+    let res = call_recall(&ctx, &call);
+    let mut rc = 0;
+    if res["isError"].as_bool().unwrap_or(false) {
+        rc = 1;
+    }
+    for c in res["content"].as_array().cloned().unwrap_or_default() {
+        match c["type"].as_str() {
+            Some("text") => println!("{}", c["text"].as_str().unwrap_or("")),
+            Some("image") => println!("[image: {} base64 bytes, {}]", c["data"].as_str().map_or(0, str::len), c["mimeType"].as_str().unwrap_or("?")),
+            _ => {}
+        }
+    }
+    rc
+}
+
+/// `recompact hook <event>`: hook entry points. Reads the hook's JSON on stdin; prints hook
+/// output JSON on stdout, or nothing. Never fails loudly — a broken hook must not block a resume.
+pub fn cmd_hook(args: &[String]) -> i32 {
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let Ok(v) = serde_json::from_str::<Value>(&input) else {
+        return 0;
+    };
+    match args.first().map(String::as_str) {
+        Some("session-start") => {
+            if let Some(ctx) = session_start_context(&v) {
+                println!(
+                    "{}",
+                    json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}})
+                );
+            }
+        }
+        _ => {}
+    }
+    0
 }

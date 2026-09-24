@@ -269,9 +269,14 @@ fn no_selector_lists_what_is_recallable() {
             last_prompt("fffffff1-ffff-4fff-8fff-ffffffffffff", "go"),
         ],
     );
-    let result = call(&dir, json!({}));
+    // Which session's summaries to list is never guessed: with none named or bound, the answer
+    // says so and points at ids, which resolve anywhere.
+    let unbound = call(&dir, json!({}));
+    assert_eq!(unbound["isError"], true);
+    assert!(text_of(&unbound).contains("does not know which session"));
+    let result = call(&dir, json!({"session": "plain"}));
     assert_eq!(result["isError"], false);
-    // No compaction has happened, so the honest answer names that and points at uuid prefixes.
+    // No compaction has happened, so the honest answer names that.
     assert!(text_of(&result).contains("no compaction summaries"));
 }
 
@@ -457,7 +462,7 @@ fn a_multi_record_expansion_too_big_to_serve_returns_an_index_not_a_wall_of_text
     let result = call(&dir, json!({"selector": "0", "session": "twin"}));
     assert_eq!(result["isError"], false, "got: {}", text_of(&result));
     let t = text_of(&result);
-    assert!(t.contains("Recall any single one by its uuid prefix"), "got: {}", &t[..200.min(t.len())]);
+    assert!(t.contains("Recall any single one by its id"), "got: {}", &t[..200.min(t.len())]);
     for u in [b, c] {
         assert!(t.contains(&u[..8]), "index should name every covered record");
     }

@@ -4,8 +4,8 @@ use std::env;
 use std::process::exit;
 
 use recompact::{
-    cmd_assemble, cmd_continue, cmd_extract, cmd_mcp, cmd_probe, cmd_rehydrate, cmd_resume,
-    cmd_scan, cmd_shell, cmd_verify, USAGE,
+    cmd_assemble, cmd_continue, cmd_extract, cmd_hook, cmd_mcp, cmd_probe, cmd_recall,
+    cmd_rehydrate, cmd_resume, cmd_scan, cmd_shell, cmd_verify, USAGE,
 };
 
 fn main() {
@@ -21,6 +21,8 @@ fn main() {
         "probe" => cmd_probe(&args[2..]),
         "rehydrate" => cmd_rehydrate(&args[2..]),
         "mcp" => cmd_mcp(&args[2..]),
+        "recall" => cmd_recall(&args[2..]),
+        "hook" => cmd_hook(&args[2..]),
         "continue" => cmd_continue(&args[2..]),
         "shell" => cmd_shell(&args[2..]),
         "resume" => cmd_resume(&args[2..]),

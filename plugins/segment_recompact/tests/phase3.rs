@@ -325,7 +325,9 @@ fn salience_session() -> Vec<Value> {
         user("u1", None, "read the big file"),
         tool_use_named("a1", "u1", "read_1", "Read"),
         tool_result_sized("r1", "a1", "read_1", 6000),
-        assistant("a2", "r1", "read it"),
+        // Prose does not mask, so a unit only earns a summary once it holds more than a summary
+        // would: token accounting counts what the model is sent, not the JSON envelope.
+        assistant("a2", "r1", &format!("read it. {}", "The file lists configuration entries. ".repeat(60))),
         user("u2", Some("a2"), "run the build"),
         tool_use_named("a3", "u2", "bash_1", "Bash"),
         {
@@ -333,7 +335,7 @@ fn salience_session() -> Vec<Value> {
             r["message"]["content"][0]["is_error"] = json!(true);
             r
         },
-        assistant("a4", "r2", "build failed with an error"),
+        assistant("a4", "r2", &format!("build failed with an error. {}", "The compiler rejected the config. ".repeat(60))),
         user("u3", Some("a4"), "actually try the other config"),
         assistant("a5", "u3", "trying"),
         user("u4", Some("a5"), "status?"),
