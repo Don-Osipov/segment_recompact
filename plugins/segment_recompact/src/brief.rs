@@ -709,7 +709,7 @@ pub fn session_start_context(input: &Value) -> Option<String> {
     if since.is_empty() {
         lines.push(
             "The final assistant message is the orientation note: read its \"State when compacted\" list before acting. \
-             Summaries and that list are a snapshot — re-check anything external (PRs, deploys, database rows, running jobs) \
+             Summaries and that list are a snapshot: re-check anything external (PRs, deploys, database rows, running jobs) \
              before relying on it. For an exact detail a summary dropped, call the recall tool (query= to search, selector= for a marker) \
              instead of re-running the work."
                 .to_string(),
@@ -722,7 +722,7 @@ pub fn session_start_context(input: &Value) -> Option<String> {
             .unwrap_or_default();
         if last_pre.contains("recompact") {
             lines.push(
-                "The /recompact request near the end of this transcript is the one that produced this session; it has already run — do not run it again."
+                "The /recompact request near the end of this transcript is the one that produced this session; it has already run, so do not run it again."
                     .to_string(),
             );
         }
@@ -1090,7 +1090,7 @@ pub fn preamble_text(p: &PreambleInput) -> String {
          Without the tool, in a shell: `recompact recall --query \"words\"` or `recompact recall <id>`.\n"
     );
     s.push_str(
-        "\nState when compacted — a snapshot; re-check anything external (PRs, deploys, database rows, running jobs) before relying on it:\n",
+        "\nState when compacted (a snapshot; re-check anything external, such as PRs, deploys, database rows, or running jobs, before relying on it):\n",
     );
     if let Some(snap) = p.snapshot {
         s.push_str(&format!(

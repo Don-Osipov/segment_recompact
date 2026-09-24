@@ -1,6 +1,6 @@
 ---
 name: recompact
-description: Offline, segment-wise compaction of a Claude Code session .jsonl, plus recovery of anything a past compaction removed. Keeps every user turn verbatim, replaces older agent work with summaries or masked payloads that carry provenance to the untouched originals, and closes the file with an orientation brief for whoever resumes it. Use when asked to recompact / compress / shrink a session transcript — AND when asked to recover, rehydrate, or look up content from an earlier or compacted session ("what did the research say", "restore that elided result", "[recompact: …] marker", "recompact summary", "recall"), or when the current transcript contains such markers and the verbatim original would help.
+description: Offline, segment-wise compaction of a Claude Code session .jsonl, plus recovery of anything a past compaction removed. Keeps every user turn verbatim, replaces older agent work with summaries or masked payloads that carry provenance to the untouched originals, and closes the file with an orientation brief for whoever resumes it. Use when asked to recompact / compress / shrink a session transcript, and also when asked to recover, rehydrate, or look up content from an earlier or compacted session ("what did the research say", "restore that elided result", "[recompact: …] marker", "recompact summary", "recall"), or when the current transcript contains such markers and the verbatim original would help.
 user_invocable: true
 ---
 
@@ -13,8 +13,8 @@ you or by a headless model) or a masked copy whose bulky tool output is replaced
 marker. Everything removed can be read back with `recall`.
 
 Helper binary: `"${CLAUDE_PLUGIN_ROOT}/bin/recompact"` (also on PATH as `recompact`). Build it if
-missing (needs a Rust toolchain); remove the old binary first — copying over a signed macOS binary
-gets it killed on launch:
+missing (needs a Rust toolchain); remove the old binary first, because copying over a signed macOS
+binary gets it killed on launch:
 
 ```bash
 [ -x "${CLAUDE_PLUGIN_ROOT}/bin/recompact" ] || ( cd "${CLAUDE_PLUGIN_ROOT}" && cargo build --release \
@@ -37,10 +37,10 @@ Inside Claude Code, commands that take a session default to the current one: Cla
 
 ## Waking up in a twin
 
-The last assistant message is the orientation note. It holds a **State when compacted** list —
-files changed (from the tool calls, not from prose), commits and branches, the last observed state
-of each PR, the last validation command and how it ended, the most recent asks — and the user's
-**standing instructions, verbatim**. On resume, a SessionStart hook adds how long ago the
+The last assistant message is the orientation note. It holds a **State when compacted** list
+(files changed, taken from the tool calls rather than prose; commits and branches; the last
+observed state of each PR; the last validation command and how it ended; the most recent asks)
+and the user's **standing instructions, verbatim**. On resume, a SessionStart hook adds how long ago the
 compaction was, how long the work itself has been idle, and what changed in the repo since.
 
 1. **Already-compacted check.** If the last user turn before the note asked for /recompact, that
@@ -50,8 +50,8 @@ compaction was, how long the work itself has been idle, and what changed in the 
    on it: PR state (`gh pr view`), deploys, database rows, running jobs, branch heads.
 3. **Recall before re-deriving.** A summary is honest but lossy. Lines beginning `⟨carried⟩` were
    copied mechanically from the original (changed files, verbatim errors, identifiers later turns
-   used). For anything else exact — an error message, a query result, a file as it was, a
-   screenshot — call `recall` instead of re-running the work or guessing.
+   used). For anything else exact (an error message, a query result, a file as it was, a
+   screenshot), call `recall` instead of re-running the work or guessing.
 4. **User turns are verbatim**, and so are messages the user typed mid-turn (shown as "The user sent
    a new message while you were working").
 
@@ -74,19 +74,19 @@ Without the tool, in a shell: `recompact recall --query "words"` or `recompact r
 
 ## Compacting
 
-All numbers are **context tokens** — what `/context` shows. The helper measures what the model is
+All numbers are **context tokens**, what `/context` shows. The helper measures what the model is
 actually sent (message text, tool calls and results, the rendered text of attachments; never the
 JSON envelope, and never persisted thinking) at the session model's measured tokenizer ratio, plus
 ~35k for system prompt and tools (`--overhead` overrides it). A session's live size comes from its
-last usage record, which also counts preserved thinking — on Opus/Fable that can be a third of it,
-and none of it survives into the twin.
+last usage record, which also counts preserved thinking. On Opus/Fable that can be a third of
+it, and none of it survives into the twin.
 
 What every compaction does, whatever the mode:
 
 - keeps every user turn and every mid-turn user message verbatim;
 - drops harness ceremony outside the recent tail (per-turn reminders, tool/skill/agent listings,
-  CLAUDE.md copies, prompt snapshots) — resume re-announces the current versions — and removes
-  persisted thinking everywhere;
+  CLAUDE.md copies, prompt snapshots), which resume re-announces in their current versions, and
+  removes persisted thinking everywhere;
 - keeps the last `--keep` turns (default 1) verbatim, but at most `--tail-budget` tokens of them
   (default 80000): an oversized final turn keeps only its newest parts;
 - appends beneath each summary its changed files, its errors verbatim, and the identifiers that

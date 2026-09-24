@@ -69,7 +69,7 @@ A compacted twin:
 - keeps every user turn, including messages typed mid-turn, verbatim;
 - keeps the last turn verbatim up to a tail budget, and summarizes or masks older agent work;
 - carries, beneath each summary, the files it changed, its errors verbatim, and the identifiers
-  later turns still use — decided by code from the session's future, not by the summarizer;
+  later turns still use, chosen by code from the session's future rather than by the summarizer;
 - drops stale harness ceremony and persisted thinking, which Claude Code re-creates or strips anyway;
 - ends with an orientation note: a mechanical brief of where the work stood (files, commits, PRs,
   the last check and its result, the most recent asks) and the user's standing instructions quoted

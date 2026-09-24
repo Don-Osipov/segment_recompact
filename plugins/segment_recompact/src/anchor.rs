@@ -110,7 +110,8 @@ pub fn identifiers(text: &str, out: &mut Vec<String>) {
                 let span = after[..end].trim();
                 if (3..=80).contains(&span.len())
                     && !span.contains('\n')
-                    && !span.starts_with("``")
+                    && !span.starts_with('`')
+                    && !span.starts_with('-')
                     && code_shaped(span)
                 {
                     out.push(span.to_string());
@@ -303,6 +304,7 @@ pub fn hindsight_anchors(
     part: &[usize],
     mentions: &Mentions,
     summary: &str,
+    skip: &HashSet<String>,
     max_items: usize,
     max_chars: usize,
 ) -> Vec<String> {
@@ -317,7 +319,7 @@ pub fn hindsight_anchors(
     }
     let mut scored: BTreeMap<String, u32> = BTreeMap::new();
     for id in local {
-        if summary.contains(id.as_str()) || scored.contains_key(&id) {
+        if summary.contains(id.as_str()) || scored.contains_key(&id) || skip.contains(&id) {
             continue;
         }
         let w = mentions.later_weight(&id, end);
@@ -446,6 +448,46 @@ pub fn retention(
         missing.into_iter().take(8).map(|(_, id)| id).collect(),
     )
 }
+
+/// Background identifiers not worth carrying beneath any summary: instruction and memory files,
+/// the session's working directories, and anything used in a quarter or more of the session's
+/// turns say nothing specific about a unit. An
+/// identifier a later user turn names is NOT skipped even though that turn is verbatim: the
+/// carried line is what links the name back to the work that introduced it.
+pub fn anchor_skip_set(
+    mentions: &Mentions,
+    turn_of: &[usize],
+    turns: usize,
+    workdirs: &[String],
+) -> HashSet<String> {
+    let mut skip: HashSet<String> = INSTRUCTION_FILES.iter().map(|s| s.to_string()).collect();
+    skip.extend(workdirs.iter().cloned());
+    for (id, occ) in &mentions.by_ident {
+        let base = id.rsplit('/').next().unwrap_or(id);
+        if INSTRUCTION_FILES.contains(&base) || workdirs.iter().any(|w| w.starts_with(id.as_str()))
+        {
+            skip.insert(id.clone());
+            continue;
+        }
+        let distinct: HashSet<usize> = occ
+            .iter()
+            .map(|(i, _)| turn_of.get(*i).copied().unwrap_or(0))
+            .collect();
+        if distinct.len() >= 4 && distinct.len() * 4 > turns {
+            skip.insert(id.clone());
+        }
+    }
+    skip
+}
+
+/// Files every session touches for its own instructions and memory.
+const INSTRUCTION_FILES: &[&str] = &[
+    "CLAUDE.md",
+    "CLAUDE.local.md",
+    "AGENTS.md",
+    "MEMORY.md",
+    "AGENTS.override.md",
+];
 
 /// Identifier set of a record set's model-visible text, recognizing `vocab` words in plain
 /// text the same way `Mentions` does.

@@ -972,7 +972,7 @@ fn print_budget_plan(b: &BudgetPlan, calib: &Calib) {
     }
     if b.planned_total > b.target {
         eprintln!(
-            "plan: total {} conversation tokens, {} OVER target — floors and fixed cost hold; this is the price of retention",
+            "plan: total {} conversation tokens, {} OVER target: floors and fixed cost hold; this is the price of retention",
             b.planned_total,
             b.planned_total - b.target
         );
@@ -1826,6 +1826,7 @@ pub fn augment_summary(
     part: &[usize],
     summary: &str,
     mentions: &Mentions,
+    skip: &HashSet<String>,
     root: Option<&str>,
 ) -> String {
     let rel = |p: &str| -> String {
@@ -1866,7 +1867,7 @@ pub fn augment_summary(
             out.push_str(&format!("\n⟨carried⟩ error from {tool}: {err}"));
         }
     }
-    let anchors = hindsight_anchors(records, part, mentions, &out, 12, 480);
+    let anchors = hindsight_anchors(records, part, mentions, &out, skip, 12, 480);
     if !anchors.is_empty() {
         let shown: Vec<String> = anchors.iter().map(|a| format!("`{}`", rel(a))).collect();
         out.push_str(&format!("\n⟨carried⟩ used later: {}", shown.join(", ")));
@@ -1895,7 +1896,7 @@ fn ledger_collapse_warning(records: &[Value], new_ledger: &str) {
     if !dropped.is_empty() {
         let shown: Vec<String> = dropped.iter().take(12).map(|x| format!("`{x}`")).collect();
         eprintln!(
-            "warning: the new ledger drops {} identifier(s) the previous ledger carried: {}{} — confirm they are obsolete",
+            "warning: the new ledger drops {} identifier(s) the previous ledger carried: {}{}. Confirm they are obsolete",
             dropped.len(),
             shown.join(", "),
             if dropped.len() > 12 { ", …" } else { "" }
@@ -2178,6 +2179,20 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     let mentions = Mentions::build(&records);
     // Carried paths are shown relative to the directory the session's edits share.
     let path_root = session_path_root(&records);
+    let mut turn_of_record = vec![0usize; records.len()];
+    for (s, seg) in segs.iter().enumerate() {
+        turn_of_record[seg.user_idx] = s + 1;
+        for &i in &seg.activity {
+            turn_of_record[i] = s + 1;
+        }
+    }
+    let mut workdirs: Vec<String> = records
+        .iter()
+        .filter_map(|r| r.get("cwd").and_then(|v| v.as_str()).map(str::to_string))
+        .collect();
+    workdirs.sort();
+    workdirs.dedup();
+    let anchor_skip = anchor_skip_set(&mentions, &turn_of_record, segs.len(), &workdirs);
 
     // Shared builder for synthetic summary records (classic mode and budget-planned units).
     let make_synthetic = |seg: &Segment, part: &[usize], key: &str, first: bool, summary: String| -> Value {
@@ -2199,7 +2214,7 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         let uuid = uuid_v4();
         let text = format!(
             "{}\n{}",
-            augment_summary(&records, part, &summary, &mentions, path_root.as_deref()),
+            augment_summary(&records, part, &summary, &mentions, &anchor_skip, path_root.as_deref()),
             summary_footer(key, &uuid)
         );
         json!({
@@ -2529,13 +2544,6 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         }
     }
 
-    let mut turn_of_record = vec![0usize; records.len()];
-    for (s, seg) in segs.iter().enumerate() {
-        turn_of_record[seg.user_idx] = s + 1;
-        for &i in &seg.activity {
-            turn_of_record[i] = s + 1;
-        }
-    }
     let (kept_ids, total_ids, missing_ids) = retention(
         &mentions,
         &visible_identifiers(&out, &mentions.vocab),
@@ -4835,7 +4843,7 @@ pub struct Recalled {
 
 const NO_SESSION_FOR_KEY: &str = "summary keys and ordinals index one session's summaries, and this \
 recall server does not know which session you are in. Use the 8-character id from the summary \
-footer (\"recall <id>\") instead — it resolves anywhere — or pass session=<session id>.";
+footer (\"recall <id>\") instead, which resolves anywhere, or pass session=<session id>.";
 
 /// Resolve a selector to verbatim records, for a caller that knows only the project dir.
 pub fn recall_select(

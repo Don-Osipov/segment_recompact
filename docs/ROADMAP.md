@@ -139,7 +139,7 @@ Driven by a month of real use (62 twins, 56 resumed) and the June–September 20
       pinning restores 0% violations in Governance Decay, arXiv 2606.22528); a SessionStart hook adds
       compaction age, idle time, and repo drift (the live-evidence rule of arXiv 2609.13800).
 - [x] **Carried evidence.** Changed files, verbatim errors, and future-referenced identifiers go
-      beneath each summary mechanically (offline hindsight — the Slipstream check of arXiv
+      beneath each summary mechanically (offline hindsight: the Slipstream check of arXiv
       2605.08580 without a model; artifact tracking is every method's weakest dimension in Factory's
       probe evaluation). Errors carried verbatim retire the blunt error floor.
 - [x] **Fidelity fix:** messages typed mid-turn arrive as `queued_command` attachments and were
