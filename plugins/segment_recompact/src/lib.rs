@@ -18,9 +18,11 @@ use serde_json::{json, Map, Value};
 mod accounting;
 mod anchor;
 mod brief;
+mod launcher;
 pub use accounting::*;
 pub use anchor::*;
 pub use brief::*;
+pub use launcher::*;
 
 pub const TOOL_RESULT_TRUNC: usize = 1500;
 
@@ -35,15 +37,19 @@ removed; inside Claude Code the current session is known)\n  \
 recompact rehydrate <compacted.jsonl> [part-key | ordinal | uuid | uuid-prefix>=8]\n  \
 recompact mcp       [project-dir]  (MCP stdio server exposing `recall`;\n                      \
 started by the plugin, not normally run by hand)\n  \
-recompact hook      session-start  (SessionStart hook: orients a resumed twin;\n                      \
+recompact hook      <event>  (plugin hooks: session-start orients a resumed twin;\n                      \
 installed by the plugin)\n  \
 recompact continue  [session.jsonl | sessionId] [--threshold T] [--keep K]\n                      \
 [--summarize-with M [--escalate-with M2] [--escalate-above S]]\n                      \
 (no session: the current Claude Code session)\n  \
-recompact shell     [sessionId] [--threshold T] [--goal G] [--auto]\n                      \
-[--summarize-with M ...] (continuous self-compacting session;\n                      \
-agent SIGTERM handoff auto-cycles; old summaries consolidate\n                      \
-into epochs re-derived from raw provenance)\n  \
+recompact shell     [--at T] [--target T] [--mask] [--no-auto] [claude args...]\n                      \
+(run claude with compaction in place: a bare /recompact, or a\n                      \
+turn ending over --at (default 400k on 1M models, else 140k),\n                      \
+compacts and resumes in the same terminal with the same flags)\n  \
+recompact handoff   [sessionId] [--continue-after]  (compact the current session:\n                      \
+queued for turn end under `shell`; otherwise compacts now and\n                      \
+prints the resume command)\n  \
+recompact prewarm   <session> [--target T]  (summarize ahead into the cache)\n  \
 recompact resume    <session.jsonl | sessionId>\n  \
 recompact scan      [project-dir] [--estimate]\n\n\
   Token numbers are context tokens (what /context shows), calibrated from the\n  \
@@ -738,6 +744,9 @@ pub fn parse_opts(args: &[String]) -> (Vec<String>, Map<String, Value>) {
         "summarize-errors",
         "error-floor",
         "json",
+        "force",
+        "mask",
+        "continue-after",
     ];
     let mut positional = Vec::new();
     let mut opts = Map::new();
@@ -3307,6 +3316,7 @@ const BATCH_MAX_UNITS: usize = 10;
 const BATCH_MAX_CHARS: usize = 120_000;
 const SUMMARIZE_WAVES: usize = 3;
 
+#[derive(Clone, Debug)]
 pub struct SummarizeCfg {
     pub bin: String,
     pub model: String,
@@ -3326,11 +3336,16 @@ struct BatchJob {
 fn call_claude_stdin(bin: &str, model: &str, prompt: &str) -> Result<String, String> {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
-    let tmp = std::env::temp_dir().join(format!("recompact-sum-{}", uuid_v4()));
+    // One fixed, empty cwd: Claude Code creates a project dir per cwd even without persistence,
+    // and a fresh cwd per call left a directory behind for every batch.
+    let tmp = std::env::temp_dir().join("recompact-summarizer");
     let _ = fs::create_dir_all(&tmp);
     let mut child = Command::new(bin)
         .current_dir(&tmp)
-        .args(["-p", "--model", model, "--strict-mcp-config"])
+        .args(["-p", "--model", model, "--strict-mcp-config", "--no-session-persistence"])
+        // Our own hooks stay out of the summarizer, and it must never signal a launcher.
+        .env("RECOMPACT_INTERNAL", "1")
+        .env_remove("RECOMPACT_SHELL")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -3343,7 +3358,6 @@ fn call_claude_stdin(bin: &str, model: &str, prompt: &str) -> Result<String, Str
             .map_err(|e| e.to_string())?;
     }
     let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    let _ = fs::remove_dir_all(&tmp);
     if !out.status.success() {
         return Err(format!("{bin} exited {}", out.status));
     }
@@ -3515,6 +3529,7 @@ pub fn headless_summarize_partial(
 
 // ---------------------------------------------------------------------- continue (shared core)
 
+#[derive(Clone, Debug)]
 pub struct ContinueOpts {
     pub threshold: usize,
     pub keep: Option<String>,
@@ -3526,6 +3541,16 @@ pub struct ContinueOpts {
     pub error_floor: bool,
     /// `--overhead`: system+tools tokens of the environment the twin resumes into.
     pub overhead: Option<String>,
+    /// `--target`: size to compact toward; defaults to the threshold.
+    pub target: Option<usize>,
+    /// `--force`: compact even when under the threshold (an explicit request).
+    pub force: bool,
+}
+
+impl ContinueOpts {
+    pub fn target(&self) -> usize {
+        self.target.unwrap_or(self.threshold)
+    }
 }
 
 /// Parse the continue/shell options shared by both commands.
@@ -3542,6 +3567,11 @@ pub fn continue_opts_from(opts: &Map<String, Value>) -> ContinueOpts {
         tail_budget: opts.get("tail-budget").and_then(|v| v.as_str()).map(String::from),
         error_floor: opts.get("error-floor").and_then(|v| v.as_bool()).unwrap_or(false),
         overhead: opts.get("overhead").and_then(|v| v.as_str()).map(String::from),
+        target: opts
+            .get("target")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse().ok()),
+        force: opts.get("force").and_then(|v| v.as_bool()).unwrap_or(false),
     }
 }
 
@@ -3571,6 +3601,145 @@ pub fn summarize_cfg_from_opts(opts: &Map<String, Value>) -> Option<SummarizeCfg
         })
 }
 
+/// Full-ladder pre-pass: plan exactly as assemble will (same units, same pricing: real lengths
+/// for cached summaries, the mechanical text for empty units, the cache's mean for the rest),
+/// summarize what the plan wants into the content-hash cache, and re-plan with the real lengths
+/// until it wants nothing new. A single pass is not enough: when real summaries cost more than
+/// the estimate, assemble's plan shifts onto units that were never summarized and refuses.
+/// Returns the content hashes of units the summarizer never covered; assemble masks them.
+/// `prewarm` runs this alone, ahead of time, so a later compaction finds the cache warm.
+pub fn summarize_for_plan(
+    active: &[Value],
+    calib: &Calib,
+    cfg: &SummarizeCfg,
+    o: &ContinueOpts,
+    cache_path: &Path,
+) -> HashSet<String> {
+    let keep: usize = o.keep.as_deref().and_then(|s| s.parse().ok()).unwrap_or(1);
+    let split: usize = o
+        .split
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SPLIT_THRESHOLD);
+    let tail_budget_tokens: usize = o
+        .tail_budget
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_TAIL_BUDGET);
+    let u = build_units_full(active, keep, split, true, tail_budget_tokens);
+    let epoch_map = epoch_digests(active, &u.segs, &u.seg_parts, &u.seg_keys, keep);
+    let empty: HashSet<String> = u
+        .seg_parts
+        .iter()
+        .zip(u.seg_keys.iter())
+        .flat_map(|(parts, keys)| {
+            parts
+                .iter()
+                .zip(keys.iter())
+                .filter(|(part, _)| unit_is_empty(active, part))
+                .map(|(_, k)| k.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let empty_cost = calib.tokens(EMPTY_UNIT_SUMMARY.len()) + SUMMARY_OVERHEAD_TOKENS;
+    let mut failed: HashSet<String> = HashSet::new(); // content hashes
+    const ROUNDS: usize = 5;
+    for round in 1..=ROUNDS {
+        let cache: Map<String, Value> = fs::read_to_string(cache_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        let price = |key: &str| -> Option<usize> {
+            if let Some(text) = u.key_hashes.get(key).and_then(|h| cache.get(h)).and_then(|v| v.as_str()) {
+                return Some(calib.tokens(text.len()) + SUMMARY_OVERHEAD_TOKENS);
+            }
+            empty.contains(key).then_some(empty_cost)
+        };
+        let b = plan_budget_calibrated(
+            &active,
+            &u.segs,
+            &u.plans,
+            &u.seg_parts,
+            &u.seg_keys,
+            o.target().saturating_sub(calib.overhead),
+            true,
+            !o.error_floor,
+            &epoch_map,
+            &calib,
+            unknown_summary_tokens(&cache, &calib),
+            price,
+        );
+        let mut work: Vec<(String, f32, String)> = Vec::new();
+        for unit in &b.units {
+            if unit.treatment != Treatment::Summarize || price(&unit.key).is_some() {
+                continue;
+            }
+            let h = &u.key_hashes[&unit.key];
+            if failed.contains(h) {
+                continue;
+            }
+            let p: usize = unit
+                .key
+                .split('.')
+                .nth(1)
+                .and_then(|x| x.parse().ok())
+                .unwrap_or(0);
+            let seg = &u.segs[unit.seg];
+            let part = &u.seg_parts[unit.seg][p];
+            // Epoch units summarize from RAW (via provenance); everything else from
+            // the current records.
+            let digest = match epoch_map.get(&unit.key) {
+                Some(Some(d)) => d.clone(),
+                _ => unit_digest(active, seg, part),
+            };
+            work.push((unit.key.clone(), unit.salience, digest));
+        }
+        if work.is_empty() {
+            break;
+        }
+        if round == ROUNDS {
+            // Out of rounds: whatever is still unwritten is masked instead.
+            failed.extend(work.iter().map(|(k, _, _)| u.key_hashes[k].clone()));
+            break;
+        }
+        eprintln!(
+            "continue: summarizing {} unit(s) with {}{}{}",
+            work.len(),
+            cfg.model,
+            cfg.escalate_with
+                .as_deref()
+                .map(|m| format!(" (escalating salience ≥ {} to {m})", cfg.escalate_above))
+                .unwrap_or_default(),
+            if round > 1 { format!(" (re-plan {round})") } else { String::new() }
+        );
+        let mut cache = cache;
+        let mut persist = |sums: &HashMap<String, String>| {
+            for (k, text) in sums {
+                if let Some(h) = u.key_hashes.get(k) {
+                    cache.insert(h.clone(), Value::String(text.clone()));
+                }
+            }
+            if fs::write(
+                cache_path,
+                serde_json::to_string_pretty(&Value::Object(cache.clone())).unwrap(),
+            )
+            .is_err()
+            {
+                eprintln!("continue: warning: cannot write summary cache {}", cache_path.display());
+            }
+        };
+        let (_sums, missing) = headless_summarize_partial(&work, cfg, &mut persist);
+        if !missing.is_empty() {
+            eprintln!(
+                "continue: no summary came back for {missing:?}; those units will be masked instead"
+            );
+            failed.extend(missing.iter().filter_map(|k| u.key_hashes.get(k).cloned()));
+        }
+    }
+    failed
+}
+
 /// Core continuation step, shared by `continue` and `shell`: resolve the newest compacted
 /// descendant; when over threshold, compact toward it (mask-only, or the full ladder when a
 /// summarizer is configured); verify with rollback; churn-guard.
@@ -3590,17 +3759,6 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
         eprintln!("error: session file not found: {}", latest_file.display());
         return (start_id.to_string(), 1);
     }
-    let keep: usize = o.keep.as_deref().and_then(|s| s.parse().ok()).unwrap_or(1);
-    let split: usize = o
-        .split
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_SPLIT_THRESHOLD);
-    let tail_budget_tokens: usize = o
-        .tail_budget
-        .as_deref()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(DEFAULT_TAIL_BUDGET);
     let cache_path = dir.join(".recompact-summary-cache.json");
 
     const ATTEMPTS: usize = 3;
@@ -3620,7 +3778,7 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
         // all); the churn guard below compares estimates, like with like.
         let current = calib.current_tokens(&active);
         let tokens = calib.context_tokens(&active);
-        if current <= o.threshold {
+        if !o.force && current <= o.threshold {
             eprintln!(
                 "continue: ~{current} context tokens ≤ threshold {}; nothing to compact ({})",
                 o.threshold,
@@ -3629,125 +3787,11 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
             return (latest, 0);
         }
 
-        // Full-ladder pre-pass: plan exactly as assemble will (same units, same pricing: real
-        // lengths for cached summaries, the mechanical text for empty units, the cache's mean for
-        // the rest), summarize what the plan wants, and re-plan with the real lengths until it
-        // wants nothing new. A single pass is not enough: when real summaries cost more than the
-        // estimate, assemble's plan shifts onto units that were never summarized and refuses.
+        // Full-ladder pre-pass: summarize what assemble's plan will want, then hand it the cache.
         let mut sums_path: Option<PathBuf> = None;
         let mut mask_path: Option<PathBuf> = None;
         if let Some(cfg) = &o.summarize {
-            let u = build_units_full(&active, keep, split, true, tail_budget_tokens);
-            let epoch_map = epoch_digests(&active, &u.segs, &u.seg_parts, &u.seg_keys, keep);
-            let empty: HashSet<String> = u
-                .seg_parts
-                .iter()
-                .zip(u.seg_keys.iter())
-                .flat_map(|(parts, keys)| {
-                    parts
-                        .iter()
-                        .zip(keys.iter())
-                        .filter(|(part, _)| unit_is_empty(&active, part))
-                        .map(|(_, k)| k.clone())
-                        .collect::<Vec<_>>()
-                })
-                .collect();
-            let empty_cost = calib.tokens(EMPTY_UNIT_SUMMARY.len()) + SUMMARY_OVERHEAD_TOKENS;
-            let mut failed: HashSet<String> = HashSet::new(); // content hashes
-            const ROUNDS: usize = 5;
-            for round in 1..=ROUNDS {
-                let cache: Map<String, Value> = fs::read_to_string(&cache_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                    .and_then(|v| v.as_object().cloned())
-                    .unwrap_or_default();
-                let price = |key: &str| -> Option<usize> {
-                    if let Some(text) = u.key_hashes.get(key).and_then(|h| cache.get(h)).and_then(|v| v.as_str()) {
-                        return Some(calib.tokens(text.len()) + SUMMARY_OVERHEAD_TOKENS);
-                    }
-                    empty.contains(key).then_some(empty_cost)
-                };
-                let b = plan_budget_calibrated(
-                    &active,
-                    &u.segs,
-                    &u.plans,
-                    &u.seg_parts,
-                    &u.seg_keys,
-                    o.threshold.saturating_sub(calib.overhead),
-                    true,
-                    !o.error_floor,
-                    &epoch_map,
-                    &calib,
-                    unknown_summary_tokens(&cache, &calib),
-                    price,
-                );
-                let mut work: Vec<(String, f32, String)> = Vec::new();
-                for unit in &b.units {
-                    if unit.treatment != Treatment::Summarize || price(&unit.key).is_some() {
-                        continue;
-                    }
-                    let h = &u.key_hashes[&unit.key];
-                    if failed.contains(h) {
-                        continue;
-                    }
-                    let p: usize = unit
-                        .key
-                        .split('.')
-                        .nth(1)
-                        .and_then(|x| x.parse().ok())
-                        .unwrap_or(0);
-                    let seg = &u.segs[unit.seg];
-                    let part = &u.seg_parts[unit.seg][p];
-                    // Epoch units summarize from RAW (via provenance); everything else from
-                    // the current records.
-                    let digest = match epoch_map.get(&unit.key) {
-                        Some(Some(d)) => d.clone(),
-                        _ => unit_digest(&active, seg, part),
-                    };
-                    work.push((unit.key.clone(), unit.salience, digest));
-                }
-                if work.is_empty() {
-                    break;
-                }
-                if round == ROUNDS {
-                    // Out of rounds: whatever is still unwritten is masked instead.
-                    failed.extend(work.iter().map(|(k, _, _)| u.key_hashes[k].clone()));
-                    break;
-                }
-                eprintln!(
-                    "continue: summarizing {} unit(s) with {}{}{}",
-                    work.len(),
-                    cfg.model,
-                    cfg.escalate_with
-                        .as_deref()
-                        .map(|m| format!(" (escalating salience ≥ {} to {m})", cfg.escalate_above))
-                        .unwrap_or_default(),
-                    if round > 1 { format!(" (re-plan {round})") } else { String::new() }
-                );
-                let mut cache = cache;
-                let mut persist = |sums: &HashMap<String, String>| {
-                    for (k, text) in sums {
-                        if let Some(h) = u.key_hashes.get(k) {
-                            cache.insert(h.clone(), Value::String(text.clone()));
-                        }
-                    }
-                    if fs::write(
-                        &cache_path,
-                        serde_json::to_string_pretty(&Value::Object(cache.clone())).unwrap(),
-                    )
-                    .is_err()
-                    {
-                        eprintln!("continue: warning: cannot write summary cache {}", cache_path.display());
-                    }
-                };
-                let (_sums, missing) = headless_summarize_partial(&work, cfg, &mut persist);
-                if !missing.is_empty() {
-                    eprintln!(
-                        "continue: no summary came back for {missing:?}; those units will be masked instead"
-                    );
-                    failed.extend(missing.iter().filter_map(|k| u.key_hashes.get(k).cloned()));
-                }
-            }
+            let failed = summarize_for_plan(&active, &calib, cfg, o, &cache_path);
             if !failed.is_empty() {
                 let hashes: Vec<&String> = failed.iter().collect();
                 let mp = std::env::temp_dir().join(format!("recompact-mask-{}.json", uuid_v4()));
@@ -3776,7 +3820,7 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
             a_args.push("mask".into());
         }
         a_args.push("--target".into());
-        a_args.push(o.threshold.to_string());
+        a_args.push(o.target().to_string());
         if o.error_floor {
             a_args.push("--error-floor".into());
         }
@@ -3870,138 +3914,6 @@ pub fn cmd_continue(args: &[String]) -> i32 {
 }
 
 // ----------------------------------------------------------------------------- subcommand: shell
-
-/// One continuous self-compacting session at the terminal: spawn claude interactively (inherited
-/// stdio), and when it exits, adopt the live head (interactive resume mints new bridge ids),
-/// compact if over threshold, and respawn. An active goal is re-engaged with a kick-prompt (a
-/// resumed goal does not start a turn on its own); --goal arms one on the first spawn.
-pub fn cmd_shell(args: &[String]) -> i32 {
-    let (pos, opts) = parse_opts(args);
-    let dir = match opts.get("dir").and_then(|v| v.as_str()) {
-        Some(d) => PathBuf::from(d),
-        None => match project_dir_from_cwd() {
-            Some(d) => d,
-            None => {
-                eprintln!("error: cannot derive the project dir from the cwd");
-                return 1;
-            }
-        },
-    };
-    let _ = fs::create_dir_all(&dir);
-    let mut id: Option<String> = pos.first().cloned();
-    let auto = opts.get("auto").and_then(|v| v.as_bool()).unwrap_or(false);
-    let max_cycles: usize = opts
-        .get("max-cycles")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let goal = opts.get("goal").and_then(|v| v.as_str()).map(String::from);
-    let kick = opts
-        .get("kick")
-        .and_then(|v| v.as_str())
-        .unwrap_or("continue")
-        .to_string();
-    let bin = opts
-        .get("claude-bin")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .or_else(|| std::env::var("RECOMPACT_CLAUDE_BIN").ok())
-        .unwrap_or_else(|| "claude".into());
-    let copts = continue_opts_from(&opts);
-    let mut first = true;
-    let mut cycles = 0usize;
-    loop {
-        cycles += 1;
-        if max_cycles > 0 && cycles > max_cycles {
-            break;
-        }
-        let mut cmd = std::process::Command::new(&bin);
-        if let Some(cur) = id.clone() {
-            let (next, rc) = continue_session(&dir, &cur, &copts);
-            if rc != 0 {
-                eprintln!("shell: continue reported an error; resuming {next}");
-            } else if next != cur {
-                eprintln!("shell: compacted {cur} -> {next}");
-            }
-            id = Some(next.clone());
-            cmd.arg("--resume").arg(&next);
-            let next_records = load_jsonl(&dir.join(format!("{next}.jsonl")));
-            // A resume starts on the saved default model and drops session-only effort; carry
-            // both over, letting `recompact shell --model/--effort` override them.
-            let mut flags = resume_flags(&next_records);
-            for key in ["model", "effort"] {
-                if let Some(v) = opts.get(key).and_then(|v| v.as_str()) {
-                    let flag = format!("--{key}");
-                    match flags.iter().position(|f| *f == flag) {
-                        Some(i) => flags[i + 1] = v.to_string(),
-                        None => flags.extend([flag, v.to_string()]),
-                    }
-                }
-            }
-            cmd.args(&flags);
-            if first && goal.is_some() {
-                cmd.arg(format!("/goal {}", goal.clone().unwrap()));
-            } else if has_active_goal(&next_records) {
-                cmd.arg(&kick);
-            }
-        } else if let Some(g) = &goal {
-            cmd.arg(format!("/goal {g}"));
-        }
-        first = false;
-        let handoff = match cmd.status() {
-            Ok(st) => {
-                // Exit 143 (or death by SIGTERM) is the agent handing control back on purpose —
-                // cycle immediately. A human exit (0, or Ctrl+C's 130) keeps the confirmation
-                // prompt: a person who typed /exit may genuinely want out.
-                if !st.success() {
-                    eprintln!("shell: claude exited with {st}");
-                }
-                #[allow(unused_mut)]
-                let mut h = st.code() == Some(143);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::process::ExitStatusExt;
-                    h = h || st.signal() == Some(15);
-                }
-                h
-            }
-            Err(e) => {
-                eprintln!("shell: cannot spawn {bin}: {e}");
-                return 1;
-            }
-        };
-        if let Some(live) = newest_session(&dir) {
-            if id.as_deref() != Some(live.as_str()) {
-                eprintln!(
-                    "shell: live head moved {} -> {live}",
-                    id.as_deref().unwrap_or("<none>")
-                );
-                id = Some(live);
-            }
-        }
-        if handoff {
-            eprintln!("shell: agent handoff (SIGTERM exit); compacting and respawning");
-        } else if !auto {
-            eprintln!(
-                "shell: session {} ended. Enter = compact+respawn, q = quit",
-                id.as_deref().unwrap_or("<none>")
-            );
-            let mut line = String::new();
-            match std::io::stdin().read_line(&mut line) {
-                Err(_) | Ok(0) => break, // no terminal / EOF: quitting beats respawning forever
-                Ok(_) => {
-                    if line.trim() == "q" {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    if let Some(i) = &id {
-        println!("{i}");
-    }
-    0
-}
 
 /// Discovery: what is in this project dir, how big, how compressible, and which sessions are
 /// already compacted descendants of something else.
@@ -5908,16 +5820,27 @@ pub fn cmd_recall(args: &[String]) -> i32 {
 pub fn cmd_hook(args: &[String]) -> i32 {
     let mut input = String::new();
     let _ = std::io::stdin().read_to_string(&mut input);
+    // recompact's own headless summarizer and prewarm runs.
+    if std::env::var_os("RECOMPACT_INTERNAL").is_some() {
+        return 0;
+    }
     let Ok(v) = serde_json::from_str::<Value>(&input) else {
         return 0;
     };
-    if args.first().map(String::as_str) == Some("session-start") {
-        if let Some(ctx) = session_start_context(&v) {
-            println!(
-                "{}",
+    let out = match args.first().map(String::as_str) {
+        Some("session-start") => {
+            on_session_start(&v);
+            session_start_context(&v).map(|ctx| {
                 json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}})
-            );
+            })
         }
+        Some("user-prompt-submit") => on_prompt(&v),
+        Some("stop") => on_stop(&v),
+        Some("post-tool-use") => on_post_tool_use(&v),
+        _ => None,
+    };
+    if let Some(o) = out {
+        println!("{o}");
     }
     0
 }

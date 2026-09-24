@@ -25,15 +25,33 @@ binary gets it killed on launch:
 
 | Situation | Do this |
 |---|---|
+| The user typed a bare `/recompact` (or asks to compact **this** session) | Run `recompact handoff` in Bash and relay what it prints. **Compact this session** below. |
 | You are inside a compacted session (preamble "This transcript was compacted by segment_recompact", footers `[recompact summary … · recall <id>]`, markers `[recompact: elided …]`) | Read **Waking up in a twin** below. Do not compact again. |
 | You need an exact detail a summary or marker dropped | `recall` tool: `query="words"` to search, `selector="<id>"` to read one item |
-| Compact a session, hands-off | `recompact continue <session> --threshold 150000 --summarize-with haiku` |
+| Compact another session, hands-off | `recompact continue <session> --threshold 150000 --summarize-with haiku` |
 | Compact with zero model cost | `recompact assemble <session.jsonl> --mode mask` |
 | Compact with the best summaries (you write them) | **Manual procedure** below |
-| Keep a long session alive indefinitely | `recompact shell <session> --threshold 150000 --summarize-with haiku` |
+| Make compaction automatic, like Claude Code's own | **The launcher: `recompact shell`** below |
 
 Inside Claude Code, commands that take a session default to the current one: Claude Code exports
 `CLAUDE_CODE_SESSION_ID` to Bash and to the recall server.
+
+## Compact this session
+
+```bash
+recompact handoff [--continue-after]
+```
+
+- **Under the launcher** (`RECOMPACT_SHELL` is set), it only queues the handoff: when this turn
+  ends, the launcher stops claude, compacts the session, and resumes the twin in the same
+  terminal. Reply in one line ("Compacting when this turn ends.") and end your turn. A bare
+  `/recompact` typed by the user never reaches you there: a hook takes it before the model runs.
+- **Without the launcher**, it compacts now (Haiku summaries, toward 120k) and prints a
+  `claude --resume …` command, also copied to the clipboard. Tell the user to `/exit` and paste
+  it, and mention that starting claude through `recompact shell` makes this automatic.
+- **Autonomous work:** at a clean checkpoint in a long task, you may queue your own handoff with
+  `--continue-after`; the resumed session is told to continue. Under the launcher, a hook also
+  asks for such a checkpoint when a single turn runs past the checkpoint size.
 
 ## Waking up in a twin
 
@@ -170,20 +188,46 @@ per-unit table (salience, treatment, floor) without writing.
    match can still reach the original.
 
 Compacting the session you are running in is safe at a stopping point: the twin is a new file and
-the live session keeps appending to the original. Your own context does not shrink; the payoff is
-the next resume.
+the live session keeps appending to the original. Your own context does not shrink until the twin
+is resumed; `recompact handoff` does that for you.
 
-## Keeping a session alive: `shell`
+## The launcher: `recompact shell`
 
 ```bash
-recompact shell <sessionId> --threshold 150000 --summarize-with haiku [--goal "…"] [--auto]
+recompact shell [--at T] [--target T] [--mask] [--no-auto] [claude arguments...]
 ```
 
-Runs `claude --resume` with your terminal attached; when it exits, adopts the live head, compacts
-if over threshold, and respawns. An agent can hand off without a keystroke by ending the CLI with
-SIGTERM (`kill -TERM <pid>` as the entire command; exit 143). An active `/goal` survives and is
-re-engaged with a kick prompt. Old summaries consolidate into coarser epoch digests re-derived from
-the raw originals, so context stays bounded across unlimited cycles.
+A drop-in for `claude`: every argument it does not know goes to claude (`recompact shell --model
+opus --effort max`, `recompact shell -r <id>`). Print-mode, `--help`, and subcommands run claude
+directly. It stays in the background and does three things:
+
+- **Typed `/recompact`:** compacts and resumes in the same terminal, no model turn spent.
+- **Automatic:** when a turn ends with the context at or over `--at` (default 400k on 1M-context
+  models, else 140k), it compacts toward `--target` (default 120k) and resumes. It waits while
+  background tasks run or session crons are scheduled, and says so once. From half of `--at`, a
+  background prewarm keeps the summary cache warm, so the handoff itself usually takes seconds.
+- **Long autonomous turns:** past the checkpoint size (`--at` + 150k on 1M models, + 30k
+  otherwise), a hook asks the agent to reach a checkpoint and end its turn; after the handoff the
+  resumed session is told to continue. An active `/goal` is continued the same way.
+
+Resuming a session that is already over `--at` compacts it before it opens. The relaunch keeps
+every flag except the session-selecting ones; model and effort come from the session itself.
+Ctrl-C during a compaction cancels it and resumes the session unchanged. Defaults can also come
+from the environment: `RECOMPACT_AT`, `RECOMPACT_TARGET`, `RECOMPACT_SUMMARIZE_WITH` (`mask` for
+none), `RECOMPACT_AUTO=0`.
+
+To route every `claude` through it (aliases like `claude --model opus` included), add to
+`~/.zshrc`:
+
+```zsh
+claude() { if [ -x "$HOME/.local/bin/recompact" ]; then "$HOME/.local/bin/recompact" shell "$@"; else command claude "$@"; fi; }
+```
+
+Outside the launcher, a Stop hook says once per 100k of growth when a session is past the size
+where the launcher would compact it.
+
+Old summaries consolidate into coarser epoch digests re-derived from the raw originals, so context
+stays bounded across unlimited handoffs.
 
 ## Notes and gotchas
 

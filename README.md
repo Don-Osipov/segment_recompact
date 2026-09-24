@@ -48,8 +48,24 @@ Then, in any session:
 /recompact
 ```
 
+For compaction that happens by itself, start claude through the launcher. It passes every other
+argument to claude, so aliases keep working:
+
+```
+recompact shell --model opus --effort max
+```
+
+Under it, a typed `/recompact` compacts and resumes in the same terminal without spending a model
+turn, and a turn that ends over the threshold (400k on 1M-context models, else 140k) does the same
+automatically. A background prewarm writes most summaries ahead of time, so a handoff usually
+takes seconds. To make plain `claude` use it, add to `~/.zshrc`:
+
+```zsh
+claude() { if [ -x "$HOME/.local/bin/recompact" ]; then "$HOME/.local/bin/recompact" shell "$@"; else command claude "$@"; fi; }
+```
+
 To confirm the install before relying on it, `recompact` with no arguments prints the usage block:
-`extract`, `assemble`, `verify`, `probe`, `rehydrate`, `continue`, `shell`, `resume`, and `scan`.
+`extract`, `assemble`, `verify`, `probe`, `rehydrate`, `continue`, `shell`, `handoff`, `resume`, and `scan`.
 A binary listing only `extract` and `assemble` is a stale build from an early version.
 
 To pick up later changes, `claude plugin update segment-recompact@segment-recompact`.

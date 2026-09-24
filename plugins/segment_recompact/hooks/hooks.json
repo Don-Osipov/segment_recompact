@@ -12,12 +12,45 @@
     ],
     "SessionStart": [
       {
-        "matcher": "resume|fork",
         "hooks": [
           {
             "type": "command",
             "command": "[ -x \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook session-start || true",
             "timeout": 15
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$RECOMPACT_SHELL\" ] && [ -x \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook user-prompt-submit || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -x \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook stop || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$RECOMPACT_SHELL\" ] && [ -x \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook post-tool-use || true",
+            "timeout": 5
           }
         ]
       }
