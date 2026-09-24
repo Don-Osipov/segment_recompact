@@ -1,359 +1,203 @@
 ---
 name: recompact
-description: Offline, segment-wise compaction of a Claude Code session .jsonl, plus recovery of anything a past compaction removed. Segments by user turn, keeps user turns verbatim, and replaces each segment's agent turns + tool results with summaries carrying provenance back to the untouched originals. Use when asked to recompact / compress / shrink a session transcript — AND when asked to recover, rehydrate, or look up content from an earlier or compacted session ("what did the research say", "restore that elided result", "[recompact: ...］ marker", "recompact summary"), or when the current transcript contains such markers and the verbatim original would help.
+description: Offline, segment-wise compaction of a Claude Code session .jsonl, plus recovery of anything a past compaction removed. Keeps every user turn verbatim, replaces older agent work with summaries or masked payloads that carry provenance to the untouched originals, and closes the file with an orientation brief for whoever resumes it. Use when asked to recompact / compress / shrink a session transcript, and also when asked to recover, rehydrate, or look up content from an earlier or compacted session ("what did the research say", "restore that elided result", "[recompact: …] marker", "recompact summary", "recall"), or when the current transcript contains such markers and the verbatim original would help.
 user_invocable: true
 ---
 
 # recompact
 
-An **ad-hoc, offline** alternative to Claude Code's built-in compaction. Instead of summarizing the
-whole conversation into one prose blob at a token threshold, this:
+An offline alternative to Claude Code's built-in compaction. It reads a session `.jsonl`, writes a
+smaller, resume-compatible twin next to it (the original is never touched), and closes the twin
+with an orientation note. User turns stay verbatim. Older agent work becomes a summary (written by
+you or by a headless model) or a masked copy whose bulky tool output is replaced by an addressable
+marker. Everything removed can be read back with `recall`.
 
-- **segments the session by genuine user turn**,
-- **keeps every user turn verbatim** (never compressed),
-- **collapses each segment's agent turns + tool results into one summary** that *you (Claude)* write,
-- emits a **shorter, resume-compatible `.jsonl`** — a normal (just smaller) session, written to a
-  new file; the original is never touched.
-
-The deterministic surgery (parsing, segmenting, rebuilding, re-chaining) is done by a small Rust
-helper bundled with this plugin; **you (Claude) are the summarizer** — the lossy intelligence
-happens between `extract` and `assemble`. This is a learn-by-doing process; there is no automated
-model backend.
-
-## Helper binary
-
-The helper lives at `${CLAUDE_PLUGIN_ROOT}/bin/recompact`, built from this plugin's `src/` by the
-Setup hook on install. **Before the first run, make sure it exists; if not, build it** (requires a
-Rust toolchain):
+Helper binary: `"${CLAUDE_PLUGIN_ROOT}/bin/recompact"` (also on PATH as `recompact`). Build it if
+missing (needs a Rust toolchain); remove the old binary first, because copying over a signed macOS
+binary gets it killed on launch:
 
 ```bash
-[ -x "${CLAUDE_PLUGIN_ROOT}/bin/recompact" ] || \
-  ( cd "${CLAUDE_PLUGIN_ROOT}" && cargo build --release && mkdir -p bin && cp target/release/recompact bin/recompact )
+[ -x "${CLAUDE_PLUGIN_ROOT}/bin/recompact" ] || ( cd "${CLAUDE_PLUGIN_ROOT}" && cargo build --release \
+  && mkdir -p bin && rm -f bin/recompact && cp target/release/recompact bin/recompact )
 ```
 
-In the commands below, invoke it by full path as `"${CLAUDE_PLUGIN_ROOT}/bin/recompact"` (the
-plugin's `bin/` is also added to PATH on install, so the bare name `recompact` often works). Shell
-variables do **not** persist between separate command invocations, so use the full path in each one.
+## What do you need?
 
-## What this does
+| Situation | Do this |
+|---|---|
+| You are inside a compacted session (preamble "This transcript was compacted by segment_recompact", footers `[recompact summary … · recall <id>]`, markers `[recompact: elided …]`) | Read **Waking up in a twin** below. Do not compact again. |
+| You need an exact detail a summary or marker dropped | `recall` tool: `query="words"` to search, `selector="<id>"` to read one item |
+| Compact a session, hands-off | `recompact continue <session> --threshold 150000 --summarize-with haiku` |
+| Compact with zero model cost | `recompact assemble <session.jsonl> --mode mask` |
+| Compact with the best summaries (you write them) | **Manual procedure** below |
+| Keep a long session alive indefinitely | `recompact shell <session> --threshold 150000 --summarize-with haiku` |
 
-1. Confirms the target session and sets up a work directory.
-2. `recompact extract` → a worksheet (`segments.json`) of segments and their agent activity.
-3. **You read it and write one summary per segment** into `summaries.json`, per the rubric below.
-4. `recompact assemble` → a new `<newSessionId>.jsonl` in the same project dir.
-5. Verification (structure, non-mutation, fidelity), then the real test: `claude --resume`.
+Inside Claude Code, commands that take a session default to the current one: Claude Code exports
+`CLAUDE_CODE_SESSION_ID` to Bash and to the recall server.
 
-## Procedure
+## Waking up in a twin
 
-### Step 0 — Pick the session, confirm
+The last assistant message is the orientation note. It holds a **State when compacted** list
+(files changed, taken from the tool calls rather than prose; commits and branches; the last
+observed state of each PR; the last validation command and how it ended; the most recent asks)
+and the user's **standing instructions, verbatim**. On resume, a SessionStart hook adds how long ago the
+compaction was, how long the work itself has been idle, and what changed in the repo since.
 
-Resolve the target `.jsonl`. Sessions live at `~/.claude/projects/<munged-cwd>/<sessionId>.jsonl`,
-where `<munged-cwd>` is the working directory with `/` and `.` replaced by `-`
-(e.g. `/home/sdr/wirt` → `-home-sdr-wirt`). Accept either a full path or a `sessionId` + project.
+1. **Already-compacted check.** If the last user turn before the note asked for /recompact, that
+   request produced this session; it has run. Do not compact again unless the user explicitly asks
+   for a second pass after substantial new work.
+2. **Treat the brief and the summaries as a snapshot.** Re-check anything external before acting
+   on it: PR state (`gh pr view`), deploys, database rows, running jobs, branch heads.
+3. **Recall before re-deriving.** A summary is honest but lossy. Lines beginning `⟨carried⟩` were
+   copied mechanically from the original (changed files, verbatim errors, identifiers later turns
+   used). For anything else exact (an error message, a query result, a file as it was, a
+   screenshot), call `recall` instead of re-running the work or guessing.
+4. **User turns are verbatim**, and so are messages the user typed mid-turn (shown as "The user sent
+   a new message while you were working").
 
-Recompacting the session you are running inside is safe **at a stopping point** (between turns,
-work committed or at rest): the output is a new file, and the live session keeps appending to the
-original untouched — worst case the compacted file lacks the final wrap-up exchange, which lands
-in the keep-K tail on the next pass. What you must NOT do is rely on the compacted file from
-inside the same process: your own context does not shrink; the compaction pays off at the NEXT
-resume. The wrap-up ritual: finish the stretch of work, update the ledger with today's
-corrections, run the compaction, verify, and hand the user the new id to resume next time (or let
-the autonomous loop below pick it up).
+## Recall
 
-**Already-compacted check (do this FIRST, before any extract).** If the transcript you
-are running in carries a recompact orientation preamble ("This transcript was compacted by
-segment_recompact…" — emitted as the LAST conversation record, so look at the end of the
-transcript, not the start), you are inside a compacted twin — the compaction the user asked for has
-usually ALREADY RUN, and the /recompact invocation you're reading may be the very prompt that
-triggered it before the respawn (its args describing the past run, not requesting a new one).
-Mechanical check: `recompact scan` (or the lineage sidecar) — if this session is a fresh twin
-with little or no new work since resume, do NOT compact again. Say so, and only proceed if the
-user explicitly confirms they want a *second* pass on top of the twin (e.g. after substantial
-new work). A twin that has since grown large again is a legitimate target; a just-resumed one is
-not.
+One MCP tool, `recall`, served by this plugin:
 
-Confirm with the user which session, and the `--keep K` window (default `K=1`: the last K segments
-stay verbatim for clean resume).
+- `recall(query="max_client_conn pgbouncer")` searches the originals behind every summary and
+  marker in this session's history, across all compaction generations, and returns ranked snippets
+  with ids. Exact identifiers work best.
+- `recall(selector="1a2b3c4d")` returns one item in full. The id is what a footer prints
+  (`recall 1a2b3c4d`) or what a marker prints (`rehydrate 1a2b3c4d`). Ids resolve across every
+  project directory; no session or file is needed. A summary's id expands to the records it replaced.
+- `recall()` lists this session's summaries with their ids.
+- Large payloads come in 8,000-character chunks (`chunk=2`, …); multi-record expansions come back as
+  an index of ids.
 
-### Step 1 — Work directory
+Without the tool, in a shell: `recompact recall --query "words"` or `recompact recall <id>`.
+`recompact rehydrate <compacted.jsonl> <selector>` prints raw records.
 
-`recompact` is additive: it opens the original read-only and creates a new `<newId>.jsonl` beside
-it, touching no existing file. So the rollback is `rm <newId>.jsonl`, and `claude --resume <origId>`
-returns to the working session either way — no backup step. Step 5 proves the non-mutation by
-checksum rather than assuming it, so capture the original's digest now, before any write:
+## Compacting
+
+All numbers are **context tokens**, what `/context` shows. The helper measures what the model is
+actually sent (message text, tool calls and results, the rendered text of attachments; never the
+JSON envelope, and never persisted thinking) at the session model's measured tokenizer ratio, plus
+~35k for system prompt and tools (`--overhead` overrides it). A session's live size comes from its
+last usage record, which also counts preserved thinking. On Opus/Fable that can be a third of
+it, and none of it survives into the twin.
+
+What every compaction does, whatever the mode:
+
+- keeps every user turn and every mid-turn user message verbatim;
+- drops harness ceremony outside the recent tail (per-turn reminders, tool/skill/agent listings,
+  CLAUDE.md copies, prompt snapshots), which resume re-announces in their current versions, and
+  removes persisted thinking everywhere;
+- keeps the last `--keep` turns (default 1) verbatim, but at most `--tail-budget` tokens of them
+  (default 80000): an oversized final turn keeps only its newest parts;
+- appends beneath each summary its changed files, its errors verbatim, and the identifiers that
+  later turns still use (`⟨carried⟩` lines);
+- closes the file with the orientation note and a title ending "(recompact N)";
+- reports a **retention** figure: how many identifiers referenced across turns remain visible
+  (the rest are recall-only).
+
+### Hands-off: `continue`
 
 ```bash
-TS=$(date +%Y%m%d-%H%M%S)
-PROJ=<munged-cwd>            # e.g. -home-sdr-wirt
-WORK=/var/tmp/recompact-work/${TS}; mkdir -p "$WORK"
-shasum -a 256 <session.jsonl> | tee "$WORK/source.sha256"
+recompact continue <session.jsonl | sessionId> --threshold 150000 --summarize-with haiku \
+  [--escalate-with sonnet --escalate-above 0.4] [--keep 1] [--error-floor]
 ```
 
-Work files go under `/var/tmp/recompact-work/`, **never `/tmp`** (tmpfs, fills up).
+Resolves the newest descendant (compacted twins and `/branch` copies, whichever moved last), and
+when its live size exceeds the threshold, plans per-unit treatments toward it: verbatim, mask, or a
+summary written headlessly (~10 units per call, no MCP servers, cached by content hash so repeat
+runs pay only for new material). Units with no agent activity get a mechanical summary; a unit
+the summarizer never returns is masked rather than failing the run; summaries are saved after every
+batch. Verifies the result, removes it if verification fails, and always prints a resumable id.
+Error-bearing units may be summarized because their error text is carried verbatim;
+`--error-floor` keeps them masked instead.
 
-### Step 2 — Extract
+### Zero cost: mask mode
 
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/bin/recompact" extract <session.jsonl> --out "$WORK/segments.json" --keep 1
+recompact assemble <session.jsonl> --mode mask [--keep 1]
 ```
 
-It prints record/segment counts, approx tokens, and which segment indices need summaries. The
-worksheet `segments.json` has, per segment: `index`, `user_text` (verbatim, for your context),
-`needs_summary`, `kept_verbatim`, `activity` (the agent's text + tool calls + truncated results),
-and `covered_uuids` (a lossless pointer back to the archived original).
+Keeps every record's prose; replaces tool results over 500 characters with a marker carrying a
+one-line preview and a recall id; keeps errors (head+tail to 2,000 characters); truncates oversized
+tool inputs. Cannot hallucinate. On tool-heavy sessions it approaches summary-level savings.
 
-Note: stored `thinking` blocks are usually empty (reasoning isn't persisted), so summarize from
-what was **said and done** (assistant text + tool calls/results), not hidden reasoning. If a tool
-result was truncated in the worksheet and you need the full thing, read it from the original file.
+Add `--target <tokens>` (to `assemble`) to plan treatments toward a budget; `--plan` prints the
+per-unit table (salience, treatment, floor) without writing.
 
-### Step 3 — Summarize (this is the actual work)
+### Manual procedure (best summaries)
 
-Read `segments.json`. For **every segment with `needs_summary: true`**, write a summary and put it
-in `summaries.json` as a map from the segment's index (string) to the summary text:
+1. **Work dir and checksum** (the original is opened read-only; prove it):
+   ```bash
+   WORK=/var/tmp/recompact-work/$(date +%Y%m%d-%H%M%S); mkdir -p "$WORK"
+   shasum -a 256 <session.jsonl> | tee "$WORK/source.sha256"
+   ```
+   Never use `/tmp` (tmpfs).
+2. **Extract** the worksheet:
+   ```bash
+   recompact extract <session.jsonl> --out "$WORK/segments.json" --keep 1
+   ```
+   It lists the unit keys that need summaries (e.g. `3`, `12.0`, `12.1` for a turn split into
+   parts). Units with no agent activity are summarized mechanically and parts kept by the tail
+   budget are marked `kept_verbatim`; neither needs a summary. Each unit shows the user's ask, the
+   agent's text, tool calls, and results (truncated head+tail, with status `ok` / `error` /
+   `empty` / `duplicate` and full length), plus a code-derived `derived_index` of files and
+   commands.
+3. **Write `summaries.json`**: `{"<key>": "<summary>", …}`, one per listed key. Rubric:
+   - First person, past tense, as the assistant's own recap; the next user turn must still make
+     sense after the raw activity is gone.
+   - What was asked, what I did, the outcome, decisions and why, **approaches tried and rejected
+     with the reason**, what was left unfinished.
+   - Quote exact values, names, ids, and commands verbatim.
+   - Grade every outcome: VERIFIED (an exit code, test output, or query result proves it),
+     OBSERVED (partial or interrupted output), CLAIMED (asserted without evidence). A killed,
+     timed-out, or erroring command is never a success.
+   - Skip file lists and error dumps: those are carried beneath the summary mechanically.
+   - Optional `"ledger"`: standing constraints, corrections, and decisions to pin before the tail.
+     A new ledger replaces the old one wholesale; assemble warns about identifiers it drops.
+4. **Assemble** (prints the new id and a `resume with:` command that restores model and effort):
+   ```bash
+   recompact assemble <session.jsonl> "$WORK/summaries.json" --keep 1 [--cache <cache.json>]
+   ```
+5. **Verify**:
+   ```bash
+   shasum -a 256 -c "$WORK/source.sha256"
+   recompact verify <new.jsonl> --source <session.jsonl>
+   ```
+   Checks: one sessionId, a linear parent chain, tool pairs intact, usage stripped, the tail
+   pointing at the leaf, user turns and mid-turn user messages preserved verbatim.
+6. **Resume** with the printed command, e.g.
+   `claude --resume <newId> --model 'claude-opus-5-5[1m]' --effort max`. Resume by id: a title
+   match can still reach the original.
+
+Compacting the session you are running in is safe at a stopping point: the twin is a new file and
+the live session keeps appending to the original. Your own context does not shrink; the payoff is
+the next resume.
+
+## Keeping a session alive: `shell`
 
 ```bash
-# you author this file with the Write tool, e.g.:
-# { "0": "…", "1": "…", "2": "…" }
+recompact shell <sessionId> --threshold 150000 --summarize-with haiku [--goal "…"] [--auto]
 ```
 
-Each summary replaces that segment's entire agent turn — so it must let the *following* user turn
-still make sense. The worksheet helps: every tool result carries a `tool` name, a `status`
-(`ok` / `error` / `empty` / `duplicate`), and a `chars` count, and each segment carries a
-code-derived `derived_index` (files touched with roles, commands run, error count) you can trust
-over your own reading of the prose. Rubric:
+Runs `claude --resume` with your terminal attached; when it exits, adopts the live head, compacts
+if over threshold, and respawns. An agent can hand off without a keystroke by ending the CLI with
+SIGTERM (`kill -TERM <pid>` as the entire command; exit 143). An active `/goal` survives and is
+re-engaged with a kick prompt. Old summaries consolidate into coarser epoch digests re-derived from
+the raw originals, so context stays bounded across unlimited cycles.
 
-- **State what the agent did and the outcome** in a few sentences.
-- **Preserve the non-recoverable**: errors hit + how resolved, decisions + rationale, values/answers
-  discovered, build/test results (pass/fail + which), anything the next user turn reacts to.
-- **Record rejected alternatives, not just the winner**: "tried X, failed because Y, chose Z". A
-  resumed session that does not know X failed will try X again.
-- **Grade every claim epistemically**: *verified* (an exit code or test output in the worksheet
-  proves it), *observed* (text appeared in a truncated or interrupted stream), or *claimed* (the
-  agent said so without evidence). A result whose `status` is `error`, or whose output was cut off
-  by a timeout or kill, must NEVER be summarized as a confirmed success; write what was observed
-  and that completion is unverified.
-- **Quote key phrases verbatim** for the load-bearing specifics (exact error text, exact values,
-  exact names); paraphrase is where drift starts.
-- **Reference recoverable state by pointer, not content**: "edited `src/foo.rs` (added `bar`)", not
-  the diff; inline a file's content only if that specific value mattered to the thread. Take file
-  paths from `derived_index`, which cannot have missed one.
-- **Drop**: superseded reads, verbose successful output, dead-end exploration, duplicate listings
-  (the worksheet has already elided `empty` and `duplicate` results for you).
-- **Keep the connective tissue**: if the next user turn says "now the other one," the summary must
-  make "the other one" resolvable.
-- **Stay faithful**: never claim a success that didn't happen; preserve uncertainty the agent had.
+## Notes and gotchas
 
-Write in first person past tense ("I read…, found…, then edited…"), as the assistant's own recap —
-because that's exactly the role the record plays on resume.
-
-Two optional extras in `summaries.json`:
-
-- **`"ledger"`**: standing constraints, corrections, and decisions that must survive every future
-  compaction ("never push to main", "the user corrected X to Y"). Assemble injects it as a pinned
-  record just before the verbatim tail; providing a new ledger on a later pass supersedes the old
-  one wholesale. Do not rely on a constraint surviving inside one segment's prose summary.
-- **`--cache <path>`** (flag on assemble): a summary cache keyed by segment content hash (the
-  worksheet shows each segment's `content_hash`). On a repeated recompaction of a continued
-  session, unchanged segments resolve from the cache automatically and only the new segments need
-  summaries. Keep one cache file per session lineage.
-
-### Mask mode — the no-summary express lane
-
-When the goal is bulk reduction rather than narrative compression, skip Steps 2 and 3 entirely:
-
-```bash
-"${CLAUDE_PLUGIN_ROOT}/bin/recompact" assemble <session.jsonl> --mode mask --keep 1
-```
-
-Masking keeps every record and all assistant prose verbatim; it only replaces stale tool-result
-payloads over 500 chars with placeholders (error output stays verbatim, head+tail to 2000 chars)
-and truncates oversized `tool_use` inputs. It never rewrites text, so it cannot hallucinate.
-Verify and resume exactly as below. On tool-heavy sessions the reduction approaches summarize
-mode at zero model cost; on discussion-heavy sessions it saves little (prose is untouched).
-
-Add `--target <tokens>` to either mode and a salience-floored planner chooses per-unit
-treatments toward that budget instead of blanket application: error-bearing units never drop
-below mask, pinned records and the recent tail never move, and if the floors make the target
-unreachable the output comes in over budget with the reasons printed. `--plan` previews the
-per-unit table without writing anything.
-
-The error floor is a blunt proxy: it fires on **any** `is_error` result and cannot tell a
-benign failure (a `grep`/`rg` exit 1 on no-match, a `sed`/`cat` on a path that does not exist)
-from a load-bearing one. When one big unit carries a couple of benign errors, the floor pins its
-whole mass to mask and can hold the output far above your target — e.g. an opening
-codebase-exploration turn of 200+ mostly-successful reads that masks to ~237k because two greps
-returned no match. `--target ... --summarize-errors` lifts the veto: error-bearing units become
-summarizable like any other, but keep their raised salience (demoted last, not first), so the
-planner sheds only the units it must to reach budget and retains your recent, load-bearing turns.
-**Your summary for such a unit MUST preserve the error text verbatim** — the plan prints a
-reminder and lists the unit in the work set. The flag requires `--target`, only relaxes the
-`error` floor (never `pinned`), and is deliberately unavailable to the autonomous `continue` /
-`shell` loop: summarizing error evidence away is a supervised judgment call, not something the
-unattended loop should do.
-
-### Autonomous continuation — sessions that compact themselves
-
-The one-command loop step for long-running agents:
-
-```bash
-"${CLAUDE_PLUGIN_ROOT}/bin/recompact" continue <session.jsonl | sessionId> --threshold 60000
-```
-
-`continue` resolves the newest compacted descendant via the lineage registry (a
-`.recompact-lineage.json` sidecar written next to the session files), and when that session
-exceeds the threshold it mask-compacts it toward the threshold (zero LLM calls), verifies the
-output, and prints the id to resume on stdout. Under the threshold — or when compaction cannot
-meaningfully reduce (the churn guard removes pointless descendants) — it prints the current id.
-Either way, stdout is always a resumable id, so a driver loop never needs a human:
-
-```bash
-ID=<starting-session-id>
-while more_work_remains; do
-  ID=$("${CLAUDE_PLUGIN_ROOT}/bin/recompact" continue "$ID" --threshold 60000)
-  claude -p --resume "$ID" "continue with the next task"
-done
-```
-
-The same one-liner works as a Stop hook or a scheduled job. Mask-only compaction has a floor:
-prose-heavy sessions (research, long discussions, delegated-agent reports) may stay above the
-resume window. Add a summarizer and the loop gets the full ladder:
-
-```bash
-recompact continue <id> --threshold 60000 --summarize-with haiku \
-  [--escalate-with sonnet --escalate-above 0.4]
-```
-
-The budget planner decides which units masking cannot shrink; those are summarized headlessly in
-contiguous batches (about 10 units per call, run from an empty directory with no MCP servers, so
-calls are cheap and spawn nothing), under the same epistemic rubric as manual summaries, cached
-by content hash so repeat passes only pay for new material. `--escalate-with` routes
-high-salience units (errors, corrections, decision-bearing) to a stronger model.
-
-`recompact resume <id>` does the lineage resolution alone (prints the newest descendant without
-compacting), and `recompact scan [dir]` lists a project's sessions (add `--estimate` for mask
-estimates; the default stays fast).
-
-### recompact shell — one continuous session at the terminal
-
-```bash
-recompact shell [sessionId] [--threshold 60000] [--goal "condition"] [--summarize-with haiku]
-```
-
-`shell` wraps the interactive CLI in the continue loop: it spawns `claude --resume` with your
-terminal attached, and each time the session exits it adopts the live head (interactive resume
-mints a new bridge-session id), compacts if over threshold, and respawns. An active `/goal`
-survives compaction (goal state lives in goal_status records and is preserved) and is re-engaged
-automatically with a kick-prompt, because a resumed goal does not start a turn on its own.
-`--goal` arms one on the first spawn; `--auto` cycles without the confirmation prompt. From the
-chair it is one session that never fills up.
-
-Two properties make the loop truly hands-off and unbounded:
-
-- **Agent handoff needs no keystroke.** When the agent inside the session ends it with SIGTERM
-  (`kill -TERM <tui-pid>` as the entire command, exit status 143), the shell treats that as a
-  deliberate handoff and cycles immediately. A human exit (status 0, or Ctrl+C) still gets the
-  Enter/q prompt — a person who typed `/exit` may genuinely want out.
-- **Old summaries do not accumulate forever.** When the budget requires it, runs of prior-cycle
-  summary records are consolidated into coarser epoch digests. The summarizer input for an epoch
-  is re-derived from the RAW records its provenance covers (following provenance across
-  generations to ground truth) — summary text is never fed back to a model, so drift cannot
-  compound. If the raw file is gone, those records stay verbatim instead. The steady state is a
-  recency gradient: verbatim tail, per-unit summaries for recent work, epoch digests for old
-  work — bounded total size over unlimited cycles.
-
-### Step 4 — Assemble
-
-```bash
-"${CLAUDE_PLUGIN_ROOT}/bin/recompact" assemble <session.jsonl> "$WORK/summaries.json" --keep 1
-# prints the new sessionId on stdout and writes <newId>.jsonl into the project dir
-```
-
-`assemble` errors out if any needed summary is missing, refuses to overwrite an existing file, opens
-the original read-only, and drops any in-flight `tool_use` with no matching `tool_result`.
-
-### Step 5 — Verify
-
-```bash
-SRC=<session.jsonl>; NEW=~/.claude/projects/${PROJ}/<newId>.jsonl
-# 0. non-mutation: original byte-identical (it never opened for write, but prove it)
-shasum -a 256 -c "$WORK/source.sha256"
-# 1. structural checks + user-turn fidelity, all in one pass:
-#    single sessionId, linear parent chain, no dangling tool_use / orphan tool_result,
-#    usage stripped, last-prompt tail points at leaf, user turns identical to the
-#    source's ACTIVE PATH
-"${CLAUDE_PLUGIN_ROOT}/bin/recompact" verify "$NEW" --source "$SRC"
-```
-
-Spot-check 2–3 summaries against the following user turn for fidelity. Report before/after token and
-record counts (from the `assemble` line).
-
-### Step 6 — The real test: resume
-
-Have the user run `claude --resume <newId>` and continue. This is the empirical validation that the
-hand-built file is actually resume-compatible — only the user can drive the interactive resume. If
-anything looks wrong, delete the new `.jsonl` — it is purely additive, and `claude --resume <origId>`
-is still the original session.
-
-## Waking up inside a compacted session (read this if you see recompact markers)
-
-If the transcript you are in contains an orientation preamble ("This transcript was compacted
-by segment_recompact"), summaries ending in `[recompact summary <key> — rehydratable]`, or
-markers like `[recompact: elided ...; rehydrate <prefix>]`, you are in a compacted twin. Rules
-of thumb:
-
-- **Recall before re-deriving.** If a summary or marker covers something you need exactly
-  (an error message, a file diff, a research report, a screenshot), recover it verbatim instead
-  of re-running searches or guessing. The selector is the summary's key or the 8-char prefix
-  from a marker; resolution follows provenance across ALL prior compaction generations to the
-  untouched originals.
-  - **Prefer the `recall` tool** if the plugin's MCP server is connected: pass the selector and
-    nothing else. A uuid prefix resolves across every session in the project, so you do not
-    need to know which file you are in.
-  - Otherwise `recompact rehydrate <this-session.jsonl> <selector>`. Either form with no
-    selector lists the summaries.
-- **Finding your own file** is only needed for a *summary key or ordinal*, which index one
-  file's summary list. Do not guess it from mtime: several sessions in a project are commonly
-  live at once and the newest `.jsonl` is often somebody else's. Run `recompact scan` in
-  `~/.claude/projects/<munged-cwd>/` (shows sizes, lineage, and which sessions are compacted
-  twins), or use a uuid prefix, which needs no file at all.
-- **Trust user text, treat summaries as summaries.** User turns are verbatim by construction;
-  synthetic summaries are honest but lossy — verify against rehydrated originals before acting
-  on a detail that matters.
-
-## Long-running autonomous loops
-
-An agent that runs long enough to fill its context can keep itself going:
-
-- Mid-session (safe anytime): `recompact continue <session-id> --threshold 100000
-  --summarize-with haiku` writes a compacted twin + lineage entry; originals are never touched.
-- Under `recompact shell`, exiting with code 143 (SIGTERM to the CLI process) hands control to
-  the wrapper, which compacts and respawns automatically — that is the intended handoff for
-  goal-driven loops, and an active /goal survives the hop.
-- Give future selves breadcrumbs: the ledger (a `"ledger"` key in summaries.json) pins standing
-  constraints near the tail; it is re-injected on every pass and superseded wholesale by a newer
-  ledger.
-
-## Notes
-
-- **Only the active path is processed.** Session files are trees: retries/rewinds leave abandoned
-  branches, and an auto-compaction starts a fresh chain root, leaving pre-boundary history
-  unreachable on resume. `extract` walks the leaf's parent chain and reports how many off-path
-  records it dropped — on a session that auto-compacted, most of the file can be off-path, which
-  is correct, not a bug. A segment carrying an `isCompactSummary` record is pinned verbatim
-  (never hand-summarized).
-- **Resume compatibility is empirically validated, not documented.** The output uses only normal
-  record types (no reverse-engineered `compact_boundary`). Re-verify after a Claude Code version bump.
-- The synthetic summary record is tagged `recompactSynthetic: true` so a compacted session is
-  identifiable later.
-- **`assemble` strips `message.usage` from every record.** `/context` reports the last assistant
-  message's `usage` (cache_read + cache_creation + input), not a re-tokenization — so verbatim
-  records copied from the source would otherwise make the compacted session report the *original's*
-  token count (and possibly trigger autocompact). After resuming, sanity-check with `/context`:
-  it should read a fraction of the original, not ~full.
-- **Resume the compacted session from a real terminal, not the VSCode extension UI** — the
-  extension's session picker only lists sessions it created, so externally-built files won't appear
-  there.
-- `--keep K` trades reduction for recent-context fidelity. Bigger K = safer resume, less savings.
-- Reduction is dominated by how much verbose tool output the collapsed segments contained; a
-  read/build/test-heavy session compresses far more than a discussion-only one.
-- Rebuild the helper after editing it: `cd "${CLAUDE_PLUGIN_ROOT}" && cargo build --release && cp target/release/recompact bin/recompact`.
+- **Only the active path is processed.** Abandoned branches and pre-auto-compaction history are
+  dropped, never resurrected.
+- **Provenance survives moves.** A summary records its source path and session id; when Claude Code
+  relocates a session between project dirs (worktree resumes), recall finds it by id.
+- **Durability.** Originals live under `~/.claude/projects`, subject to `cleanupPeriodDays`; a
+  deleted original leaves its summary as the best copy.
+- **Stale descendant.** `continue`/`resume` follow a twin or branch only while it is fresher than
+  its parent; a twin abandoned in favor of the parent is skipped.
+- **Empty units** (resume scaffolding, system notices) never go to a summarizer.
+- **Resume compatibility is empirical.** The output uses only normal record types; run
+  `recompact probe <session.jsonl>` after a Claude Code upgrade to flag unknown record or block
+  types before trusting surgery.
+- `recompact scan [project-dir]` lists sessions with sizes (live usage where known), turns, and
+  flags (`compacted`, `superseded`, `est` for estimate-only).

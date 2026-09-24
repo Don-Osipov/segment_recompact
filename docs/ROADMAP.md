@@ -121,6 +121,43 @@ a paper; a tool you run without thinking, and a lifecycle that lets a session li
 - [ ] Stop-hook / scheduled-job packaging for the continue loop (today it is a documented
       one-liner; a shipped hook config would make it turnkey).
 
+## v1.0 (2026-09): from compacting to resuming
+
+Driven by a month of real use (62 twins, 56 resumed) and the June–September 2026 literature.
+
+- [x] **Token accounting that matches the API.** Visible text at measured tokenizer ratios
+      (Opus 5.5 2.39, Fable ~2.65, Haiku 3.06 chars/token); the old JSON/4 estimate overstated a
+      resumed twin by a median 3.6x, so thresholds over-compressed. Live size from the last usage
+      record (it includes preserved thinking: 38% of one Fable session).
+- [x] **Recall that resolves.** Every real v0.9 recall call failed (5/5). Now: session binding via
+      `CLAUDE_CODE_SESSION_ID`, project-wide ids in every footer, cross-project-dir lookup,
+      relocation-proof provenance, and `query` search over the lineage's originals. Verified live:
+      a resumed Opus 5.5 session queried, then selected, then answered an exact figure that existed
+      only in elided output.
+- [x] **Orientation.** A third of resumed twins opened with "where did we leave off". The preamble now
+      carries a mechanical state brief and the user's standing instructions verbatim (constraint
+      pinning restores 0% violations in Governance Decay, arXiv 2606.22528); a SessionStart hook adds
+      compaction age, idle time, and repo drift (the live-evidence rule of arXiv 2609.13800).
+- [x] **Carried evidence.** Changed files, verbatim errors, and future-referenced identifiers go
+      beneath each summary mechanically (offline hindsight: the Slipstream check of arXiv
+      2605.08580 without a model; artifact tracking is every method's weakest dimension in Factory's
+      probe evaluation). Errors carried verbatim retire the blunt error floor.
+- [x] **Fidelity fix:** messages typed mid-turn arrive as `queued_command` attachments and were
+      summarized away; now pinned and verified.
+- [x] **Leaner twins:** ceremony attachments outside the tail (re-announced on resume, verified),
+      persisted thinking (stripped by Claude Code on resume; a strict preserved-thinking risk),
+      and the adaptive tail budget for multi-megabyte final turns.
+- [x] **Robustness:** crash-safe summary cache, mechanical empty units, targeted mask fallback,
+      `/branch` copies in lineage, bare ids across project dirs, titles carried, model and effort
+      restored in the resume command.
+
+Next, in evidence order:
+- [ ] Probe-based evaluation harness (`recompact eval`): exact-match probes mined from the original
+      (errors, ids, files, next step), answered by a resumed model; TRACE-style next-action agreement.
+- [ ] Typed ledger with ids and delta updates (ACE, arXiv 2510.04618), human-sourced constraints only.
+- [ ] Claim tags in the headless rubric parsed into the brief ("unverified claims").
+- [ ] Sub-goal epoch folds instead of time-based ones.
+
 ## Track C: confidence
 
 - [x] 30 integration tests over synthetic sessions covering every failure class identified in the
