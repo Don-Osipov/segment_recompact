@@ -1705,7 +1705,85 @@ pub fn with_block(text: &str, block: &str) -> Result<String, String> {
     Ok(out)
 }
 
-/// `recompact install [--rc <file>]`: make interactive `claude` run through the launcher.
+/// Turn on Claude Code's auto-update for this plugin's marketplace (off by default for
+/// third-party marketplaces) by adding `"autoUpdate": true` to its entry under
+/// `extraKnownMarketplaces` in the user's settings. A targeted insertion, not a rewrite: the rest
+/// of the file keeps its order and formatting, and the result must parse and differ only by that
+/// key. `Ok(false)` when already on or when there is no such entry (a directory source, or a
+/// marketplace declared in a project's settings).
+pub fn with_auto_update(text: &str) -> Result<Option<String>, String> {
+    let before: Value = serde_json::from_str(text).map_err(|e| format!("not valid JSON: {e}"))?;
+    let Some(entry) = before.pointer("/extraKnownMarketplaces/segment-recompact") else {
+        return Ok(None);
+    };
+    if entry.get("autoUpdate") == Some(&json!(true))
+        || entry.pointer("/source/source") == Some(&json!("directory"))
+    {
+        return Ok(None);
+    }
+    if entry.get("autoUpdate").is_some() {
+        return Err("autoUpdate is set to something else; change it in /plugin".into());
+    }
+    let section = text
+        .find("\"extraKnownMarketplaces\"")
+        .ok_or("extraKnownMarketplaces not found")?;
+    let key = text[section..]
+        .find("\"segment-recompact\"")
+        .map(|i| section + i)
+        .ok_or("marketplace entry not found")?;
+    let brace = text[key..]
+        .find('{')
+        .map(|i| key + i)
+        .ok_or("marketplace entry is not an object")?;
+    if !text[key + "\"segment-recompact\"".len()..brace]
+        .chars()
+        .all(|c| c.is_whitespace() || c == ':')
+    {
+        return Err("unexpected layout".into());
+    }
+    let empty = text[brace + 1..].trim_start().starts_with('}');
+    let insert = if empty {
+        "\"autoUpdate\": true"
+    } else {
+        "\"autoUpdate\": true,"
+    };
+    let out = format!("{}{insert}{}", &text[..=brace], &text[brace + 1..]);
+    let mut expected = before.clone();
+    expected["extraKnownMarketplaces"]["segment-recompact"]["autoUpdate"] = json!(true);
+    let after: Value =
+        serde_json::from_str(&out).map_err(|e| format!("edit broke the JSON: {e}"))?;
+    if after != expected {
+        return Err("edit changed more than autoUpdate".into());
+    }
+    Ok(Some(out))
+}
+
+fn claude_settings() -> PathBuf {
+    home().join(".claude").join("settings.json")
+}
+
+/// Enable marketplace auto-update in the user's settings; a description of what happened.
+fn enable_auto_update(settings: &Path) -> String {
+    let Ok(text) = fs::read_to_string(settings) else {
+        return "auto-update: no user settings file; enable it in /plugin → Marketplaces".into();
+    };
+    match with_auto_update(&text) {
+        Ok(Some(updated)) => {
+            let _ = fs::write(settings.with_extension("json.recompact-backup"), &text);
+            let tmp = settings.with_extension("json.recompact-tmp");
+            if fs::write(&tmp, &updated).is_ok() && fs::rename(&tmp, settings).is_ok() {
+                "auto-update: turned on for the segment-recompact marketplace".into()
+            } else {
+                "auto-update: could not write the settings file".into()
+            }
+        }
+        Ok(None) => "auto-update: nothing to change".into(),
+        Err(e) => format!("auto-update: left as is ({e})"),
+    }
+}
+
+/// `recompact install [--rc <file>]`: make interactive `claude` run through the launcher, and
+/// turn on auto-update for the plugin. Safe to run again: it only fills in what is missing.
 pub fn cmd_install(args: &[String]) -> i32 {
     let (_, opts) = parse_opts(args);
     let rc = match opts.get("rc").and_then(|v| v.as_str()) {
@@ -1727,24 +1805,263 @@ pub fn cmd_install(args: &[String]) -> i32 {
             return 1;
         }
     };
-    if updated == text {
-        println!("recompact is already set up in {}.", rc.display());
-        return 0;
+    let changed = updated != text;
+    if changed {
+        if !text.is_empty() {
+            let _ = fs::write(rc.with_extension("recompact-backup"), &text);
+        }
+        if let Err(e) = fs::write(&rc, &updated) {
+            eprintln!("install: cannot write {}: {e}", rc.display());
+            return 1;
+        }
+        println!(
+            "shell: claude now runs through recompact ({})",
+            rc.display()
+        );
+    } else {
+        println!("shell: already set up ({})", rc.display());
     }
-    if !text.is_empty() {
-        let _ = fs::write(rc.with_extension("recompact-backup"), &text);
-    }
-    if let Err(e) = fs::write(&rc, &updated) {
-        eprintln!("install: cannot write {}: {e}", rc.display());
-        return 1;
+    if opts.get("rc").is_none() {
+        println!("{}", enable_auto_update(&claude_settings()));
     }
     println!(
-        "Set up in {}. Open a new terminal (or `source {}`), then start claude as usual: \
-/recompact and large contexts now compact in place. Undo with `recompact uninstall`.",
-        rc.display(),
-        rc.display()
+        "Next: open a new terminal and start claude as usual. Sessions already running keep the \
+old setup until restarted. Check with `recompact doctor`; undo with `recompact uninstall`."
     );
     0
+}
+
+// ------------------------------------------------------------------------------------ doctor
+
+/// The installed plugin, from Claude Code's own record: (version, install path).
+fn installed_plugin(home: &Path) -> Option<(String, PathBuf)> {
+    let v = read_json(
+        &home
+            .join(".claude")
+            .join("plugins")
+            .join("installed_plugins.json"),
+    )?;
+    let plugins = v.get("plugins").unwrap_or(&v);
+    let entry = plugins
+        .get("segment-recompact@segment-recompact")?
+        .as_array()?
+        .first()?;
+    Some((
+        get_s(entry, "version")?.to_string(),
+        PathBuf::from(get_s(entry, "installPath")?),
+    ))
+}
+
+fn marketplace_source(home: &Path) -> Option<Value> {
+    read_json(&home.join(".claude").join("settings.json"))?
+        .pointer("/extraKnownMarketplaces/segment-recompact")
+        .cloned()
+}
+
+/// Every check an installer (person or agent) needs: each line is `ok`, `fix` (with the command
+/// that fixes it), or `note`. Returns (lines, all ok).
+pub fn doctor_report(home: &Path, rc: Option<&Path>) -> (Vec<String>, bool) {
+    let mut lines = Vec::new();
+    let mut ok = true;
+    let fix = |lines: &mut Vec<String>, s: String| {
+        lines.push(format!("fix   {s}"));
+    };
+    let installed = installed_plugin(home);
+    match &installed {
+        Some((v, _)) => lines.push(format!("ok    plugin segment-recompact {v} is installed")),
+        None => {
+            ok = false;
+            fix(&mut lines, "plugin not installed: curl -fsSL https://raw.githubusercontent.com/Don-Osipov/segment_recompact/main/install.sh | sh".into());
+        }
+    }
+    let source = marketplace_source(home);
+    let directory =
+        source.as_ref().and_then(|s| s.pointer("/source/source")) == Some(&json!("directory"));
+    match &source {
+        _ if directory => lines.push(
+            "note  marketplace is a local directory: update by pulling and building it".into(),
+        ),
+        Some(s) if s.get("autoUpdate") == Some(&json!(true)) => {
+            lines.push("ok    auto-update is on: new versions arrive when claude starts".into())
+        }
+        Some(_) => {
+            ok = false;
+            fix(
+                &mut lines,
+                "auto-update is off, so new versions never arrive: recompact install".into(),
+            );
+        }
+        None if installed.is_some() => lines.push(
+            "note  marketplace is declared elsewhere (a project's settings): auto-update follows that".into(),
+        ),
+        None => {}
+    }
+    if let Some((v, _)) = &installed {
+        let offered = read_json(
+            &home
+                .join(".claude/plugins/marketplaces/segment-recompact/plugins/segment_recompact/.claude-plugin/plugin.json"),
+        )
+        .and_then(|m| get_s(&m, "version").map(String::from));
+        if let Some(o) = offered.filter(|o| o != v) {
+            ok = false;
+            fix(
+                &mut lines,
+                format!("version {o} is available (installed {v}): recompact update"),
+            );
+        }
+    }
+    let launcher = home.join(".claude/recompact/bin/recompact");
+    let running = Command::new(&launcher)
+        .arg("version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let want = installed.as_ref().map(|(v, _)| format!("recompact {v}"));
+    match running {
+        Some(v) if want.as_ref().is_some_and(|w| w != &v) => {
+            ok = false;
+            fix(
+                &mut lines,
+                format!(
+                    "launcher runs {v} but {} is installed: recompact update",
+                    want.unwrap_or_default()
+                ),
+            );
+        }
+        Some(v) => lines.push(format!("ok    launcher {} runs: {v}", launcher.display())),
+        None => {
+            ok = false;
+            fix(
+                &mut lines,
+                format!(
+                    "launcher {} missing or not runnable: recompact update",
+                    launcher.display()
+                ),
+            );
+        }
+    }
+    match rc {
+        Some(rc) => {
+            let text = fs::read_to_string(rc).unwrap_or_default();
+            if text.contains(BLOCK_START) {
+                lines.push(format!(
+                    "ok    shell: claude runs through recompact ({})",
+                    rc.display()
+                ));
+            } else if with_block(&text, "").is_err() {
+                ok = false;
+                fix(
+                    &mut lines,
+                    format!(
+                        "{} defines `claude` itself: remove that definition, then run recompact install",
+                        rc.display()
+                    ),
+                );
+            } else {
+                ok = false;
+                fix(
+                    &mut lines,
+                    format!("shell not set up ({}): recompact install", rc.display()),
+                );
+            }
+        }
+        None => lines.push("note  shell is not zsh or bash: see `recompact install`".into()),
+    }
+    if std::env::var("CLAUDE_CODE_SESSION_ID").is_ok() {
+        let managed = Shell::from_env().is_some_and(|s| s.is_own_claude());
+        lines.push(if managed {
+            "ok    this claude session runs through recompact".into()
+        } else {
+            "note  this claude session started before setup: /recompact here compacts and prints a \
+resume command; sessions started from a new terminal compact in place"
+                .into()
+        });
+    }
+    let defaults = user_settings();
+    lines.push(format!(
+        "note  auto-compaction is {} by default{}; /recompact on turns it on per session",
+        if defaults.get("auto") == Some(&json!(true)) {
+            "ON"
+        } else {
+            "off"
+        },
+        get_u(&defaults, "at")
+            .map(|a| format!(" (size {})", fmt_k(a)))
+            .unwrap_or_default()
+    ));
+    (lines, ok)
+}
+
+/// `recompact doctor`: is everything installed and wired up; what exactly to run if not.
+pub fn cmd_doctor(_args: &[String]) -> i32 {
+    let (lines, ok) = doctor_report(&home(), rc_file().ok().as_deref());
+    println!("recompact doctor ({})", env!("CARGO_PKG_VERSION"));
+    for l in &lines {
+        println!("  {l}");
+    }
+    println!(
+        "{}",
+        if ok {
+            "All set."
+        } else {
+            "Run the commands after `fix`, then `recompact doctor` again."
+        }
+    );
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+/// `recompact update`: newest plugin version, binary, shell setup, then a doctor report. Safe to
+/// run inside a claude session; the new version applies to sessions started afterwards.
+pub fn cmd_update(_args: &[String]) -> i32 {
+    let claude = std::env::var("RECOMPACT_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
+    if let Some(path) = marketplace_source(&home())
+        .filter(|s| s.pointer("/source/source") == Some(&json!("directory")))
+        .and_then(|s| {
+            s.pointer("/source/path")
+                .and_then(|p| p.as_str())
+                .map(String::from)
+        })
+    {
+        println!(
+            "The marketplace is the local directory {path}: pull it and run `cargo build --release` \
+in plugins/segment_recompact first; continuing with the plugin update."
+        );
+    }
+    for args in [
+        vec!["plugin", "marketplace", "update", "segment-recompact"],
+        vec!["plugin", "update", "segment-recompact@segment-recompact"],
+    ] {
+        match Command::new(&claude).args(&args).status() {
+            Ok(s) if s.success() => {}
+            Ok(s) => {
+                eprintln!("update: `claude {}` exited {s}", args.join(" "));
+                return 1;
+            }
+            Err(e) => {
+                eprintln!("update: cannot run {claude}: {e}");
+                return 1;
+            }
+        }
+    }
+    let Some((version, path)) = installed_plugin(&home()) else {
+        eprintln!("update: the plugin is not installed; run install.sh");
+        return 1;
+    };
+    // The new version's launcher fetches its binary, repoints the stable link, and refreshes
+    // the shell setup; then it reports.
+    let launcher = path.join("bin").join("recompact");
+    println!("Installed segment-recompact {version}.");
+    let _ = Command::new(&launcher).arg("install").status();
+    Command::new(&launcher)
+        .arg("doctor")
+        .status()
+        .map(|s| s.code().unwrap_or(1))
+        .unwrap_or(1)
 }
 
 /// `recompact uninstall [--rc <file>]`: remove what `install` added.

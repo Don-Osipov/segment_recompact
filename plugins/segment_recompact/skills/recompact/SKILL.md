@@ -20,6 +20,7 @@ the plugin's version; `recompact version` confirms it runs.
 | Situation | Do this |
 |---|---|
 | The user typed `/recompact on`, `off`, `status`, or `default on/off` | Normally a hook answers before you see it. If you do see it, run `recompact auto on` (or `off`, `status`, `on 300k`, `default on`) and relay the line it prints. |
+| The user asks to install, update, or check recompact | `recompact doctor` shows what is set up and names the command for anything missing; `recompact update` brings plugin, binary, and shell setup to the latest version. Relay the result, and that new sessions (a new terminal) pick it up. |
 | The user typed `/recompact setup` (or asks to make compaction automatic) | Run `recompact install` and relay what it prints: they open a new terminal once, and from then on `/recompact` and large contexts compact in place. `recompact uninstall` undoes it. |
 | The user typed a bare `/recompact` (or asks to compact **this** session) | Run `recompact handoff` in Bash and relay what it prints. **Compact this session** below. |
 | You are inside a compacted session (preamble "This transcript was compacted by segment_recompact", footers `[recompact summary … · recall <id>]`, markers `[recompact: elided …]`) | Read **Waking up in a twin** below. Do not compact again. |
