@@ -396,7 +396,14 @@ pub fn on_prompt_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
         let managed = shell.as_ref().is_some_and(|sh| {
             hook_session(input).is_some_and(|s| sh.tracks(s)) || sh.is_own_claude()
         });
-        let text = switch(cmd, arg, shell.as_ref(), transcript.as_deref(), managed);
+        let text = switch(
+            cmd,
+            arg,
+            hook_session(input),
+            shell.as_ref(),
+            transcript.as_deref(),
+            managed,
+        );
         return Some(json!({"decision": "block", "reason": text}));
     }
     if !is_bare_recompact(prompt) {
@@ -420,14 +427,14 @@ fn nudged_at(shell: &Shell, session: &str) -> Option<usize> {
 }
 
 /// (trigger, checkpoint, target) for the session's current model and size.
-fn thresholds(shell: &Shell, model: &str, live: usize) -> (usize, usize, usize) {
+fn thresholds(shell: &Shell, session: &str, model: &str, live: usize) -> (usize, usize, usize) {
     let model = if model.is_empty() {
         get_s(&shell.config, "launch_model").unwrap_or("")
     } else {
         model
     };
     let window = window_for(model, live);
-    let at = user_at()
+    let at = user_at(Some(session))
         .or_else(|| get_u(&shell.config, "at"))
         .unwrap_or_else(|| default_at(window));
     let checkpoint =
@@ -474,11 +481,12 @@ pub fn on_stop_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
             );
         }
     }
-    if !auto_on(&shell.config) {
+    let (on, source) = auto_for(&shell.config, Some(session));
+    if !on {
         return None;
     }
     let (live, model) = live_status(&transcript)?;
-    let (at, _, target) = thresholds(&shell, &model, live);
+    let (at, _, target) = thresholds(&shell, session, &model, live);
     if live < at {
         // From halfway on, keep the summary cache warm in the background, so the handoff (or a
         // manual /recompact) finds almost every summary already written.
@@ -510,11 +518,13 @@ pub fn on_stop_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
         return None;
     }
     let kick = nudged_at(&shell, session).is_some();
-    // Never a surprise: the first time a turn ends over the size, say what will happen and how
-    // to stop it; compact when the next turn ends. An agent past its checkpoint request is
-    // mid-task with no one typing, so it goes now.
+    // Never a surprise: when it is on only by default, the first turn over the size says what
+    // will happen and how to stop it, and the next turn's end compacts. A session switched on
+    // for itself (or started with --auto) asked for this, and an agent past its checkpoint
+    // request is mid-task with no one typing: those go now.
     let warned = shell.dir.join("warned.json");
     if !kick
+        && source == AutoSource::Default
         && read_json(&warned).and_then(|w| get_s(&w, "session").map(|s| s == session)) != Some(true)
     {
         write_json(&warned, &json!({"session": session, "tokens": live}));
@@ -540,16 +550,13 @@ pub fn on_post_tool_use_in(shell: Option<Shell>, input: &Value) -> Option<Value>
         return None;
     }
     let shell = shell?;
-    if !auto_on(&shell.config) {
-        return None;
-    }
     let session = hook_session(input)?;
-    if !shell.tracks(session) {
+    if !shell.tracks(session) || !auto_on(&shell.config, Some(session)) {
         return None;
     }
     let transcript = PathBuf::from(get_s(input, "transcript_path")?);
     let (live, model) = live_status(&transcript)?;
-    let (_, checkpoint, _) = thresholds(&shell, &model, live);
+    let (_, checkpoint, _) = thresholds(&shell, session, &model, live);
     if live < checkpoint {
         return None;
     }
@@ -570,11 +577,11 @@ is then compacted and resumed automatically, and you will be told to continue.",
 
 /// Outside the launcher, say once per 100k of growth that the session is large.
 fn suggest(session: &str, transcript: &Path) -> Option<Value> {
-    if !auto_on(&json!({})) {
+    if !auto_on(&json!({}), Some(session)) {
         return None;
     }
     let (live, model) = live_status(transcript)?;
-    if live < user_at().unwrap_or_else(|| default_at_for(&model, live)) {
+    if live < user_at(Some(session)).unwrap_or_else(|| default_at_for(&model, live)) {
         return None;
     }
     let dir = home().join(".claude").join("recompact").join("suggest");
@@ -1167,7 +1174,7 @@ struct Launch {
     bin: String,
     at: Option<usize>,
     checkpoint_at: Option<usize>,
-    auto: bool,
+    auto: Option<bool>,
     kick: String,
     max_cycles: usize,
     dir: Option<PathBuf>,
@@ -1184,9 +1191,7 @@ fn split_launcher_args(args: &[String]) -> (Launch, Vec<String>) {
         bin: std::env::var("RECOMPACT_CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
         at: env_usize("RECOMPACT_AT"),
         checkpoint_at: env_usize("RECOMPACT_CHECKPOINT_AT"),
-        auto: std::env::var("RECOMPACT_AUTO")
-            .map(|v| v != "0")
-            .unwrap_or(true),
+        auto: std::env::var("RECOMPACT_AUTO").ok().map(|v| v != "0"),
         kick:
             "Continue the work from where you left off: the session was compacted at a checkpoint, \
 and your last message says what was done and what is next."
@@ -1247,11 +1252,11 @@ and your last message says what was done and what is next."
                 i += 1;
             }
             "--no-auto" => {
-                l.auto = false;
+                l.auto = Some(false);
                 i += 1;
             }
             "--auto" => {
-                l.auto = true;
+                l.auto = Some(true);
                 i += 1;
             }
             "--interactive" => {
@@ -1321,11 +1326,14 @@ pub fn cmd_shell(args: &[String]) -> i32 {
     let mut next_args: Vec<String> = claude_args.clone();
 
     // A resumed session opens as it is, however big: compaction only ever follows a warning.
-    let auto = auto_on(&json!({"auto": l.auto}));
+    let (auto, _) = auto_for(
+        &json!({"auto": l.auto}),
+        flag_value(&parsed, &["-r", "--resume"]),
+    );
     say(if auto {
-        "auto-compaction on · /recompact off to turn it off"
+        "auto-compaction on for this session · /recompact off to turn it off"
     } else {
-        "auto-compaction off · /recompact on to turn it on"
+        "auto-compaction off · /recompact on turns it on for this session"
     });
 
     let mut cycles = 0usize;
@@ -1395,7 +1403,7 @@ pub fn cmd_shell(args: &[String]) -> i32 {
             }
             continue;
         };
-        let at = user_at().or(l.at).unwrap_or_else(|| {
+        let at = user_at(get_s(&req, "session")).or(l.at).unwrap_or_else(|| {
             let (live, model) = live_status(&transcript).unwrap_or((0, String::new()));
             let model = if model.is_empty() {
                 origin.launch_model.clone().unwrap_or_default()
@@ -1410,6 +1418,9 @@ pub fn cmd_shell(args: &[String]) -> i32 {
         };
         if est > 0 {
             rearm = rearm_for(est, at);
+        }
+        if let Some(from) = get_s(&req, "session") {
+            carry_session_setting(from, &twin);
         }
         let kick = req.get("kick") == Some(&json!(true));
         next_args = relaunch_args(&origin, &twin, &transcript, kick.then_some(l.kick.as_str()));
@@ -1768,26 +1779,72 @@ pub fn cmd_uninstall(args: &[String]) -> i32 {
 
 // ------------------------------------------------------------------------------------ switch
 
-/// The user's switch, `~/.claude/recompact/settings.json` (`auto`, optional `at`). It wins over
-/// launch flags and the environment, and every hook reads it, so `/recompact off` applies to all
-/// running sessions from their next turn.
+/// Where a session's auto-compaction setting comes from, strongest first.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AutoSource {
+    /// `/recompact on|off` in that session (or an earlier session of its lineage).
+    Session,
+    /// `claude --auto` / `--no-auto` for this launcher.
+    Launch,
+    /// `/recompact default on|off`; off unless set.
+    Default,
+}
+
 fn settings_path() -> PathBuf {
     recompact_home().join("settings.json")
 }
 
+/// Defaults for new sessions, `~/.claude/recompact/settings.json`: `auto` (off unless set) and
+/// optionally `at`.
 pub fn user_settings() -> Value {
     read_json(&settings_path()).unwrap_or(json!({}))
 }
 
-fn auto_on(config: &Value) -> bool {
-    match user_settings().get("auto").and_then(|v| v.as_bool()) {
-        Some(b) => b,
-        None => config.get("auto") != Some(&json!(false)),
-    }
+fn session_setting_path(id: &str) -> PathBuf {
+    recompact_home().join("sessions").join(format!("{id}.json"))
 }
 
-fn user_at() -> Option<usize> {
-    get_u(&user_settings(), "at")
+fn session_setting(id: &str) -> Value {
+    read_json(&session_setting_path(id)).unwrap_or(json!({}))
+}
+
+/// Is auto-compaction on for this session, and on whose say-so.
+pub fn auto_for(config: &Value, session: Option<&str>) -> (bool, AutoSource) {
+    if let Some(b) =
+        session.and_then(|id| session_setting(id).get("auto").and_then(|v| v.as_bool()))
+    {
+        return (b, AutoSource::Session);
+    }
+    if let Some(b) = config.get("auto").and_then(|v| v.as_bool()) {
+        return (b, AutoSource::Launch);
+    }
+    (
+        user_settings()
+            .get("auto")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        AutoSource::Default,
+    )
+}
+
+fn auto_on(config: &Value, session: Option<&str>) -> bool {
+    auto_for(config, session).0
+}
+
+fn user_at(session: Option<&str>) -> Option<usize> {
+    session
+        .and_then(|id| get_u(&session_setting(id), "at"))
+        .or_else(|| get_u(&user_settings(), "at"))
+}
+
+/// A handoff's twin inherits its parent's setting: a session switched on stays on.
+fn carry_session_setting(from: &str, to: &str) {
+    if from != to {
+        if let Some(v) = read_json(&session_setting_path(from)) {
+            let _ = fs::create_dir_all(recompact_home().join("sessions"));
+            write_json(&session_setting_path(to), &v);
+        }
+    }
 }
 
 /// `300k`, `1m`, `400000`.
@@ -1804,7 +1861,7 @@ pub fn parse_size(s: &str) -> Option<usize> {
     (v >= 10_000.0).then_some(v as usize)
 }
 
-/// `/recompact on [size]`, `/recompact off`, `/recompact status`.
+/// `/recompact on [size]`, `/recompact off`, `/recompact status`, `/recompact default on|off`.
 fn switch_command(prompt: &str) -> Option<(&str, Option<&str>)> {
     let p = prompt.trim();
     let rest = p
@@ -1819,90 +1876,143 @@ fn switch_command(prompt: &str) -> Option<(&str, Option<&str>)> {
     if words.next().is_some() {
         return None;
     }
-    match (cmd, arg) {
-        ("on" | "off" | "status", None) => Some((cmd, None)),
-        ("on", Some(a)) if parse_size(a).is_some() => Some((cmd, Some(a))),
-        _ => None,
-    }
+    let ok = match (cmd, arg) {
+        ("on" | "off" | "status", None) => true,
+        ("on", Some(a)) => parse_size(a).is_some(),
+        ("default", Some("on" | "off")) => true,
+        _ => false,
+    };
+    ok.then_some((cmd, arg))
 }
 
-/// Apply a switch command and describe the result in one line.
+/// Apply a switch command for `session` and describe the result in one line.
 pub fn switch(
     cmd: &str,
     arg: Option<&str>,
+    session: Option<&str>,
     shell: Option<&Shell>,
     transcript: Option<&Path>,
     managed: bool,
 ) -> String {
-    let mut settings = user_settings();
-    match cmd {
-        "on" => {
-            settings["auto"] = json!(true);
+    match (cmd, session) {
+        ("on" | "off", Some(id)) => {
+            let mut v = session_setting(id);
+            v["auto"] = json!(cmd == "on");
             if let Some(at) = arg.and_then(parse_size) {
-                settings["at"] = json!(at);
+                v["at"] = json!(at);
             }
+            let _ = fs::create_dir_all(recompact_home().join("sessions"));
+            write_json(&session_setting_path(id), &v);
         }
-        "off" => settings["auto"] = json!(false),
+        ("default", _) => {
+            let mut v = user_settings();
+            v["auto"] = json!(arg == Some("on"));
+            let _ = fs::create_dir_all(recompact_home());
+            write_json(&settings_path(), &v);
+        }
         _ => {}
     }
-    if cmd != "status" {
-        let _ = fs::create_dir_all(recompact_home());
-        write_json(&settings_path(), &settings);
-    }
     let config = shell.map(|s| s.config.clone()).unwrap_or(json!({}));
-    let on = auto_on(&config);
+    let (on, source) = auto_for(&config, session);
+    let default_on = user_settings()
+        .get("auto")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let live = transcript.and_then(live_status);
-    let at = match (shell, &live) {
-        (Some(sh), Some((t, m))) => thresholds(sh, m, *t).0,
-        (_, Some((t, m))) => user_at().unwrap_or_else(|| default_at_for(m, *t)),
-        _ => user_at().unwrap_or(400_000),
+    let at = match (shell, session, &live) {
+        (Some(sh), Some(id), Some((t, m))) => thresholds(sh, id, m, *t).0,
+        (_, _, Some((t, m))) => user_at(session).unwrap_or_else(|| default_at_for(m, *t)),
+        _ => user_at(session).unwrap_or(400_000),
     };
-    let size = live
+    let now = live
         .as_ref()
-        .map(|(t, _)| format!("; this session is at {}", fmt_k(*t)))
+        .map(|(t, _)| format!(", now {}", fmt_k(*t)))
         .unwrap_or_default();
-    if !on {
-        return format!(
-            "recompact: auto-compaction is OFF everywhere{size}. Type /recompact to compact by hand, \
-/recompact on to turn it back on."
-        );
-    }
-    let mut text = format!(
-        "recompact: auto-compaction is ON: sessions compact in place when a turn ends at {} or more{size}. \
-/recompact off turns it off; /recompact on 300k changes the size.",
-        fmt_k(at)
+    let new_sessions = format!(
+        "New sessions start {} (/recompact default {} changes that).",
+        if default_on { "ON" } else { "OFF" },
+        if default_on { "off" } else { "on" }
     );
-    if !managed {
+    let mut text = match (cmd, session.is_some()) {
+        ("default", _) => format!(
+            "recompact: new sessions now start with auto-compaction {}. {}",
+            if default_on { "ON" } else { "OFF" },
+            if session.is_some() {
+                format!("This session is {}.", if on { "ON" } else { "OFF" })
+            } else {
+                String::new()
+            }
+        ),
+        (_, false) => format!(
+            "recompact: no session here; `recompact auto on --session <id>` names one. {new_sessions}"
+        ),
+        ("on", true) => format!(
+            "recompact: auto-compaction is ON for this session and its continuations (at {}{now}). \
+When a turn ends past that size it compacts in place and carries on; long autonomous turns are asked \
+to checkpoint first. /recompact off turns it off.",
+            fmt_k(at)
+        ),
+        ("off", true) => format!(
+            "recompact: auto-compaction is OFF for this session{now}. /recompact still compacts by hand; \
+/recompact on turns it back on."
+        ),
+        _ => format!(
+            "recompact: this session is {}{} (at {}{now}). {new_sessions}",
+            if on { "ON" } else { "OFF" },
+            match source {
+                AutoSource::Session => "",
+                AutoSource::Launch => ", from `claude --auto`/`--no-auto`",
+                AutoSource::Default => ", the default",
+            },
+            fmt_k(at)
+        ),
+    };
+    if on && !managed {
         text.push_str(
             " This claude was not started through recompact, so it cannot compact in place: run \
 /recompact setup once, then open a new terminal.",
         );
     }
-    text
+    text.trim_end().to_string()
 }
 
-/// `recompact auto [on [size] | off | status]`: the same switch from a terminal.
+/// `recompact auto [on [size] | off | status] [--session <id>]`, `recompact auto default on|off`:
+/// the switch from a shell. Inside claude the session is the current one.
 pub fn cmd_auto(args: &[String]) -> i32 {
-    let cmd = args.first().map(String::as_str).unwrap_or("status");
-    let arg = args.get(1).map(String::as_str);
+    let (pos, opts) = parse_opts(args);
+    let cmd = pos.first().map(String::as_str).unwrap_or("status");
+    let arg = pos.get(1).map(String::as_str);
     let valid = match (cmd, arg) {
         ("on" | "off" | "status", None) => true,
         ("on", Some(a)) => parse_size(a).is_some(),
+        ("default", Some("on" | "off")) => true,
         _ => false,
     };
     if !valid {
-        eprintln!("usage: recompact auto [on [300k] | off | status]");
+        eprintln!(
+            "usage: recompact auto [on [300k] | off | status] [--session <id>]\n       recompact auto default on|off"
+        );
         return 2;
     }
     let shell = Shell::from_env();
-    // Run from inside claude (the agent's shell), say whether that claude can compact in place;
-    // from a plain terminal there is no session to judge.
-    let session = std::env::var("CLAUDE_CODE_SESSION_ID").ok();
-    let managed = session.is_none() || shell.as_ref().is_some_and(|s| s.is_own_claude());
-    let transcript = session.and_then(|id| locate_session(None, &id));
+    let session = opts
+        .get("session")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok());
+    let inside = std::env::var("CLAUDE_CODE_SESSION_ID").is_ok();
+    let managed = !inside || shell.as_ref().is_some_and(|s| s.is_own_claude());
+    let transcript = session.as_deref().and_then(|id| locate_session(None, id));
     println!(
         "{}",
-        switch(cmd, arg, shell.as_ref(), transcript.as_deref(), managed)
+        switch(
+            cmd,
+            arg,
+            session.as_deref(),
+            shell.as_ref(),
+            transcript.as_deref(),
+            managed
+        )
     );
     0
 }
