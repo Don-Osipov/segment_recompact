@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$RECOMPACT_SHELL\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook user-prompt-submit 2>/dev/null || true",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook user-prompt-submit 2>/dev/null || true",
             "timeout": 10
           }
         ]

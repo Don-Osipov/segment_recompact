@@ -10,7 +10,19 @@ use serde_json::{json, Value};
 
 const SESSION: &str = "5e5516a0-0000-4000-8000-000000000001";
 
+/// Hooks read the user's switch from RECOMPACT_HOME; point this test binary at an empty one so
+/// a real `/recompact off` never changes the outcome. (phase17 tests the switch itself.)
+fn isolate() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let home = std::env::temp_dir().join(format!("recompact-test-home-{}", uuid_v4()));
+        fs::create_dir_all(&home).unwrap();
+        std::env::set_var("RECOMPACT_HOME", home);
+    });
+}
+
 fn tmp_dir() -> PathBuf {
+    isolate();
     let dir = std::env::temp_dir().join(format!("recompact-test-{}", uuid_v4()));
     fs::create_dir_all(&dir).unwrap();
     dir

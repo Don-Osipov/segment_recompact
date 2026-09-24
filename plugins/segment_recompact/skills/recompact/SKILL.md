@@ -19,6 +19,7 @@ the plugin's version; `recompact version` confirms it runs.
 
 | Situation | Do this |
 |---|---|
+| The user typed `/recompact on`, `off`, or `status` | Normally a hook answers before you see it. If you do see it, run `recompact auto on` (or `off`, `status`; `on 300k` sets the size) and relay the line it prints. |
 | The user typed `/recompact setup` (or asks to make compaction automatic) | Run `recompact install` and relay what it prints: they open a new terminal once, and from then on `/recompact` and large contexts compact in place. `recompact uninstall` undoes it. |
 | The user typed a bare `/recompact` (or asks to compact **this** session) | Run `recompact handoff` in Bash and relay what it prints. **Compact this session** below. |
 | You are inside a compacted session (preamble "This transcript was compacted by segment_recompact", footers `[recompact summary … · recall <id>]`, markers `[recompact: elided …]`) | Read **Waking up in a twin** below. Do not compact again. |
@@ -206,6 +207,13 @@ cannot classify run claude directly, unwrapped. It stays in the background and d
   under Claude Code's own compaction), a hook asks the main agent (not subagents) to reach a
   checkpoint and end its turn; the resumed session is told to continue. An active `/goal` is
   continued the same way.
+
+**On and off:** `/recompact off` stops automatic compaction in every session from its next turn;
+`/recompact on` turns it back on (`/recompact on 300k` also sets the size); `/recompact status`
+says which is in effect and how big this session is. A hook answers these without a model turn.
+From a terminal: `recompact auto on|off|status`. The switch lives in
+`~/.claude/recompact/settings.json` and wins over launch flags and environment. A bare
+`/recompact` always compacts, on or off.
 
 Transcripts do not record the context window: Haiku counts as 200k, other models as 1M (what the
 `opus` alias gives on current plans); set `RECOMPACT_WINDOW=200k` if yours differs.

@@ -51,6 +51,8 @@ queued for turn end under `shell`; otherwise compacts now and\n                 
 prints the resume command)\n  \
 recompact prewarm   <session> [--target T]  (summarize ahead into the cache)\n  \
 recompact install   (make interactive `claude` run through `shell`; `uninstall` undoes it)\n  \
+recompact auto      [on [300k] | off | status]  (the auto-compaction switch; inside\n                      \
+claude: /recompact on, /recompact off, /recompact status)\n  \
 recompact version\n  \
 recompact resume    <session.jsonl | sessionId>\n  \
 recompact scan      [project-dir] [--estimate]\n\n\
