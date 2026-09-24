@@ -17,6 +17,9 @@ fn isolate() {
     ONCE.call_once(|| {
         let home = std::env::temp_dir().join(format!("recompact-test-home-{}", uuid_v4()));
         fs::create_dir_all(&home).unwrap();
+        // Default on here, so a config without "auto" exercises the by-default path (warning
+        // first) and "auto": true the explicit one (`claude --auto`).
+        fs::write(home.join("settings.json"), r#"{"auto": true}"#).unwrap();
         std::env::set_var("RECOMPACT_HOME", home);
     });
 }
@@ -266,8 +269,8 @@ fn a_bare_recompact_is_taken_by_the_launcher_before_the_model_sees_it() {
 fn a_turn_ending_over_the_threshold_requests_a_handoff() {
     let dir = tmp_dir();
     let t = big_session(&dir, 180_000);
-    let shell = shell_state(json!({"auto": true, "at": 150_000}), &t);
-    // First a warning, and nothing else: never a surprise.
+    let shell = shell_state(json!({"at": 150_000}), &t);
+    // On by default only: first a warning, and nothing else. Never a surprise.
     let warn = on_stop_in(Some(reload(&shell)), &stop_input(&t)).expect("warned");
     let text = warn["systemMessage"].as_str().unwrap();
     assert!(
@@ -312,10 +315,26 @@ fn a_turn_ending_over_the_threshold_requests_a_handoff() {
 }
 
 #[test]
-fn background_work_defers_the_handoff_and_says_so_once() {
+fn a_session_started_with_auto_hands_off_without_a_warning() {
     let dir = tmp_dir();
     let t = big_session(&dir, 180_000);
     let shell = shell_state(json!({"auto": true, "at": 150_000}), &t);
+    let out = on_stop_in(Some(reload(&shell)), &stop_input(&t)).expect("handoff");
+    assert!(out["systemMessage"]
+        .as_str()
+        .unwrap()
+        .contains("compacting"));
+    assert_eq!(
+        read(shell.dir.join("request.json")).unwrap()["reason"],
+        "auto"
+    );
+}
+
+#[test]
+fn background_work_defers_the_handoff_and_says_so_once() {
+    let dir = tmp_dir();
+    let t = big_session(&dir, 180_000);
+    let shell = shell_state(json!({"at": 150_000}), &t);
     let mut input = stop_input(&t);
     input["background_tasks"] = json!([{"id": "b1"}]);
     let out = on_stop_in(Some(reload(&shell)), &input).expect("explains the wait");
@@ -339,7 +358,7 @@ fn background_work_defers_the_handoff_and_says_so_once() {
 fn a_session_opened_over_the_size_gets_room_before_any_warning() {
     let dir = tmp_dir();
     let t = big_session(&dir, 612_000);
-    let shell = shell_state(json!({"auto": true, "at": 400_000}), &t);
+    let shell = shell_state(json!({"at": 400_000}), &t);
     let mut session: Value = read(shell.dir.join("session.json")).unwrap();
     session["start_tokens"] = json!(612_000);
     fs::write(shell.dir.join("session.json"), session.to_string()).unwrap();

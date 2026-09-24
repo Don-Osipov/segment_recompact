@@ -19,7 +19,7 @@ the plugin's version; `recompact version` confirms it runs.
 
 | Situation | Do this |
 |---|---|
-| The user typed `/recompact on`, `off`, or `status` | Normally a hook answers before you see it. If you do see it, run `recompact auto on` (or `off`, `status`; `on 300k` sets the size) and relay the line it prints. |
+| The user typed `/recompact on`, `off`, `status`, or `default on/off` | Normally a hook answers before you see it. If you do see it, run `recompact auto on` (or `off`, `status`, `on 300k`, `default on`) and relay the line it prints. |
 | The user typed `/recompact setup` (or asks to make compaction automatic) | Run `recompact install` and relay what it prints: they open a new terminal once, and from then on `/recompact` and large contexts compact in place. `recompact uninstall` undoes it. |
 | The user typed a bare `/recompact` (or asks to compact **this** session) | Run `recompact handoff` in Bash and relay what it prints. **Compact this session** below. |
 | You are inside a compacted session (preamble "This transcript was compacted by segment_recompact", footers `[recompact summary … · recall <id>]`, markers `[recompact: elided …]`) | Read **Waking up in a twin** below. Do not compact again. |
@@ -198,9 +198,8 @@ opus --effort max`, `recompact shell -r <id>`). Print mode, `--help`, subcommand
 cannot classify run claude directly, unwrapped. It stays in the background and does three things:
 
 - **Typed `/recompact`:** compacts and resumes in the same terminal, no model turn spent.
-- **Automatic, never a surprise:** when a turn ends with the context at or over `--at` (default
-  400k on a 1M window, 140k on 200k), it prints one line saying the session compacts when the next
-  turn ends, and how to stop it (`/recompact off`). When that next turn ends, it compacts toward
+- **Automatic, for sessions that ask for it** (`/recompact on`, below): when a turn ends with the
+  context at or over `--at` (default 400k on a 1M window, 140k on 200k), it compacts toward
   `--target` (default half of `--at`, at most 120k) and resumes. It waits while background tasks run or session crons are scheduled, and says so once.
   From half of `--at`, a background prewarm keeps the summary cache warm, so the handoff itself
   usually takes seconds.
@@ -209,12 +208,17 @@ cannot classify run claude directly, unwrapped. It stays in the background and d
   checkpoint and end its turn; the resumed session is told to continue. An active `/goal` is
   continued the same way.
 
-**On and off:** `/recompact off` stops automatic compaction in every session from its next turn;
-`/recompact on` turns it back on (`/recompact on 300k` also sets the size); `/recompact status`
-says which is in effect and how big this session is. A hook answers these without a model turn.
-From a terminal: `recompact auto on|off|status`. The switch lives in
-`~/.claude/recompact/settings.json` and wins over launch flags and environment. A bare
-`/recompact` always compacts, on or off.
+**On and off, per session.** Automatic compaction is off unless a session asks for it:
+`/recompact on` turns it on for this session and every continuation of it (the setting follows
+the session through its handoffs, and back when you resume it later); `/recompact on 500k` also
+sets its size; `/recompact off` turns it off; `/recompact status` shows this session's setting,
+its size, and the default. `/recompact default on|off` sets what new sessions start with, and
+`claude --auto` starts one session with it on. A hook answers all of these without a model turn.
+From a terminal: `recompact auto on|off|status [--session <id>]`, `recompact auto default on|off`.
+A bare `/recompact` always compacts, on or off.
+
+A session switched on (or started with `--auto`) compacts at the end of the turn that crosses its
+size; one that is on only because of the default gets the one-line notice first.
 
 Transcripts do not record the context window: Haiku counts as 200k, other models as 1M (what the
 `opus` alias gives on current plans); set `RECOMPACT_WINDOW=200k` if yours differs.

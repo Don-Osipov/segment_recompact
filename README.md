@@ -34,14 +34,14 @@ needed), and adds a small `claude` function to your shell startup file. Open a n
 use claude as always:
 
 - Type `/recompact` to compact the current session. It resumes in the same terminal.
-- When a turn ends with the context at 400k tokens (140k on Haiku), you get a one-line notice
-  that it compacts after your next turn, then it does, unless you type `/recompact off`. A
-  session you resume opens as it is, whatever its size.
-  Set `RECOMPACT_WINDOW=200k` if your Opus or Sonnet plan has a 200k window.
-- Long autonomous turns are asked to checkpoint, then compacted and told to continue.
-- `/recompact off` and `/recompact on` switch the automatic part for every session;
-  `/recompact status` shows the setting and this session's size; `/recompact on 300k` changes
-  the size. They answer instantly, without a model turn.
+- Sessions you expect to run long: type `/recompact on` in them (or start them with
+  `claude --auto`). When a turn ends past 400k tokens (140k on Haiku), that session compacts in
+  place and carries on, through as many handoffs as it takes; long autonomous turns are asked to
+  reach a checkpoint first. Everything else stays untouched: automatic compaction is off by
+  default. Set `RECOMPACT_WINDOW=200k` if your Opus or Sonnet plan has a 200k window.
+- `/recompact off` turns it off for that session, `/recompact on 500k` changes its size,
+  `/recompact status` shows where it stands, and `/recompact default on` makes it the default for
+  new sessions. They answer instantly, without a model turn.
 
 Anything removed stays readable through the `recall` tool. `claude -p`, subcommands, and flags the
 launcher does not recognize run plain claude. To undo the shell change:
