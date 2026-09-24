@@ -34,7 +34,9 @@ needed), and adds a small `claude` function to your shell startup file. Open a n
 use claude as always:
 
 - Type `/recompact` to compact the current session. It resumes in the same terminal.
-- When a turn ends with the context at 400k tokens (140k on Haiku), the same happens by itself.
+- When a turn ends with the context at 400k tokens (140k on Haiku), you get a one-line notice
+  that it compacts after your next turn, then it does, unless you type `/recompact off`. A
+  session you resume opens as it is, whatever its size.
   Set `RECOMPACT_WINDOW=200k` if your Opus or Sonnet plan has a 200k window.
 - Long autonomous turns are asked to checkpoint, then compacted and told to continue.
 - `/recompact off` and `/recompact on` switch the automatic part for every session;

@@ -198,9 +198,10 @@ opus --effort max`, `recompact shell -r <id>`). Print mode, `--help`, subcommand
 cannot classify run claude directly, unwrapped. It stays in the background and does three things:
 
 - **Typed `/recompact`:** compacts and resumes in the same terminal, no model turn spent.
-- **Automatic:** when a turn ends with the context at or over `--at` (default 400k on a 1M
-  window, 140k on 200k), it compacts toward `--target` (default half of `--at`, at most 120k) and
-  resumes. It waits while background tasks run or session crons are scheduled, and says so once.
+- **Automatic, never a surprise:** when a turn ends with the context at or over `--at` (default
+  400k on a 1M window, 140k on 200k), it prints one line saying the session compacts when the next
+  turn ends, and how to stop it (`/recompact off`). When that next turn ends, it compacts toward
+  `--target` (default half of `--at`, at most 120k) and resumes. It waits while background tasks run or session crons are scheduled, and says so once.
   From half of `--at`, a background prewarm keeps the summary cache warm, so the handoff itself
   usually takes seconds.
 - **Long autonomous turns:** past the checkpoint size (`--at` + 150k on 1M; on 200k, 30k more but
@@ -218,7 +219,8 @@ From a terminal: `recompact auto on|off|status`. The switch lives in
 Transcripts do not record the context window: Haiku counts as 200k, other models as 1M (what the
 `opus` alias gives on current plans); set `RECOMPACT_WINDOW=200k` if yours differs.
 
-Resuming a session that is already over `--at` compacts it before it opens. The relaunch keeps
+A resumed session always opens as it is. If it is already over `--at`, it gets another 100k (or
+a quarter of `--at`) of room before the warning. The relaunch keeps
 every flag except the session-selecting ones and `--permission-mode` (the session restores the
 mode it was in; `--dangerously-skip-permissions` becomes `--allow-dangerously-skip-permissions`).
 It keeps the model you launched with, unless the session switched model family mid-way, and the
