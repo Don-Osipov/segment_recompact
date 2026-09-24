@@ -3779,9 +3779,23 @@ pub fn cmd_shell(args: &[String]) -> i32 {
             }
             id = Some(next.clone());
             cmd.arg("--resume").arg(&next);
+            let next_records = load_jsonl(&dir.join(format!("{next}.jsonl")));
+            // A resume starts on the saved default model and drops session-only effort; carry
+            // both over, letting `recompact shell --model/--effort` override them.
+            let mut flags = resume_flags(&next_records);
+            for key in ["model", "effort"] {
+                if let Some(v) = opts.get(key).and_then(|v| v.as_str()) {
+                    let flag = format!("--{key}");
+                    match flags.iter().position(|f| *f == flag) {
+                        Some(i) => flags[i + 1] = v.to_string(),
+                        None => flags.extend([flag, v.to_string()]),
+                    }
+                }
+            }
+            cmd.args(&flags);
             if first && goal.is_some() {
                 cmd.arg(format!("/goal {}", goal.clone().unwrap()));
-            } else if has_active_goal(&load_jsonl(&dir.join(format!("{next}.jsonl")))) {
+            } else if has_active_goal(&next_records) {
                 cmd.arg(&kick);
             }
         } else if let Some(g) = &goal {
