@@ -494,6 +494,18 @@ pub fn on_prompt(input: &Value) -> Option<Value> {
 
 pub fn on_prompt_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
     let prompt = get_s(input, "prompt")?;
+    if matches!(
+        prompt.trim(),
+        "/recompact setup" | "/segment-recompact:recompact setup"
+    ) {
+        let (ok, lines) = install(None);
+        let text = if ok {
+            lines.join(" ")
+        } else {
+            format!("recompact setup failed: {}", lines.join(" "))
+        };
+        return Some(json!({"decision": "block", "reason": text}));
+    }
     if let Some((cmd, arg)) = switch_command(prompt) {
         let transcript = get_s(input, "transcript_path").map(PathBuf::from);
         let managed = shell.as_ref().is_some_and(|sh| {
@@ -1753,16 +1765,20 @@ fn rc_file() -> Result<PathBuf, String> {
         .and_then(|n| n.to_str())
         .unwrap_or("");
     match name {
-        "zsh" => Ok(home().join(".zshrc")),
-        "bash" => {
-            // macOS terminals start login shells, which read .bash_profile.
-            let profile = home().join(".bash_profile");
-            if cfg!(target_os = "macos") && profile.exists() {
-                Ok(profile)
-            } else {
-                Ok(home().join(".bashrc"))
-            }
+        "zsh" => Ok(std::env::var("ZDOTDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| home())
+            .join(".zshrc")),
+        "bash" if cfg!(target_os = "macos") => {
+            // macOS terminals start login shells, which read only the first of these that
+            // exists; .bashrc is never read. Creating .bash_profile when none exists is safe.
+            Ok([".bash_profile", ".bash_login", ".profile"]
+                .iter()
+                .map(|f| home().join(f))
+                .find(|p| p.exists())
+                .unwrap_or_else(|| home().join(".bash_profile")))
         }
+        "bash" => Ok(home().join(".bashrc")),
         other => Err(format!(
             "shell `{other}` is not supported by `recompact install`; define `claude` to run \
 `{} shell \"$@\"` yourself",
@@ -1917,49 +1933,127 @@ fn enable_auto_update(settings: &Path) -> String {
 /// turn on auto-update for the plugin. Safe to run again: it only fills in what is missing.
 pub fn cmd_install(args: &[String]) -> i32 {
     let (_, opts) = parse_opts(args);
-    let rc = match opts.get("rc").and_then(|v| v.as_str()) {
-        Some(p) => PathBuf::from(p),
-        None => match rc_file() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("install: {e}");
-                return 1;
-            }
-        },
+    let rc = opts.get("rc").and_then(|v| v.as_str()).map(PathBuf::from);
+    let (ok, lines) = install(rc.as_deref());
+    for l in &lines {
+        if ok {
+            println!("{l}");
+        } else {
+            eprintln!("install: {l}");
+        }
+    }
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+/// Add the shell block (and, for the user's own rc file, marketplace auto-update). Safe to run
+/// again. Returns success and what to tell the user.
+pub fn install(rc: Option<&Path>) -> (bool, Vec<String>) {
+    let custom = rc.is_some();
+    let rc = match rc.map(Path::to_path_buf).map(Ok).unwrap_or_else(rc_file) {
+        Ok(p) => p,
+        Err(e) => return (false, vec![e]),
     };
     let launcher = recompact_home().join("bin").join("recompact");
     let text = fs::read_to_string(&rc).unwrap_or_default();
     let updated = match with_block(&text, &shell_block(&launcher)) {
         Ok(t) => t,
-        Err(e) => {
-            eprintln!("install: not changing {}: {e}", rc.display());
-            return 1;
-        }
+        Err(e) => return (false, vec![format!("not changing {}: {e}", rc.display())]),
     };
-    let changed = updated != text;
-    if changed {
+    let mut lines = Vec::new();
+    if updated != text {
         if !text.is_empty() {
             let _ = fs::write(rc.with_extension("recompact-backup"), &text);
         }
         if let Err(e) = fs::write(&rc, &updated) {
-            eprintln!("install: cannot write {}: {e}", rc.display());
-            return 1;
+            return (
+                false,
+                vec![format!(
+                    "cannot write {}: {e}. Run `{} install` in a terminal outside claude.",
+                    rc.display(),
+                    launcher.display()
+                )],
+            );
         }
-        println!(
+        lines.push(format!(
             "shell: claude now runs through recompact ({})",
             rc.display()
-        );
+        ));
     } else {
-        println!("shell: already set up ({})", rc.display());
+        lines.push(format!("shell: already set up ({})", rc.display()));
     }
-    if opts.get("rc").is_none() {
-        println!("{}", enable_auto_update(&claude_settings()));
+    let _ = fs::remove_file(recompact_home().join("declined"));
+    if !custom {
+        lines.push(enable_auto_update(&claude_settings()));
     }
-    println!(
+    lines.push(
         "Next: open a new terminal and start claude as usual. Sessions already running keep the \
 old setup until restarted. Check with `recompact doctor`; undo with `recompact uninstall`."
+            .into(),
     );
-    0
+    (true, lines)
+}
+
+/// Why this claude cannot compact in place, if it cannot, and what fixes it. `None` when it
+/// runs under the launcher, or the user removed the setup on purpose.
+pub fn setup_gap(under_launcher: bool) -> Option<String> {
+    if under_launcher || recompact_home().join("declined").exists() {
+        return None;
+    }
+    match rc_file() {
+        Err(_) => Some(
+            "recompact: this shell is not zsh or bash, so /recompact cannot compact in place here \
+(it compacts and prints a resume command instead). See `recompact install`."
+                .into(),
+        ),
+        Ok(rc) => {
+            let text = fs::read_to_string(&rc).unwrap_or_default();
+            if text.contains(BLOCK_START) {
+                Some(
+                    "recompact: this claude was not started through recompact (a terminal opened \
+before setup, an editor, or the desktop app), so /recompact here needs a restart. Open a new \
+terminal and run claude there to compact in place."
+                        .into(),
+                )
+            } else if with_block(&text, "").is_err() {
+                Some(format!(
+                    "recompact: {} defines `claude` itself, so recompact cannot wrap it. Remove \
+that definition, then type /recompact setup.",
+                    rc.display()
+                ))
+            } else {
+                Some(
+                    "recompact: in-place compaction is not set up yet. Type /recompact setup \
+once, then open a new terminal."
+                        .into(),
+                )
+            }
+        }
+    }
+}
+
+/// At session start, say once a day when this claude cannot compact in place and why.
+pub fn setup_notice(input: &Value) -> Option<String> {
+    let source = get_s(input, "source").unwrap_or("");
+    if !matches!(source, "startup" | "resume") {
+        return None;
+    }
+    let under = Shell::from_env().is_some_and(|s| s.is_own_claude());
+    let gap = setup_gap(under)?;
+    let mark = recompact_home().join("setup-notice.json");
+    let now = crate::now_unix();
+    if read_json(&mark)
+        .and_then(|v| v.get("at").and_then(|a| a.as_i64()))
+        .is_some_and(|at| now - at < 24 * 3600)
+    {
+        return None;
+    }
+    let _ = fs::create_dir_all(recompact_home());
+    write_json(&mark, &json!({"at": now}));
+    Some(gap)
 }
 
 // ------------------------------------------------------------------------------------ doctor
@@ -2215,6 +2309,8 @@ pub fn cmd_uninstall(args: &[String]) -> i32 {
                 eprintln!("uninstall: cannot write {}: {e}", rc.display());
                 return 1;
             }
+            let _ = fs::create_dir_all(recompact_home());
+            let _ = fs::write(recompact_home().join("declined"), "");
             println!(
                 "Removed from {}. New terminals run plain claude.",
                 rc.display()

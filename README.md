@@ -74,6 +74,11 @@ user before changing that definition. To update later: `~/.claude/recompact/bin/
 Already have the plugin (for example through a team's settings)? Type `/recompact setup` once
 inside claude instead.
 
+If a claude session cannot compact in place, it says why when it starts (at most once a day):
+setup not done yet (type `/recompact setup`), a terminal opened before setup (open a new one), or
+a shell file that defines `claude` itself. Editors and the desktop app do not go through the shell,
+so there `/recompact` compacts and prints a resume command instead.
+
 ### Share with a team
 
 Add this to a repository's `.claude/settings.json`. Everyone who trusts the folder gets the

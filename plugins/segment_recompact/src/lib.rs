@@ -5869,9 +5869,15 @@ pub fn cmd_hook(args: &[String]) -> i32 {
     let out = match args.first().map(String::as_str) {
         Some("session-start") => {
             on_session_start(&v);
-            session_start_context(&v).map(|ctx| {
-                json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": ctx}})
-            })
+            let mut out = json!({});
+            if let Some(ctx) = session_start_context(&v) {
+                out["hookSpecificOutput"] =
+                    json!({"hookEventName": "SessionStart", "additionalContext": ctx});
+            }
+            if let Some(notice) = setup_notice(&v) {
+                out["systemMessage"] = json!(notice);
+            }
+            (out != json!({})).then_some(out)
         }
         Some("user-prompt-submit") => on_prompt(&v),
         Some("stop") => on_stop(&v),
