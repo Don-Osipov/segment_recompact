@@ -2058,6 +2058,25 @@ fn title_record(records: &[Value], new_session: &str, generation: u64) -> Option
     }))
 }
 
+/// The session's `/rename` name and `/color`, carried to the twin unchanged. Claude Code restores
+/// both from the resumed session's own records, so a twin without them lost its prompt-bar label
+/// and color.
+fn identity_records(records: &[Value], new_session: &str) -> Vec<Value> {
+    [("agent-name", "agentName"), ("agent-color", "agentColor")]
+        .into_iter()
+        .filter_map(|(kind, field)| {
+            let value = records
+                .iter()
+                .rev()
+                .find(|r| rec_type(r) == kind)
+                .and_then(|r| r.get(field))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())?;
+            Some(json!({ "type": kind, field: value, "sessionId": new_session }))
+        })
+        .collect()
+}
+
 /// Core of assemble, returning the new session id and output path (None for --plan previews).
 fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     let (pos, opts) = parse_opts(args);
@@ -2603,6 +2622,7 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     if let Some(t) = title_record(&records, &new_session, generation) {
         out.push(t);
     }
+    out.extend(identity_records(&records, &new_session));
     // Fresh last-prompt tail pointing at the new leaf.
     let last_prompt = last_prompt_text(&records)
         .or_else(|| segs.last().map(|seg| user_text(&records[seg.user_idx])))
@@ -4055,6 +4075,7 @@ const KNOWN_RECORD_TYPES: &[&str] = &[
     "queue-operation",
     "custom-title",
     "agent-name",
+    "agent-color",
     "relocated",
     "worktree-state",
     "atis-latch",

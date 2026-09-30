@@ -639,6 +639,9 @@ fn work_session() -> Vec<Value> {
     effort["isMeta"] = json!(true);
     recs.insert(recs.len() - 1, effort);
     recs.push(json!({"type": "custom-title", "customTitle": "Deploy fix", "sessionId": SESSION}));
+    recs.push(json!({"type": "agent-name", "agentName": "Deploy fix", "sessionId": SESSION}));
+    recs.push(json!({"type": "agent-color", "agentColor": "yellow", "sessionId": SESSION}));
+    recs.push(json!({"type": "agent-color", "agentColor": "blue", "sessionId": SESSION}));
     recs
 }
 
@@ -675,6 +678,20 @@ fn the_preamble_briefs_state_and_pins_standing_instructions_verbatim() {
     assert!(out
         .iter()
         .any(|r| r["type"] == "custom-title" && r["customTitle"] == "Deploy fix (recompact 1)"));
+    // The /rename name and the latest /color ride along unchanged, under the twin's own id.
+    let twin_id = out
+        .iter()
+        .find(|r| r["type"] == "custom-title")
+        .unwrap()["sessionId"]
+        .clone();
+    let named: Vec<_> = out.iter().filter(|r| r["type"] == "agent-name").collect();
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0]["agentName"], "Deploy fix");
+    assert_eq!(named[0]["sessionId"], twin_id);
+    let colored: Vec<_> = out.iter().filter(|r| r["type"] == "agent-color").collect();
+    assert_eq!(colored.len(), 1);
+    assert_eq!(colored[0]["agentColor"], "blue");
+    assert_eq!(colored[0]["sessionId"], twin_id);
     // Resume flags: the model (1M: usage ran past 200k) and the session-only effort.
     let flags = resume_flags(&work_session());
     assert_eq!(
