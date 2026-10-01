@@ -208,9 +208,84 @@ struct Input {
     typed: Option<String>,
 }
 
+/// What claude's terminal title says about it. Claude Code shows `✳ <title>` while idle and
+/// turns the first character into a spinner (`◐`, `◑`, …) while it works, also while a long
+/// tool call runs or the terminal is in the background (measured, CLI 2.1.286).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TitleState {
+    Idle,
+    Busy,
+}
+
+/// Classify a terminal title. Titles that are not Claude Code's own (hooks can set one) say
+/// nothing.
+pub fn title_state(title: &str) -> Option<TitleState> {
+    match title.chars().next()? {
+        '✳' => Some(TitleState::Idle),
+        '◐'..='◓' | '\u{2801}'..='\u{28ff}' => Some(TitleState::Busy),
+        _ => None,
+    }
+}
+
+/// Finds the titles (`OSC 0` and `OSC 2`) in a terminal output stream; a title can be split
+/// across reads.
+#[derive(Default)]
+pub struct TitleWatch {
+    partial: Vec<u8>,
+}
+
+impl TitleWatch {
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
+        let mut data = std::mem::take(&mut self.partial);
+        data.extend_from_slice(bytes);
+        let mut titles = Vec::new();
+        let mut i = 0;
+        while let Some(at) = data[i..]
+            .windows(2)
+            .position(|w| w == b"\x1b]")
+            .map(|p| i + p)
+        {
+            let body = at + 2;
+            // BEL or ESC \ ends it; any other escape cancels it.
+            let end = (body..data.len()).find_map(|j| match data[j] {
+                0x07 => Some((j, j + 1, true)),
+                0x1b if data.get(j + 1) == Some(&b'\\') => Some((j, j + 2, true)),
+                0x1b if j + 1 < data.len() => Some((j, j, false)),
+                _ => None,
+            });
+            let Some((stop, next, ended)) = end else {
+                // Unfinished: keep it for the next read, unless it cannot be a title.
+                if data.len() - at < 4096 {
+                    self.partial = data[at..].to_vec();
+                }
+                return titles;
+            };
+            let osc = &data[body..stop];
+            if let Some(t) = osc
+                .strip_prefix(b"0;")
+                .or_else(|| osc.strip_prefix(b"2;"))
+                .filter(|_| ended)
+            {
+                titles.push(String::from_utf8_lossy(t).into_owned());
+            }
+            i = next.max(at + 1);
+        }
+        if data.last() == Some(&0x1b) {
+            self.partial = vec![0x1b];
+        }
+        titles
+    }
+}
+
+struct Title {
+    state: Option<TitleState>,
+    since: Instant,
+}
+
 struct Shared {
     master: AtomicI32,
     input: Mutex<Input>,
+    title: Mutex<Title>,
 }
 
 fn write_all(fd: RawFd, mut bytes: &[u8]) -> bool {
@@ -287,8 +362,9 @@ fn input_loop(shared: Arc<Shared>) {
 
 /// Copy claude's screen to the user's until its terminal closes, or until `stop` once nothing is
 /// left to read (a process claude left behind can keep the terminal open after claude exits).
-fn output_loop(master: RawFd, stop: Arc<AtomicBool>) {
+fn output_loop(master: RawFd, stop: Arc<AtomicBool>, shared: Arc<Shared>) {
     let mut buf = [0u8; 65536];
+    let mut watch = TitleWatch::default();
     loop {
         let mut pfd = libc::pollfd {
             fd: master,
@@ -311,6 +387,17 @@ fn output_loop(master: RawFd, stop: Arc<AtomicBool>) {
         }
         if n == 0 || !write_all(1, &buf[..n as usize]) {
             return;
+        }
+        for t in watch.feed(&buf[..n as usize]) {
+            if let Some(state) = title_state(&t) {
+                let mut title = shared.title.lock().unwrap();
+                if title.state != Some(state) {
+                    *title = Title {
+                        state: Some(state),
+                        since: Instant::now(),
+                    };
+                }
+            }
         }
     }
 }
@@ -408,6 +495,10 @@ impl Proxy {
                 commands: Vec::new(),
                 typed: None,
             }),
+            title: Mutex::new(Title {
+                state: None,
+                since: Instant::now(),
+            }),
         });
         let reader = shared.clone();
         std::thread::spawn(move || input_loop(reader));
@@ -478,8 +569,15 @@ impl Proxy {
         let fd = master.as_raw_fd();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
-        *self.output.lock().unwrap() =
-            Some((std::thread::spawn(move || output_loop(fd, flag)), stop));
+        *self.shared.title.lock().unwrap() = Title {
+            state: None,
+            since: Instant::now(),
+        };
+        let shared = self.shared.clone();
+        *self.output.lock().unwrap() = Some((
+            std::thread::spawn(move || output_loop(fd, flag, shared)),
+            stop,
+        ));
         *self.master.lock().unwrap() = Some(master);
         self.shared.master.store(fd, Ordering::SeqCst);
         Ok(child)
@@ -576,6 +674,16 @@ impl Proxy {
     pub fn input_clean(&self) -> bool {
         let input = self.shared.input.lock().unwrap();
         !input.dirty && input.held.is_empty()
+    }
+
+    /// How long claude's title has said it is idle (zero while it says busy); `None` until it
+    /// has set a title of its own.
+    pub fn title_idle_for(&self) -> Option<Duration> {
+        let title = self.shared.title.lock().unwrap();
+        title.state.map(|s| match s {
+            TitleState::Idle => title.since.elapsed(),
+            TitleState::Busy => Duration::ZERO,
+        })
     }
 
     /// How long since the user's last key reached claude.

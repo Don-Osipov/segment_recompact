@@ -61,6 +61,7 @@ pub fn render_progress(p: &Value, now: i64, cols: usize) -> Option<String> {
                 "waiting" => match p.get("wait").and_then(Value::as_str) {
                     Some("turn") => "ready · switches when this turn ends".into(),
                     Some("typing") => "ready · switches once the input box is empty".into(),
+                    Some("answer") => "ready · switches after you answer claude".into(),
                     _ => "ready · switching at the next pause".into(),
                 },
                 "switching" => "switching".into(),

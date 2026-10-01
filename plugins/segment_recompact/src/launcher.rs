@@ -347,6 +347,19 @@ fn hook_session(input: &Value) -> Option<&str> {
     get_s(input, "session_id")
 }
 
+/// The session's transcript. The hook's `transcript_path` can name a file that does not exist:
+/// `claude --worktree <name> --resume <id>` reports the worktree's project folder while the
+/// session is still written in the folder it started in.
+fn hook_transcript(input: &Value) -> Option<PathBuf> {
+    let given = get_s(input, "transcript_path").map(PathBuf::from);
+    if given.as_ref().is_some_and(|p| p.exists()) {
+        return given;
+    }
+    hook_session(input)
+        .and_then(|id| locate_session(given.as_deref(), id))
+        .or(given)
+}
+
 /// SessionStart: the launcher learns which session its claude is in (startup, resume, /clear,
 /// a /resume inside the TUI).
 pub fn on_session_start(input: &Value) {
@@ -374,11 +387,11 @@ pub fn on_session_start(input: &Value) {
         &shell.dir.join("session.json"),
         &json!({
             "session": session,
-            "transcript": get_s(input, "transcript_path"),
+            "transcript": hook_transcript(input),
             "model": get_s(input, "model"),
             "source": get_s(input, "source"),
-            "start_tokens": get_s(input, "transcript_path")
-                .and_then(|t| live_status(Path::new(t)))
+            "start_tokens": hook_transcript(input)
+                .and_then(|t| live_status(&t))
                 .map(|(t, _)| t),
         }),
     );
@@ -445,19 +458,94 @@ pub fn turn_ended(transcript: &Path) -> bool {
     true
 }
 
+/// A tool call in the current turn has no result yet: claude is running it, or a dialog for it
+/// (a permission prompt, a question) is waiting for the user.
+pub fn tool_call_waiting(transcript: &Path) -> bool {
+    let Some(tail) = read_tail(transcript, 4 << 20) else {
+        return false;
+    };
+    let mut open: Vec<String> = Vec::new();
+    for line in tail.lines() {
+        let Ok(r) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if rec_type(&r) == "system"
+            && matches!(
+                get_s(&r, "subtype"),
+                Some("turn_duration" | "stop_hook_summary")
+            )
+        {
+            open.clear();
+            continue;
+        }
+        if !turn_record(&r) {
+            continue;
+        }
+        for b in r
+            .pointer("/message/content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match get_s(b, "type") {
+                Some("tool_use") => open.extend(get_s(b, "id").map(String::from)),
+                Some("tool_result") => {
+                    let id = get_s(b, "tool_use_id");
+                    open.retain(|o| Some(o.as_str()) != id);
+                }
+                _ => {}
+            }
+        }
+    }
+    !open.is_empty()
+}
+
+enum Idle {
+    Yes,
+    Busy,
+    /// Between steps of a turn, waiting for the user to answer a dialog.
+    Asking,
+}
+
+/// Is claude between turns, with nothing waiting on the user? Claude Code's terminal title says
+/// whether it is working; a dialog shows the idle title too, so a tool call without a result
+/// means it is asking. A prompt whose query was dropped (a hook blocked its batch) leaves a turn
+/// open in the transcript, so the transcript alone is only the fallback, for when Claude Code
+/// sets no title.
+fn claude_idle(p: &Proxy, transcript: &Path, r: &mut Ready) -> Idle {
+    match p.title_idle_for() {
+        Some(d) if d < SETTLE => Idle::Busy,
+        Some(_)
+            if *r
+                .waiting
+                .get_or_insert_with(|| tool_call_waiting(transcript)) =>
+        {
+            Idle::Asking
+        }
+        Some(_) => Idle::Yes,
+        None if turn_ended(transcript) => Idle::Yes,
+        None => Idle::Busy,
+    }
+}
+
 /// Did the session add a prompt, a task notice or a reply after its record `uuid`? Unknown
 /// counts as yes.
 pub fn activity_after(transcript: &Path, uuid: &str) -> bool {
     let Ok(text) = fs::read_to_string(transcript) else {
         return true;
     };
-    let Some(at) = text.rfind(&format!("\"uuid\":\"{uuid}\"")) else {
-        return true;
-    };
-    text[at..]
-        .lines()
-        .skip(1)
-        .any(|line| serde_json::from_str::<Value>(line).is_ok_and(|r| turn_record(&r)))
+    for line in text.lines().rev() {
+        let Ok(r) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if get_s(&r, "uuid") == Some(uuid) {
+            return false;
+        }
+        if turn_record(&r) {
+            return true;
+        }
+    }
+    true
 }
 
 /// The last prompt or reply a twin carries over from its source. The twin's own summary and
@@ -530,7 +618,7 @@ fn request(shell: &Shell, input: &Value, reason: &str, kick: bool, force: bool, 
         &shell.dir.join("request.json"),
         &json!({
             "session": hook_session(input),
-            "transcript": get_s(input, "transcript_path"),
+            "transcript": hook_transcript(input),
             "reason": reason,
             "kick": kick,
             "force": force,
@@ -677,7 +765,7 @@ pub fn on_prompt_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
         return Some(block(text));
     }
     if let Some((cmd, arg)) = switch_command(prompt) {
-        let transcript = get_s(input, "transcript_path").map(PathBuf::from);
+        let transcript = hook_transcript(input);
         let managed = shell.as_ref().is_some_and(|sh| {
             hook_session(input).is_some_and(|s| sh.tracks(s)) || sh.is_own_claude()
         });
@@ -765,7 +853,7 @@ pub fn on_stop_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
         return None;
     }
     let session = hook_session(input)?;
-    let transcript = PathBuf::from(get_s(input, "transcript_path")?);
+    let transcript = hook_transcript(input)?;
     let Some(shell) = shell else {
         return suggest(session, &transcript);
     };
@@ -867,7 +955,7 @@ pub fn on_post_tool_use_in(shell: Option<Shell>, input: &Value) -> Option<Value>
     if !shell.tracks(session) || !auto_on(&shell.config, Some(session)) {
         return None;
     }
-    let transcript = PathBuf::from(get_s(input, "transcript_path")?);
+    let transcript = hook_transcript(input)?;
     let (live, model) = live_status(&transcript)?;
     let (_, checkpoint, _) = thresholds(&shell, session, &model, live);
     if live < checkpoint {
@@ -1888,6 +1976,8 @@ struct Ready {
     /// The transcript's length, and since when it has stayed that.
     len: u64,
     since: Instant,
+    /// `tool_call_waiting` for that length.
+    waiting: Option<bool>,
 }
 
 struct Handoff {
@@ -2018,6 +2108,7 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
                             covered,
                             len: file_len(&h.transcript),
                             since: Instant::now(),
+                            waiting: None,
                         };
                         (Next::Wait, Some(Phase::Ready(ready)))
                     }
@@ -2037,20 +2128,23 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
                 (Next::Done, None)
             }
         },
+        Some(Phase::Ready(r)) if tracked.as_deref() == Some(r.twin.as_str()) => {
+            // The user typed `/resume <twin>` themselves: that is the switch.
+            (finish_switch(h, ip, p, &r.twin, r.est), None)
+        }
         Some(Phase::Ready(mut r)) => {
             let len = file_len(&h.transcript);
             if len != r.len {
                 r.len = len;
                 r.since = Instant::now();
+                r.waiting = None;
             }
             let settled = r.since.elapsed() >= SETTLE && p.quiet_for() >= SETTLE;
-            let ended = turn_ended(&h.transcript);
-            let wait = if !ended {
-                "turn"
-            } else if !p.input_clean() {
-                "typing"
-            } else {
-                "quiet"
+            let wait = match claude_idle(p, &h.transcript, &mut r) {
+                Idle::Busy => "turn",
+                Idle::Asking => "answer",
+                Idle::Yes if !p.input_clean() => "typing",
+                Idle::Yes => "quiet",
             };
             if wait != r.wait {
                 crate::progress_update(json!({"wait": wait}));
@@ -2106,31 +2200,7 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
             tries,
         }) => {
             if tracked.as_deref() == Some(twin.as_str()) {
-                ip.rearm = rearm_for(est, h.at);
-                write_json(
-                    &ip.state.join("config.json"),
-                    &(ip.config)(ip.claude, ip.rearm),
-                );
-                let records = load_jsonl(&h.transcript.with_file_name(format!("{twin}.jsonl")));
-                let kick = (h.req.get("kick") == Some(&json!(true)))
-                    .then(|| ip.l.kick.clone())
-                    .or_else(|| has_active_goal(&records).then(|| "continue".to_string()));
-                if let Some(k) = kick {
-                    // Let the resumed conversation finish drawing before typing into it.
-                    std::thread::sleep(Duration::from_millis(1500));
-                    p.type_keys(k.as_bytes());
-                    std::thread::sleep(Duration::from_millis(500));
-                    p.type_keys(b"\r");
-                }
-                p.release();
-                progress_end(ip.state, Some("done"));
-                say(&format!(
-                    "switched in place to {} ({} → ~{})",
-                    short_id(&twin),
-                    fmt_k(h.live),
-                    fmt_k(est)
-                ));
-                (Next::Done, None)
+                (finish_switch(h, ip, p, &twin, est), None)
             } else if since.elapsed() < ip.l.switch_timeout {
                 (
                     Next::Wait,
@@ -2161,6 +2231,35 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
     };
     h.phase = phase;
     next
+}
+
+/// Claude now has the twin open: re-arm, continue the work if it was mid-task, report.
+fn finish_switch(h: &Handoff, ip: &mut InPlace, p: &Proxy, twin: &str, est: usize) -> Next {
+    ip.rearm = rearm_for(est, h.at);
+    write_json(
+        &ip.state.join("config.json"),
+        &(ip.config)(ip.claude, ip.rearm),
+    );
+    let records = load_jsonl(&h.transcript.with_file_name(format!("{twin}.jsonl")));
+    let kick = (h.req.get("kick") == Some(&json!(true)))
+        .then(|| ip.l.kick.clone())
+        .or_else(|| has_active_goal(&records).then(|| "continue".to_string()));
+    if let Some(k) = kick {
+        // Let the resumed conversation finish drawing before typing into it.
+        std::thread::sleep(Duration::from_millis(1500));
+        p.type_keys(k.as_bytes());
+        std::thread::sleep(Duration::from_millis(500));
+        p.type_keys(b"\r");
+    }
+    p.release();
+    progress_end(ip.state, Some("done"));
+    say(&format!(
+        "switched in place to {} ({} → ~{})",
+        short_id(twin),
+        fmt_k(h.live),
+        fmt_k(est)
+    ));
+    Next::Done
 }
 
 /// The progress row's last state: a result to show for a moment, or nothing.
