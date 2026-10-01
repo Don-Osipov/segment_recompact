@@ -28,7 +28,9 @@ pub use launcher::*;
 pub use statusline::{
     cmd_statusline, render_progress, status_line, with_statusline, without_statusline, wrapped_command,
 };
-pub use term::{cmd_pty_leader, title_state, InputKind, InputSplitter, TitleState, TitleWatch, TypedLine};
+pub use term::{
+    cmd_pty_leader, title_state, InputBox, InputKind, InputSplitter, TitleState, TitleWatch,
+};
 
 pub const TOOL_RESULT_TRUNC: usize = 1500;
 

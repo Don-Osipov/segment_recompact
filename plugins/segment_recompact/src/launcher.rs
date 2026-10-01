@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::term::Proxy;
+use crate::term::{InputBox, Proxy};
 use crate::{
     calibrate_lineage, continue_session, has_active_goal, lineage_latest, lineage_remove,
     load_jsonl, locate_session, parse_opts, prompt_tokens, rec_type, resume_command, resume_flags,
@@ -2143,8 +2143,12 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
             let wait = match claude_idle(p, &h.transcript, &mut r) {
                 Idle::Busy => "turn",
                 Idle::Asking => "answer",
-                Idle::Yes if !p.input_clean() => "typing",
-                Idle::Yes => "quiet",
+                Idle::Yes if p.input_clean() => "quiet",
+                Idle::Yes => match p.input_box() {
+                    InputBox::Unknown => "unknown",
+                    InputBox::Empty => "typing",
+                    InputBox::Text(_) | InputBox::Draft => "draft",
+                },
             };
             if wait != r.wait {
                 crate::progress_update(json!({"wait": wait}));
