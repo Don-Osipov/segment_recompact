@@ -215,6 +215,9 @@ written for 1.5s) it types `/resume <twin>` into the same claude, which opens th
 without restarting. A turn that lands while it compacts is built into the twin before the
 switch. If the switch does not take (twice, about 25s), it restarts claude on the twin instead.
 `--no-pty` or `RECOMPACT_PTY=0` always restarts. Ctrl-Z and `fg` work as with plain claude.
+Progress shows as a bar under the status line: `recompact statusline -- '<command>'` wraps the
+user's status line command (re-running it only when its input changes) and adds the bar while a
+handoff runs; `install` sets that up when a status line exists, and `uninstall` restores it.
 
 **On and off, per session.** Automatic compaction is off unless a session asks for it:
 `/recompact on` turns it on for this session and every continuation of it (the setting follows
