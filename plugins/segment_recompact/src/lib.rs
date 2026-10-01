@@ -19,11 +19,15 @@ mod accounting;
 mod anchor;
 mod brief;
 mod launcher;
+mod statusline;
 mod term;
 pub use accounting::*;
 pub use anchor::*;
 pub use brief::*;
 pub use launcher::*;
+pub use statusline::{
+    cmd_statusline, render_progress, status_line, with_statusline, without_statusline, wrapped_command,
+};
 pub use term::{cmd_pty_leader, InputKind, InputSplitter, TypedLine};
 
 pub const TOOL_RESULT_TRUNC: usize = 1500;
@@ -3529,6 +3533,9 @@ pub fn headless_summarize_partial(
             if cancelled() {
                 break;
             }
+            let before = result.len();
+            summary_progress(before, Some(before + wave.iter().map(|j| j.keys.len()).sum::<usize>()));
+            let finished = std::sync::atomic::AtomicUsize::new(0);
             let outs: Vec<(Vec<String>, Result<String, String>)> = std::thread::scope(|sc| {
                 let handles: Vec<_> = wave
                     .iter()
@@ -3537,7 +3544,13 @@ pub fn headless_summarize_partial(
                         let model = j.model.clone();
                         let prompt = j.prompt.clone();
                         let keys = j.keys.clone();
-                        sc.spawn(move || (keys, call_claude_stdin(&bin, &model, &prompt)))
+                        let finished = &finished;
+                        sc.spawn(move || {
+                            let out = call_claude_stdin(&bin, &model, &prompt);
+                            let n = finished.fetch_add(keys.len(), std::sync::atomic::Ordering::SeqCst);
+                            summary_progress(before + n + keys.len(), None);
+                            (keys, out)
+                        })
                     })
                     .collect();
                 handles.into_iter().map(|h| h.join().unwrap()).collect()
@@ -3568,6 +3581,81 @@ pub fn headless_summarize_partial(
         .filter(|k| !result.contains_key(k))
         .collect();
     (result, missing)
+}
+
+// ---------------------------------------------------------------------- progress
+
+static PROGRESS: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Report compaction progress to `path` (the status line reads it) until called with `None`.
+pub fn set_progress_file(path: Option<PathBuf>) {
+    *PROGRESS.lock().unwrap() = path;
+}
+
+/// How far along a compaction is, 0-100, at a phase and its step count.
+pub fn progress_pct(phase: &str, done: usize, total: usize) -> usize {
+    match phase {
+        "reading" => 2,
+        "summarizing" if total > 0 => 5 + 80 * done.min(total) / total,
+        "summarizing" => 85,
+        "assembling" => 88,
+        "verifying" => 93,
+        "waiting" => 96,
+        "switching" => 98,
+        "done" => 100,
+        _ => 0,
+    }
+}
+
+/// Merge `fields` into the progress file, if one is set: the phase and its step count, and
+/// whatever else the reader shows (sizes, start time). A no-op unless the launcher asked.
+pub fn progress_update(fields: Value) {
+    let guard = PROGRESS.lock().unwrap();
+    let Some(path) = guard.as_ref() else {
+        return;
+    };
+    let mut v: Value = fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let (Some(obj), Some(new)) = (v.as_object_mut(), fields.as_object()) {
+        for (k, x) in new {
+            obj.insert(k.clone(), x.clone());
+        }
+    }
+    let phase = v.get("phase").and_then(|p| p.as_str()).unwrap_or("");
+    let done = v.get("done").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    let total = v.get("total").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
+    v["pct"] = json!(progress_pct(phase, done, total));
+    v["at"] = json!(now_unix());
+    let tmp = path.with_extension("tmp");
+    if fs::write(&tmp, v.to_string()).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
+/// `progress_update` for a phase with a step count.
+pub fn progress(phase: &str, done: usize, total: usize) {
+    progress_update(json!({"phase": phase, "done": done, "total": total}));
+}
+
+/// The summary units a compaction had before this summarizer call, and all it needs; set while
+/// `summarize_for_plan` runs one, so its batches can report as they finish.
+static SUMMARY_STEPS: std::sync::Mutex<Option<(usize, usize)>> = std::sync::Mutex::new(None);
+
+/// `done` units of this call are summarized and, when a wave starts, `next` will be once it
+/// lands. The status line moves the bar toward `next` while the wave runs.
+fn summary_progress(done: usize, next: Option<usize>) {
+    let Some((base, total)) = *SUMMARY_STEPS.lock().unwrap() else {
+        return;
+    };
+    let mut fields = json!({"phase": "summarizing", "done": base + done, "total": total,
+                            "step_at": now_unix()});
+    if let Some(n) = next {
+        fields["next"] = json!(base + n);
+    }
+    progress_update(fields);
 }
 
 // ---------------------------------------------------------------------- continue (shared core)
@@ -3766,6 +3854,13 @@ pub fn summarize_for_plan(
             };
             work.push((unit.key.clone(), unit.salience, digest));
         }
+        let total = b
+            .units
+            .iter()
+            .filter(|x| x.treatment == Treatment::Summarize)
+            .count();
+        let base = total.saturating_sub(work.len());
+        progress("summarizing", base, total);
         if work.is_empty() {
             break;
         }
@@ -3794,8 +3889,11 @@ pub fn summarize_for_plan(
             if write_cache_merged(cache_path, &fresh).is_err() {
                 eprintln!("continue: warning: cannot write summary cache {}", cache_path.display());
             }
+            progress("summarizing", base + sums.len(), total);
         };
+        *SUMMARY_STEPS.lock().unwrap() = Some((base, total));
         let (_sums, missing) = headless_summarize_partial(&work, cfg, &mut persist);
+        *SUMMARY_STEPS.lock().unwrap() = None;
         if !missing.is_empty() {
             eprintln!(
                 "continue: no summary came back for {missing:?}; those units will be masked instead"
@@ -3829,6 +3927,7 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
 
     const ATTEMPTS: usize = 3;
     for attempt in 1..=ATTEMPTS {
+        progress("reading", 0, 0);
         // Unit keys built here must match the ones assemble computes below, so this shares
         // assemble's view of the records (preamble stripped) rather than the raw active path.
         let (all, _) = select_active(load_jsonl(&latest_file));
@@ -3908,6 +4007,7 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
                 a_args.push(v.clone());
             }
         }
+        progress("assembling", 0, 0);
         let assembled = run_assemble(&a_args);
         for p in sums_path.iter().chain(mask_path.iter()) {
             let _ = fs::remove_file(p);
@@ -3926,6 +4026,7 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
                 return (latest, rc);
             }
         };
+        progress("verifying", 0, 0);
         let v = cmd_verify(&[
             new_file.to_string_lossy().into_owned(),
             "--source".into(),

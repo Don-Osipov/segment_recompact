@@ -46,6 +46,9 @@ terminal and use claude as always:
   not restarted, so nothing stops, and their notices arrive in the compacted session. Where
   claude must be restarted instead (no terminal, or `RECOMPACT_PTY=0`), compaction records them
   and the resumed session starts them again.
+- While a session compacts, a progress bar runs under your Claude Code status line, then the
+  result for a few seconds. `recompact install` and `recompact update` add it to the status line
+  you already have; `recompact uninstall` takes it out.
 - `/recompact off` turns it off for that session, `/recompact on 600k` changes its size,
   `/recompact status` shows where it stands, and `/recompact default on` makes it the default for
   new sessions. They answer instantly, without a model turn.

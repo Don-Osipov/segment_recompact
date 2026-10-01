@@ -417,23 +417,29 @@ fn read_tail(path: &Path, max: u64) -> Option<String> {
 /// (`turn_duration`, `stop_hook_summary`), and it writes the turn's own last records after the
 /// Stop hooks run, so only the transcript can tell, not a hook.
 pub fn turn_ended(transcript: &Path) -> bool {
-    let Some(tail) = read_tail(transcript, 4 << 20) else {
-        return true;
-    };
-    for line in tail.lines().rev() {
-        let Ok(r) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if rec_type(&r) == "system"
-            && matches!(
-                get_s(&r, "subtype"),
-                Some("turn_duration" | "stop_hook_summary")
-            )
-        {
+    // Read often while a switch waits: a small tail answers almost always.
+    for window in [64u64 << 10, 4 << 20] {
+        let Some(tail) = read_tail(transcript, window) else {
             return true;
+        };
+        for line in tail.lines().rev() {
+            let Ok(r) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if rec_type(&r) == "system"
+                && matches!(
+                    get_s(&r, "subtype"),
+                    Some("turn_duration" | "stop_hook_summary")
+                )
+            {
+                return true;
+            }
+            if turn_record(&r) {
+                return false;
+            }
         }
-        if turn_record(&r) {
-            return false;
+        if file_len(transcript) <= window {
+            break;
         }
     }
     true
@@ -1875,6 +1881,8 @@ enum Phase {
 struct Ready {
     twin: String,
     est: usize,
+    /// What the switch is waiting for, as the status line shows it.
+    wait: &'static str,
     /// The last record of the session the twin carries: anything after it is not in the twin.
     covered: String,
     /// The transcript's length, and since when it has stayed that.
@@ -1950,8 +1958,16 @@ fn start_handoff(ip: &InPlace, mut req: Value) -> Option<Handoff> {
     let at = handoff_at(&req, ip.l, ip.origin, &transcript);
     stop_prewarm(ip.state);
     write_json(&ip.state.join("handoff.json"), &json!({"session": session}));
+    let live = live_tokens(&transcript).unwrap_or(0);
+    let feed = ip.state.join("progress.json");
+    let _ = fs::remove_file(&feed);
+    crate::set_progress_file(Some(feed));
+    crate::progress_update(
+        json!({"phase": "reading", "done": 0, "total": 0, "live": live,
+                                  "started": crate::now_unix()}),
+    );
     Some(Handoff {
-        live: live_tokens(&transcript).unwrap_or(0),
+        live,
         phase: Some(build(&req, ip.copts, at)),
         req,
         session,
@@ -1994,9 +2010,11 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
                 match last_carried_uuid(&h.transcript.with_file_name(format!("{twin}.jsonl"))) {
                     Some(covered) => {
                         carry_session_setting(&h.session, &twin);
+                        crate::progress_update(json!({"phase": "waiting", "est": est}));
                         let ready = Ready {
                             twin,
                             est,
+                            wait: "",
                             covered,
                             len: file_len(&h.transcript),
                             since: Instant::now(),
@@ -2005,11 +2023,19 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
                     }
                     None => {
                         discard(&h.transcript, &twin);
+                        progress_end(ip.state, None);
                         (Next::Done, None)
                     }
                 }
             }
-            _ => (Next::Done, None),
+            Some(_) => {
+                progress_end(ip.state, Some("noop"));
+                (Next::Done, None)
+            }
+            None => {
+                progress_end(ip.state, None);
+                (Next::Done, None)
+            }
         },
         Some(Phase::Ready(mut r)) => {
             let len = file_len(&h.transcript);
@@ -2018,11 +2044,24 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
                 r.since = Instant::now();
             }
             let settled = r.since.elapsed() >= SETTLE && p.quiet_for() >= SETTLE;
+            let ended = turn_ended(&h.transcript);
+            let wait = if !ended {
+                "turn"
+            } else if !p.input_clean() {
+                "typing"
+            } else {
+                "quiet"
+            };
+            if wait != r.wait {
+                crate::progress_update(json!({"wait": wait}));
+                r.wait = wait;
+            }
             if tracked.as_deref() != Some(h.session.as_str()) {
                 // The user opened another session (/resume, /clear): this twin is for one they left.
                 discard(&h.transcript, &r.twin);
+                progress_end(ip.state, None);
                 (Next::Done, None)
-            } else if !(settled && p.input_clean() && turn_ended(&h.transcript)) {
+            } else if !(settled && wait == "quiet") {
                 (Next::Wait, Some(Phase::Ready(r)))
             } else {
                 p.hold();
@@ -2034,9 +2073,11 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
                     p.release();
                     discard(&h.transcript, &r.twin);
                     if h.rebuilds >= 3 {
+                        progress_end(ip.state, None);
                         (Next::Done, None)
                     } else {
                         h.rebuilds += 1;
+                        crate::progress_update(json!({"phase": "reading", "done": 0, "total": 0}));
                         (Next::Wait, Some(build(&h.req, ip.copts, h.at)))
                     }
                 } else {
@@ -2044,6 +2085,7 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
                         &ip.state.join("switch.json"),
                         &switch_notice(h, &r.twin, r.est),
                     );
+                    crate::progress_update(json!({"phase": "switching"}));
                     type_resume(p, &r.twin);
                     (
                         Next::Wait,
@@ -2081,6 +2123,7 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
                     p.type_keys(b"\r");
                 }
                 p.release();
+                progress_end(ip.state, Some("done"));
                 say(&format!(
                     "switched in place to {} ({} → ~{})",
                     short_id(&twin),
@@ -2111,6 +2154,7 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
                 )
             } else {
                 let _ = fs::remove_file(ip.state.join("switch.json"));
+                progress_end(ip.state, None);
                 (Next::Restart(twin, est), None)
             }
         }
@@ -2119,9 +2163,21 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
     next
 }
 
+/// The progress row's last state: a result to show for a moment, or nothing.
+fn progress_end(state: &Path, shown: Option<&str>) {
+    match shown {
+        Some(phase) => crate::progress_update(json!({ "phase": phase })),
+        None => {
+            let _ = fs::remove_file(state.join("progress.json"));
+        }
+    }
+    crate::set_progress_file(None);
+}
+
 /// Claude quit with a handoff under way: stop the compaction (it removes its own output) or
 /// drop the twin that was never switched to.
-fn abandon(h: Handoff) {
+fn abandon(h: Handoff, state: &Path) {
+    progress_end(state, None);
     match h.phase {
         Some(Phase::Building(job)) => {
             CANCEL.store(true, Ordering::SeqCst);
@@ -2151,7 +2207,7 @@ fn supervise_in_place(
             ChildState::Exited(code) => {
                 p.child_gone();
                 if let Some(h) = job.take() {
-                    abandon(h);
+                    abandon(h, ip.state);
                 }
                 for f in ["handoff.json", "switch.json"] {
                     let _ = fs::remove_file(ip.state.join(f));
@@ -2402,7 +2458,7 @@ fn prune_stale_states(root: &Path) {
 const BLOCK_START: &str = "# >>> recompact >>>";
 const BLOCK_END: &str = "# <<< recompact <<<";
 
-fn recompact_home() -> PathBuf {
+pub(crate) fn recompact_home() -> PathBuf {
     std::env::var("RECOMPACT_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| home().join(".claude").join("recompact"))
@@ -2440,12 +2496,16 @@ fn rc_file() -> Result<PathBuf, String> {
 
 /// The shell block `install` writes: interactive `claude` runs through the launcher, and falls
 /// back to plain claude whenever the launcher is missing.
-pub fn shell_block(launcher: &Path) -> String {
-    // `$HOME/...` keeps the block valid for a dotfiles repo shared across machines.
-    let l = match launcher.strip_prefix(home()) {
+/// `$HOME/...` keeps a path valid for a dotfiles repo shared across machines.
+fn home_relative(path: &Path) -> String {
+    match path.strip_prefix(home()) {
         Ok(rel) => format!("$HOME/{}", rel.display()),
-        Err(_) => launcher.display().to_string(),
-    };
+        Err(_) => path.display().to_string(),
+    }
+}
+
+pub fn shell_block(launcher: &Path) -> String {
+    let l = home_relative(launcher);
     [
         BLOCK_START,
         "# Interactive claude runs through recompact: /recompact and large contexts compact in place.",
@@ -2639,6 +2699,10 @@ pub fn install(rc: Option<&Path>) -> (bool, Vec<String>) {
     let _ = fs::remove_file(recompact_home().join("declined"));
     if !custom {
         lines.push(enable_auto_update(&claude_settings()));
+        lines.push(crate::statusline::wrap_statusline(
+            &claude_settings(),
+            &home_relative(&launcher),
+        ));
     }
     lines.push(
         "Next: open a new terminal and start claude as usual. Sessions already running keep the \
@@ -2966,6 +3030,9 @@ pub fn cmd_uninstall(args: &[String]) -> i32 {
                 "Removed from {}. New terminals run plain claude.",
                 rc.display()
             );
+            if let Some(line) = crate::statusline::unwrap_statusline(&claude_settings()) {
+                println!("{line}");
+            }
         }
         None => println!("Nothing to remove in {}.", rc.display()),
     }

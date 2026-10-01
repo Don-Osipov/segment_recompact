@@ -5,7 +5,7 @@ use std::process::exit;
 
 use recompact::{
     cmd_assemble, cmd_auto, cmd_continue, cmd_doctor, cmd_extract, cmd_handoff, cmd_hook, cmd_install, cmd_mcp, cmd_prewarm, cmd_probe, cmd_recall,
-    cmd_pty_leader, cmd_rehydrate, cmd_resume, cmd_scan, cmd_shell, cmd_uninstall, cmd_update, cmd_verify, USAGE,
+    cmd_pty_leader, cmd_rehydrate, cmd_resume, cmd_scan, cmd_shell, cmd_statusline, cmd_uninstall, cmd_update, cmd_verify, USAGE,
 };
 
 fn main() {
@@ -37,6 +37,7 @@ fn main() {
         "continue" => cmd_continue(&args[2..]),
         "shell" => cmd_shell(&args[2..]),
         "pty-leader" => cmd_pty_leader(&args[2..]),
+        "statusline" => cmd_statusline(&args[2..]),
         "resume" => cmd_resume(&args[2..]),
         "scan" => cmd_scan(&args[2..]),
         _ => {
