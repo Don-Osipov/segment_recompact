@@ -213,7 +213,9 @@ cannot classify run claude directly, unwrapped. It stays in the background and d
 while the session keeps going; at the next pause it types `/resume <twin>` into the same claude,
 which opens the compacted copy without restarting. A pause: Claude Code's terminal title shows it
 idle (`✳`, not its spinner) and no tool call is waiting on a dialog, the input box is empty, and
-nothing was typed or written for 1.5s. Resuming the twin by hand counts as the switch. A turn that lands while it compacts is built into the twin before the
+nothing was typed or written for 1.5s. The box is followed from what each key does to it: Esc,
+cursor keys and shortcuts leave an empty box empty, Enter and Ctrl+C empty it, and after history
+recall or completion it is unknown until one of those (the status line then asks for Enter). Resuming the twin by hand counts as the switch. A turn that lands while it compacts is built into the twin before the
 switch. If the switch does not take (twice, about 25s), it restarts claude on the twin instead.
 `--no-pty` or `RECOMPACT_PTY=0` always restarts. Ctrl-Z and `fg` work as with plain claude.
 Progress shows as a bar under the status line: `recompact statusline -- '<command>'` wraps the

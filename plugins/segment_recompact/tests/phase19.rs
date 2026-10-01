@@ -142,11 +142,23 @@ fn terminal_input_is_told_apart_keys_enter_replies_and_reports() {
         kinds(&mut sp, b"fix it\r"),
         vec![(Key, "fix it".into()), (Enter, "\r".into())]
     );
-    // Arrows and Alt+Enter edit the box; only a plain Enter (legacy or kitty) empties it.
+    // Arrows and Alt+Enter edit the box; only a plain Enter (legacy or kitty) sends it.
     assert_eq!(kinds(&mut sp, b"\x1b[A")[0].0, Key);
     assert_eq!(kinds(&mut sp, b"\x1b\r")[0].0, Key);
     assert_eq!(kinds(&mut sp, b"\x1b[13u")[0].0, Enter);
+    assert_eq!(kinds(&mut sp, b"\x1b[13;129u")[0].0, Enter, "Num Lock on");
+    assert_eq!(kinds(&mut sp, b"\x1b[57414u")[0].0, Enter, "keypad Enter");
+    assert_eq!(
+        kinds(&mut sp, b"\x1bOM")[0].0,
+        Enter,
+        "keypad Enter, application mode"
+    );
     assert_eq!(kinds(&mut sp, b"\x1b[13;2u")[0].0, Key);
+    assert_eq!(
+        kinds(&mut sp, b"\x1b[97;1:3u")[0].0,
+        Passive,
+        "a key release"
+    );
     assert_eq!(kinds(&mut sp, b"\x1b")[0].0, Key, "a lone Esc is a key");
     // The terminal answering claude's queries: never held, never text.
     for reply in [
@@ -179,15 +191,15 @@ fn terminal_input_is_told_apart_keys_enter_replies_and_reports() {
 }
 
 #[test]
-fn a_bracketed_paste_is_one_key_even_with_newlines_and_across_reads() {
+fn a_bracketed_paste_is_one_paste_even_with_newlines_and_across_reads() {
     use InputKind::*;
     let mut sp = InputSplitter::default();
     let first = kinds(&mut sp, b"\x1b[200~line one\rline");
-    assert!(first.iter().all(|(k, _)| *k == Key), "{first:?}");
+    assert!(first.iter().all(|(k, _)| *k == Paste), "{first:?}");
     let second = kinds(&mut sp, b" two\x1b[201~\r");
     assert_eq!(
         second,
-        vec![(Key, " two\x1b[201~".into()), (Enter, "\r".into())]
+        vec![(Paste, " two\x1b[201~".into()), (Enter, "\r".into())]
     );
 }
 
@@ -573,39 +585,93 @@ fn a_live_session_ends_at_its_newest_turn_not_at_a_stale_last_prompt() {
 }
 
 #[test]
-fn a_typed_line_is_known_only_while_it_is_plain_characters_and_backspace() {
+fn the_input_box_is_followed_from_what_each_key_does_to_it() {
     use InputKind::*;
-    let mut line = TypedLine::default();
-    for (k, b) in [
-        (Key, &b"/recompcat"[..]),
-        (Key, b"\x7f\x7f\x7f"),
-        (Key, b"act"),
-    ] {
-        line.feed(k, b);
-    }
-    assert!(line.is("/recompact"), "typo fixed with Backspace");
-    line.feed(Enter, b"\r");
-    assert!(line.is(""), "Enter empties the box");
-    line.feed(Key, b"/rec");
-    line.feed(Key, b"\t");
-    assert!(
-        !line.is("/rec") && !line.is("/recompact"),
-        "Tab completes: unknown"
+    let feed = |keys: &[(InputKind, &[u8])]| {
+        let mut b = InputBox::default();
+        for (k, bytes) in keys {
+            b.feed(*k, bytes);
+        }
+        b
+    };
+    let text = |s: &str| InputBox::Text(s.as_bytes().to_vec());
+    assert_eq!(
+        feed(&[(Key, b"/recompcat"), (Key, b"\x7f\x7f\x7f"), (Key, b"act")]),
+        text("/recompact")
     );
-    line.feed(Enter, b"\r");
-    line.feed(Key, b"\x1b[A");
-    line.feed(Key, b"/recompact");
-    assert!(!line.is("/recompact"), "history recall: unknown");
-    line.feed(Enter, b"\r");
-    line.feed(Key, b"\x1b[200~/recompact\x1b[201~");
-    assert!(!line.is("/recompact"), "a paste: unknown");
-    line.feed(Enter, b"\r");
-    line.feed(Reply, b"\x1b[?62c");
-    line.feed(Passive, b"\x1b[I");
-    line.feed(Key, b"/recompact");
-    assert!(
-        line.is("/recompact"),
-        "terminal replies and focus reports change nothing"
+    assert!(feed(&[(Key, b"/recompact")]).is("/recompact"));
+    assert_eq!(
+        feed(&[(Key, b"hi"), (Enter, b"\r")]),
+        InputBox::Empty,
+        "Enter sends it"
+    );
+    assert_eq!(
+        feed(&[(Key, b"x"), (Key, b"\x7f")]),
+        InputBox::Empty,
+        "typed and deleted"
+    );
+    assert_eq!(
+        feed(&[(Key, b"draft"), (Key, b"\x03")]),
+        InputBox::Empty,
+        "Ctrl+C clears it"
+    );
+    assert_eq!(
+        feed(&[(Key, b"draft"), (Key, b"\x1b[99;5u")]),
+        InputBox::Empty,
+        "Ctrl+C, kitty protocol"
+    );
+    // Keys that cannot put text in an empty box leave it empty.
+    for key in [
+        &b"\x1b"[..],   // Esc
+        b"\x1b[27u",    // Esc, kitty protocol
+        b"\x1b[D",      // Left
+        b"\x1b[1;5C",   // Ctrl+Right
+        b"\x1b[Z",      // Shift+Tab
+        b"\x1b[9;2u",   // Shift+Tab, kitty protocol
+        b"\x1b[3~",     // Delete
+        b"\x0f",        // Ctrl+O
+        b"\x1b[111;5u", // Ctrl+O, kitty protocol
+        b"\x1b[101;3u", // Alt+E
+        b"\x1bOP",      // F1
+    ] {
+        assert_eq!(feed(&[(Key, key)]), InputBox::Empty, "{key:?}");
+    }
+    // History, completion and the clipboard can fill it with text this does not see.
+    for key in [
+        &b"\x1b[A"[..],
+        b"\t",
+        b"\x1b[9u",
+        b"\x12",
+        b"\x16",
+        b"\x1b[118;5u",
+    ] {
+        assert_eq!(feed(&[(Key, key)]), InputBox::Unknown, "{key:?}");
+    }
+    assert_eq!(feed(&[(Key, b"\x1b[A"), (Enter, b"\r")]), InputBox::Empty);
+    assert_eq!(feed(&[(Paste, b"\x1b[200~x\x1b[201~")]), InputBox::Draft);
+    assert_eq!(
+        feed(&[(Key, b"ab"), (Key, b"\x1b[D")]),
+        InputBox::Draft,
+        "cursor moved"
+    );
+    assert_eq!(feed(&[(Key, "é".as_bytes())]), InputBox::Draft);
+    assert_eq!(
+        feed(&[(Key, b"line"), (Key, b"\x1b[13;2u")]),
+        InputBox::Draft,
+        "Shift+Enter"
+    );
+    assert_eq!(
+        feed(&[(Paste, b"x"), (Key, b"\x7f")]),
+        InputBox::Unknown,
+        "maybe emptied"
+    );
+    assert_eq!(
+        feed(&[(Key, b"\x1b[A"), (Key, b"\x1b[D")]),
+        InputBox::Unknown
+    );
+    assert_eq!(
+        feed(&[(Reply, b"\x1b[?62c"), (Passive, b"\x1b[I")]),
+        InputBox::Empty
     );
 }
 

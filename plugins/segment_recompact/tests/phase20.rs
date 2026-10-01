@@ -97,6 +97,17 @@ fn the_row_says_where_the_compaction_is() {
     );
     let typing = row(json!({"phase": "waiting", "wait": "typing", "pct": 96, "at": now})).unwrap();
     assert!(typing.contains("once the input box is empty"), "{typing}");
+    let draft = row(json!({"phase": "waiting", "wait": "draft", "pct": 96, "at": now})).unwrap();
+    assert!(
+        draft.contains("after you send or clear your draft"),
+        "{draft}"
+    );
+    let unknown =
+        row(json!({"phase": "waiting", "wait": "unknown", "pct": 96, "at": now})).unwrap();
+    assert!(
+        unknown.contains("press Enter on an empty prompt"),
+        "{unknown}"
+    );
     let done =
         row(json!({"phase": "done", "live": 612_000, "est": 95_000, "at": now - 3})).unwrap();
     assert_eq!(done, "✓ recompact · compacted in place · 612k → ~95k");

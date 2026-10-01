@@ -23,8 +23,10 @@ extern "C" fn on_winch(_: libc::c_int) {
 /// What a run of bytes from the user's terminal is.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputKind {
-    /// A key or a paste: it may put text in claude's input box.
+    /// A key: it may change what claude's input box holds.
     Key,
+    /// Part of a bracketed paste: it puts text in the box.
+    Paste,
     /// Plain Enter: the box was submitted (or a picker closed), so it is empty again.
     Enter,
     /// The terminal answering one of claude's queries; claude may be waiting for it.
@@ -58,6 +60,22 @@ fn string_end(seq: &[u8]) -> usize {
     seq.len()
 }
 
+/// A kitty keyboard protocol key (`CSI code[:alts] ; mods[:event] [; text] u`): the key code,
+/// the modifier bits (shift 1, alt 2, ctrl 4, super 8; lock keys left out), and the event (1
+/// press, 2 repeat, 3 release).
+fn csi_u(params: &[u8]) -> Option<(u32, u32, u32)> {
+    let text = std::str::from_utf8(params).ok()?;
+    let mut fields = text.split(';');
+    let code = fields.next()?.split(':').next()?.parse().ok()?;
+    let mut mods = fields.next().unwrap_or("").split(':');
+    let m: u32 = mods
+        .next()
+        .filter(|m| !m.is_empty())
+        .map_or(Some(1), |m| m.parse().ok())?;
+    let event = mods.next().map_or(Some(1), |e| e.parse().ok())?;
+    Some((code, m.saturating_sub(1) & !(64 | 128), event))
+}
+
 /// Length and kind of the escape sequence at the start of `seq` (which begins with ESC).
 /// `None` as the kind marks the start of a bracketed paste.
 fn escape(seq: &[u8]) -> (usize, Option<InputKind>) {
@@ -89,14 +107,18 @@ fn escape(seq: &[u8]) -> (usize, Option<InputKind>) {
                     Some(InputKind::Reply)
                 }
                 (_, b'R' | b'n' | b't') => Some(InputKind::Reply),
-                // Kitty keyboard protocol: Enter with no modifier, as a press.
-                (b"13" | b"13;1" | b"13;1:1", b'u') => Some(InputKind::Enter),
-                (p, b'u') if p.ends_with(b":3") => Some(InputKind::Passive),
+                (p, b'u') => match csi_u(p) {
+                    Some((_, _, 3)) => Some(InputKind::Passive),
+                    // Enter, or keypad Enter, with no modifier.
+                    Some((13 | 57414, 0, _)) => Some(InputKind::Enter),
+                    _ => Some(InputKind::Key),
+                },
                 _ => Some(InputKind::Key),
             };
             (len, kind)
         }
         Some(b']' | b'P' | b'_' | b'^' | b'X') => (string_end(seq), Some(InputKind::Reply)),
+        Some(b'O') if seq.get(2) == Some(&b'M') => (3, Some(InputKind::Enter)),
         Some(b'O') => (seq.len().min(3), Some(InputKind::Key)),
         Some(&c) => {
             // Alt + a key; a multi-byte character stays whole.
@@ -123,7 +145,7 @@ impl InputSplitter {
                     }
                     None => buf.len(),
                 };
-                out.push((InputKind::Key, buf[i..end].to_vec()));
+                out.push((InputKind::Paste, buf[i..end].to_vec()));
                 i = end;
                 continue;
             }
@@ -132,7 +154,7 @@ impl InputSplitter {
                     let (len, kind) = escape(&buf[i..]);
                     let kind = kind.unwrap_or_else(|| {
                         self.in_paste = true;
-                        InputKind::Key
+                        InputKind::Paste
                     });
                     out.push((kind, buf[i..i + len].to_vec()));
                     i += len;
@@ -154,54 +176,154 @@ impl InputSplitter {
     }
 }
 
-/// What the user typed into claude's input box since the last Enter, while that was only plain
-/// characters and Backspace. Anything else (arrows, Tab, a paste, history) makes it unknown: the
-/// box may then hold text this cannot see.
-pub struct TypedLine(Option<Vec<u8>>);
+/// What a key does to claude's input box.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Effect {
+    /// Types this printable character.
+    Char(u8),
+    /// Puts in text this does not follow (a newline, a paste, non-ASCII text).
+    Insert,
+    /// Deletes one character (Backspace).
+    Erase,
+    /// Empties the box (Ctrl+C).
+    Clear,
+    /// May replace the box with text from elsewhere (history, completion, the clipboard, an
+    /// editor).
+    Recall,
+    /// May delete text, never adds any.
+    Delete,
+    /// Moves the cursor.
+    Move,
+    /// Leaves the text alone (Esc, Shift+Tab, function keys, other shortcuts).
+    Other,
+}
 
-impl Default for TypedLine {
-    fn default() -> Self {
-        TypedLine(Some(Vec::new()))
+/// A control character's effect, with Ctrl+letter given as the letter.
+fn ctrl_effect(letter: u8) -> Effect {
+    match letter {
+        b'c' => Effect::Clear,
+        b'i' | b'r' | b'v' | b'y' | b'g' | b'p' | b'n' => Effect::Recall,
+        b'j' => Effect::Insert,
+        b'h' => Effect::Erase,
+        b'k' | b'u' | b'w' | b'd' => Effect::Delete,
+        b'a' | b'e' | b'b' | b'f' => Effect::Move,
+        _ => Effect::Other,
     }
 }
 
-impl TypedLine {
+/// The effect of one key that came as an escape sequence.
+fn escape_effect(seq: &[u8]) -> Effect {
+    let (params, fin) = match seq {
+        [0x1b] => return Effect::Other,
+        [0x1b, b'[', rest @ ..] | [0x1b, b'O', rest @ ..] if !rest.is_empty() => {
+            (&rest[..rest.len() - 1], rest[rest.len() - 1])
+        }
+        // Alt + a key.
+        [0x1b, 0x7f] | [0x1b, b'd'] => return Effect::Delete,
+        [0x1b, b'b'] | [0x1b, b'f'] => return Effect::Move,
+        [0x1b, b'\r'] => return Effect::Insert,
+        [0x1b, b'v'] => return Effect::Recall,
+        _ => return Effect::Other,
+    };
+    match fin {
+        b'A' | b'B' => Effect::Recall,
+        b'C' | b'D' | b'H' | b'F' => Effect::Move,
+        b'~' => match params.split(|&b| b == b';').next().unwrap_or(b"") {
+            b"3" => Effect::Delete,
+            b"1" | b"4" | b"7" | b"8" => Effect::Move,
+            _ => Effect::Other,
+        },
+        b'u' => match csi_u(params) {
+            Some((13, 0, _)) => Effect::Other,
+            Some((13, _, _)) => Effect::Insert,
+            Some((9, 0, _)) => Effect::Recall,
+            Some((127, 0, _)) => Effect::Erase,
+            Some((127, _, _)) => Effect::Delete,
+            Some((code @ 97..=122, 4, _)) => ctrl_effect(code as u8),
+            Some((code @ 97..=122, 2, _)) => match code as u8 {
+                b'b' | b'f' => Effect::Move,
+                b'd' => Effect::Delete,
+                b'v' => Effect::Recall,
+                _ => Effect::Other,
+            },
+            _ => Effect::Other,
+        },
+        _ => Effect::Other,
+    }
+}
+
+/// What claude's input box holds, followed from the keys sent to it.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum InputBox {
+    #[default]
+    Empty,
+    /// Exactly this text, typed as plain characters.
+    Text(Vec<u8>),
+    /// Something, not followed exactly.
+    Draft,
+    /// Maybe something (after history recall, completion, or a deletion in a draft).
+    Unknown,
+}
+
+impl InputBox {
     pub fn feed(&mut self, kind: InputKind, bytes: &[u8]) {
         match kind {
-            InputKind::Enter => self.0 = Some(Vec::new()),
-            InputKind::Key if bytes.first() == Some(&0x1b) => self.0 = None,
+            InputKind::Enter => *self = InputBox::Empty,
+            InputKind::Paste => self.apply(Effect::Insert),
+            InputKind::Key if bytes.first() == Some(&0x1b) => self.apply(escape_effect(bytes)),
             InputKind::Key => {
                 for &b in bytes {
-                    let Some(line) = self.0.as_mut() else {
-                        return;
-                    };
-                    match b {
-                        0x7f | 0x08 => {
-                            line.pop();
-                        }
-                        0x20..=0x7e => line.push(b),
-                        _ => self.0 = None,
-                    }
+                    self.apply(match b {
+                        0x20..=0x7e => Effect::Char(b),
+                        0x7f => Effect::Erase,
+                        0x80..=0xff => Effect::Insert,
+                        c => ctrl_effect(c + 0x60),
+                    });
                 }
             }
             InputKind::Reply | InputKind::Passive => {}
         }
     }
 
+    fn apply(&mut self, effect: Effect) {
+        use InputBox::*;
+        let next = match (effect, std::mem::take(self)) {
+            (Effect::Char(c), Empty) => Text(vec![c]),
+            (Effect::Char(c), Text(mut t)) => {
+                t.push(c);
+                Text(t)
+            }
+            (Effect::Char(_) | Effect::Insert, _) => Draft,
+            (Effect::Erase, Text(mut t)) => {
+                t.pop();
+                if t.is_empty() {
+                    Empty
+                } else {
+                    Text(t)
+                }
+            }
+            (Effect::Clear, _) => Empty,
+            (Effect::Recall, _) => Unknown,
+            (Effect::Erase | Effect::Delete | Effect::Move | Effect::Other, Empty) => Empty,
+            (Effect::Erase | Effect::Delete, _) => Unknown,
+            (Effect::Move, Text(_)) => Draft,
+            (Effect::Move | Effect::Other, state) => state,
+        };
+        *self = next;
+    }
+
     /// The box holds exactly `text`.
     pub fn is(&self, text: &str) -> bool {
-        self.0.as_deref() == Some(text.as_bytes())
+        matches!(self, InputBox::Text(t) if t == text.as_bytes())
     }
 }
 
 struct Input {
     holding: bool,
     held: Vec<(InputKind, Vec<u8>)>,
-    /// A key reached claude since the last plain Enter: its input box may hold text.
-    dirty: bool,
     /// When a key or Enter last reached claude.
     last: Option<Instant>,
-    line: TypedLine,
+    line: InputBox,
     /// Commands the launcher handles itself when typed and entered as they are.
     commands: Vec<String>,
     /// The last such command, for the launcher to pick up.
@@ -311,8 +433,7 @@ impl Shared {
         if fd >= 0 && kind == InputKind::Enter {
             if let Some(cmd) = input.commands.iter().find(|c| input.line.is(c)).cloned() {
                 if write_all(fd, &vec![0x7f; cmd.len()]) {
-                    input.line = TypedLine::default();
-                    input.dirty = false;
+                    input.line = InputBox::Empty;
                     input.last = Some(Instant::now());
                     input.typed = Some(cmd);
                     return;
@@ -326,12 +447,9 @@ impl Shared {
             return;
         }
         input.line.feed(kind, &bytes);
-        match kind {
-            InputKind::Key => input.dirty = true,
-            InputKind::Enter => input.dirty = false,
-            InputKind::Reply | InputKind::Passive => return,
+        if matches!(kind, InputKind::Key | InputKind::Paste | InputKind::Enter) {
+            input.last = Some(Instant::now());
         }
-        input.last = Some(Instant::now());
     }
 }
 
@@ -489,9 +607,8 @@ impl Proxy {
             input: Mutex::new(Input {
                 holding: false,
                 held: Vec::new(),
-                dirty: false,
                 last: None,
-                line: TypedLine::default(),
+                line: InputBox::Empty,
                 commands: Vec::new(),
                 typed: None,
             }),
@@ -533,6 +650,8 @@ impl Proxy {
     /// Run `cmd` as the session leader of a fresh pseudo-terminal sized like the user's.
     pub fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
         let (master, slave) = open_pty()?;
+        // A new claude starts with an empty input box.
+        self.shared.input.lock().unwrap().line = InputBox::Empty;
         let ws = window_size();
         unsafe {
             libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws);
@@ -670,10 +789,15 @@ impl Proxy {
         self.shared.input.lock().unwrap().typed.take()
     }
 
-    /// Nothing typed into claude since the last Enter, and nothing held: its input box is empty.
+    /// Claude's input box is empty and no keys are held for it.
     pub fn input_clean(&self) -> bool {
         let input = self.shared.input.lock().unwrap();
-        !input.dirty && input.held.is_empty()
+        input.line == InputBox::Empty && input.held.is_empty()
+    }
+
+    /// What claude's input box holds, as far as the keys sent to it tell.
+    pub fn input_box(&self) -> InputBox {
+        self.shared.input.lock().unwrap().line.clone()
     }
 
     /// How long claude's title has said it is idle (zero while it says busy); `None` until it
