@@ -361,6 +361,15 @@ fn a_twin_is_stale_once_the_session_adds_a_turn_after_its_last_carried_record() 
     append(&t, &[user("u9", Some("a3"), "one more thing")]);
     assert!(activity_after(&t, "a3"));
     assert!(activity_after(&t, "not-there"), "unknown counts as stale");
+    // Any JSON spacing: the record is found by its uuid, not by its text.
+    let spaced = dir.join("spaced.jsonl");
+    fs::write(
+        &spaced,
+        "{\"type\": \"user\", \"uuid\": \"s1\", \"message\": {\"role\": \"user\", \"content\": \"hi\"}}\n\
+{\"type\": \"system\", \"subtype\": \"turn_duration\"}\n",
+    )
+    .unwrap();
+    assert!(!activity_after(&spaced, "s1"));
 }
 
 // ------------------------------------------------------------------------------ the launcher
@@ -597,5 +606,255 @@ fn a_typed_line_is_known_only_while_it_is_plain_characters_and_backspace() {
     assert!(
         line.is("/recompact"),
         "terminal replies and focus reports change nothing"
+    );
+}
+
+// ------------------------------------------------------------------------------ busy or idle
+
+#[test]
+fn claudes_title_is_read_even_when_split_across_reads() {
+    let mut w = TitleWatch::default();
+    assert_eq!(
+        w.feed(b"text \x1b]0;\xe2\x9c\xb3 Claude Code\x07 more"),
+        ["✳ Claude Code"]
+    );
+    assert!(
+        w.feed(b"\x1b]0;\xe2\x97\x90 Fix the").is_empty(),
+        "unfinished"
+    );
+    assert_eq!(w.feed(b" bug\x1b\\"), ["◐ Fix the bug"]);
+    assert!(w.feed(b"\x1b").is_empty());
+    assert_eq!(
+        w.feed(b"]2;Ready | Claude 0a08\x07"),
+        ["Ready | Claude 0a08"]
+    );
+    // Other OSC sequences, and a title cancelled by another escape, are not titles.
+    assert!(w.feed(b"\x1b]11;?\x07\x1b]8;;https://x\x1b\\").is_empty());
+    assert!(w.feed(b"\x1b]0;half\x1b[0m").is_empty());
+
+    assert_eq!(title_state("✳ Claude Code"), Some(TitleState::Idle));
+    assert_eq!(title_state("◐ Fix the bug"), Some(TitleState::Busy));
+    assert_eq!(title_state("◑ Fix the bug"), Some(TitleState::Busy));
+    assert_eq!(title_state("⠂ Older spinner"), Some(TitleState::Busy));
+    assert_eq!(
+        title_state("Needs input | Claude cda6"),
+        None,
+        "a hook's title says nothing"
+    );
+    assert_eq!(title_state(""), None);
+}
+
+#[test]
+fn a_tool_call_without_a_result_means_claude_is_running_it_or_asking() {
+    let dir = tmp_dir();
+    let t = big_session(&dir, 20_000);
+    assert!(!tool_call_waiting(&t), "between turns");
+    let call = |id: &str| {
+        json!({"type": "assistant", "uuid": format!("c{id}"), "sessionId": SESSION, "isSidechain": false,
+               "message": {"role": "assistant", "content": [{"type": "tool_use", "id": id, "name": "Bash", "input": {}}]}})
+    };
+    let result = |id: &str| {
+        json!({"type": "user", "uuid": format!("r{id}"), "sessionId": SESSION, "isSidechain": false,
+               "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": id, "content": "ok"}]}})
+    };
+    append(
+        &t,
+        &[
+            user("u9", Some("a3"), "touch a file"),
+            call("t1"),
+            call("t2"),
+            result("t1"),
+        ],
+    );
+    assert!(
+        tool_call_waiting(&t),
+        "t2 waits: a permission dialog for it"
+    );
+    append(&t, &[result("t2")]);
+    assert!(!tool_call_waiting(&t));
+    append(&t, &[call("t3")]);
+    assert!(tool_call_waiting(&t));
+    append(
+        &t,
+        &[json!({"type": "system", "subtype": "turn_duration", "sessionId": SESSION})],
+    );
+    assert!(!tool_call_waiting(&t), "the turn ended");
+    // A prompt whose query a hook dropped leaves no reply and no turn bookkeeping: open in the
+    // transcript, but nothing waits.
+    append(
+        &t,
+        &[user(
+            "u10",
+            Some("a3"),
+            "<task-notification>4 tasks</task-notification>",
+        )],
+    );
+    assert!(!turn_ended(&t));
+    assert!(!tool_call_waiting(&t));
+}
+
+/// A claude that sets its title, writes `then` to its transcript, and reports what it is typed.
+/// `busy_for` seconds of spinner title first, then the idle title.
+fn titled_stub(dir: &Path, t: &Path, then: &[Value], busy_for: u32, meanwhile: &str) -> String {
+    let lines = then
+        .iter()
+        .map(|r| format!("printf '%s\\n' '{r}' >> \"{}\"", t.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    write_stub(
+        dir,
+        "claude-stub.sh",
+        &format!(
+            r#"#!/bin/sh
+D="$(dirname "$0")"
+echo "spawn $*" >> "$D/spawns.log"
+[ "$(wc -l < "$D/spawns.log")" -eq 1 ] || exit 0
+{hooks}
+{lines}
+i=0
+while [ $i -lt {busy_for} ]; do printf '\033]0;\342\227\220 Working\007'; sleep 1; i=$((i+1)); done
+echo idle > "$D/idle-at"
+printf '\033]0;\342\234\263 Done\007'
+{meanwhile}
+while IFS= read -r line; do
+  [ -f "$D/idle-at" ] || echo early >> "$D/typed.log"
+  echo "got $line" >> "$D/typed.log"
+  case "$line" in
+    *"/resume "*)
+      printf '{{"session":"%s"}}' "${{line##*/resume }}" > "$S/session.json"
+      sleep 1
+      exit 0;;
+  esac
+done
+exit 0
+"#,
+            hooks = hooks_say(t)
+        ),
+    )
+}
+
+fn in_place_args(dir: &Path, stub: &str) -> Vec<String> {
+    s(&[
+        "--interactive",
+        "--pty",
+        "--leader",
+        env!("CARGO_BIN_EXE_recompact"),
+        "--switch-timeout",
+        "3",
+        "--mask",
+        "--dir",
+        dir.to_str().unwrap(),
+        "--state-root",
+        tmp_dir().to_str().unwrap(),
+        "--claude-bin",
+        stub,
+    ])
+}
+
+#[test]
+fn a_prompt_whose_query_was_dropped_does_not_hold_the_switch_forever() {
+    let dir = tmp_dir();
+    let t = big_session(&dir, 20_000);
+    // The stuck case: a task notice written, then its batch dropped by a hook; claude is idle.
+    let dropped = [
+        user(
+            "u9",
+            Some("a3"),
+            "<task-notification>4 tasks did not finish</task-notification>",
+        ),
+        json!({"type": "system", "subtype": "informational", "sessionId": SESSION,
+               "content": "UserPromptSubmit operation blocked by hook"}),
+    ];
+    let stub = titled_stub(&dir, &t, &dropped, 0, "");
+    assert_eq!(cmd_shell(&in_place_args(&dir, &stub)), 0);
+    let twin = lineage_latest(&dir, SESSION);
+    assert_ne!(twin, SESSION);
+    let typed = fs::read_to_string(dir.join("typed.log")).unwrap_or_default();
+    assert!(
+        typed.contains(&format!("/resume {twin}")),
+        "switched: {typed}"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("spawns.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn nothing_is_typed_into_claude_while_its_title_says_it_is_working() {
+    let dir = tmp_dir();
+    let t = big_session(&dir, 20_000);
+    let stub = titled_stub(&dir, &t, &[], 4, "");
+    assert_eq!(cmd_shell(&in_place_args(&dir, &stub)), 0);
+    let typed = fs::read_to_string(dir.join("typed.log")).unwrap_or_default();
+    assert!(!typed.contains("early"), "typed while busy: {typed}");
+    assert!(typed.contains("/resume "), "{typed}");
+}
+
+#[test]
+fn a_twin_the_user_resumes_by_hand_is_the_switch_and_is_kept() {
+    let dir = tmp_dir();
+    let t = big_session(&dir, 20_000);
+    // Busy for long enough that the launcher never types; meanwhile the user opens the twin.
+    let meanwhile = format!(
+        r#"for n in $(seq 1 100); do
+  tw=$(ls "{d}" | grep '\.jsonl$' | grep -v '{SESSION}' | head -1)
+  [ -n "$tw" ] && break; sleep 0.1
+done
+sleep 1
+printf '{{"session":"%s"}}' "${{tw%.jsonl}}" > "$S/session.json"
+echo "${{tw%.jsonl}}" > "$D/manual"
+sleep 3
+exit 0"#,
+        d = dir.display()
+    );
+    let stub = write_stub(
+        &dir,
+        "claude-stub.sh",
+        &format!(
+            "#!/bin/sh\nD=\"$(dirname \"$0\")\"\necho spawn >> \"$D/spawns.log\"\n\
+[ \"$(wc -l < \"$D/spawns.log\")\" -eq 1 ] || exit 0\n{}\nprintf '\\033]0;\\342\\227\\220 Working\\007'\n{meanwhile}\n",
+            hooks_say(&t)
+        ),
+    );
+    assert_eq!(cmd_shell(&in_place_args(&dir, &stub)), 0);
+    let manual = fs::read_to_string(dir.join("manual")).unwrap();
+    let twin = manual.trim();
+    assert!(!twin.is_empty());
+    assert!(
+        dir.join(format!("{twin}.jsonl")).exists(),
+        "the twin the user opened is not deleted"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("spawns.log"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_hook_whose_transcript_path_does_not_exist_finds_the_session_by_id() {
+    // `claude --worktree x --resume <id>` reports the worktree's project folder, while the session
+    // is still written in the folder it started in.
+    let root = tmp_dir();
+    let proj = root.join("main-project");
+    fs::create_dir_all(&proj).unwrap();
+    let t = big_session(&proj, 200_000);
+    let moved = root
+        .join("worktree-project")
+        .join(format!("{SESSION}.jsonl"));
+    let shell = shell_state(json!({"auto": true, "at": 150_000, "inplace": true}), &t);
+    let input = json!({"session_id": SESSION, "transcript_path": moved, "cwd": "/tmp",
+        "hook_event_name": "Stop", "stop_hook_active": false, "session_crons": [], "background_tasks": []});
+    let out = on_stop_in(Some(reload(&shell)), &input).expect("auto-compaction sees the session");
+    assert!(out["systemMessage"].as_str().unwrap().contains("200k"));
+    assert_eq!(
+        read(shell.dir.join("request.json")).unwrap()["transcript"],
+        json!(t)
     );
 }
