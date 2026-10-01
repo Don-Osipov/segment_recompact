@@ -19,10 +19,12 @@ mod accounting;
 mod anchor;
 mod brief;
 mod launcher;
+mod term;
 pub use accounting::*;
 pub use anchor::*;
 pub use brief::*;
 pub use launcher::*;
+pub use term::{cmd_pty_leader, InputKind, InputSplitter, TypedLine};
 
 pub const TOOL_RESULT_TRUNC: usize = 1500;
 
@@ -227,14 +229,26 @@ pub fn select_active(records: Vec<Value>) -> (Vec<Value>, usize) {
             by_uuid.insert(u.to_string(), i);
         }
     }
-    let leaf: Option<String> = records
-        .iter()
-        .rev()
-        .find(|r| rec_type(r) == "last-prompt")
-        .and_then(|r| r.get("leafUuid").and_then(|v| v.as_str()))
-        .filter(|u| by_uuid.contains_key(*u))
-        .map(String::from)
-        .or_else(|| records.iter().rev().find_map(|r| rec_uuid(r).map(String::from)));
+    // Claude Code writes `last-prompt` when a prompt is submitted (pointing at the tip before it)
+    // and once more at exit. A prompt or reply after the latest one means the conversation went
+    // on past it: in a live session the newest of those is the tip.
+    let last_prompt = records.iter().rposition(|r| rec_type(r) == "last-prompt");
+    let newest_turn = records.iter().rposition(|r| {
+        matches!(rec_type(r), "user" | "assistant")
+            && !truthy(r, "isSidechain")
+            && rec_uuid(r).is_some()
+    });
+    let went_on = match (last_prompt, newest_turn) {
+        (Some(lp), Some(t)) if t > lp => rec_uuid(&records[t]).map(String::from),
+        _ => None,
+    };
+    let leaf: Option<String> = went_on.or_else(|| {
+        last_prompt
+            .and_then(|i| records[i].get("leafUuid").and_then(|v| v.as_str()))
+            .filter(|u| by_uuid.contains_key(*u))
+            .map(String::from)
+            .or_else(|| records.iter().rev().find_map(|r| rec_uuid(r).map(String::from)))
+    });
     let Some(mut cur) = leaf else {
         return (records, 0);
     };
@@ -5890,13 +5904,19 @@ pub fn cmd_hook(args: &[String]) -> i32 {
     let out = match args.first().map(String::as_str) {
         Some("session-start") => {
             on_session_start(&v);
+            let (switched, note) = in_place_notice(&v).unzip();
             let mut out = json!({});
-            if let Some(ctx) = session_start_context(&v) {
+            let ctx: Vec<String> = session_start_context(&v)
+                .into_iter()
+                .chain(note.flatten())
+                .collect();
+            if !ctx.is_empty() {
                 out["hookSpecificOutput"] =
-                    json!({"hookEventName": "SessionStart", "additionalContext": ctx});
+                    json!({"hookEventName": "SessionStart", "additionalContext": ctx.join("\n\n")});
             }
-            if let Some(notice) = setup_notice(&v) {
-                out["systemMessage"] = json!(notice);
+            let lines: Vec<String> = switched.into_iter().chain(setup_notice(&v)).collect();
+            if !lines.is_empty() {
+                out["systemMessage"] = json!(lines.join("\n"));
             }
             (out != json!({})).then_some(out)
         }

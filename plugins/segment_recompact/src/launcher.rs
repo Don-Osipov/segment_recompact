@@ -3,16 +3,28 @@
 //! `recompact shell` runs `claude` as its child and otherwise stays out of the way. Hooks inside
 //! that claude report which session is live and ask for a handoff: the user typing a bare
 //! `/recompact`, a turn ending with the context over the threshold, or the agent queueing one
-//! itself (`recompact handoff`). The launcher then stops claude with SIGTERM (Claude Code exits
-//! cleanly on it: terminal restored, transcript flushed, exit 143), compacts the session with
-//! progress on the terminal, and resumes the twin in the same terminal with the same flags.
+//! itself (`recompact handoff`).
+//!
+//! In a terminal, claude runs on a pseudo-terminal the launcher owns (`term`). A handoff then
+//! happens in place: the launcher compacts in the background while claude keeps running, waits
+//! for a pause (turn over, input box empty), and types `/resume <twin>` into it. Claude Code
+//! switches sessions in the same process, so background shells, monitors, agents and scheduled
+//! prompts keep running and their notices reach the twin (measured, CLI 2.1.286).
+//!
+//! Without that terminal, or when the switch does not take, the launcher stops claude with
+//! SIGTERM (Claude Code exits cleanly on it: terminal restored, transcript flushed, exit 143),
+//! compacts with progress on the terminal, and resumes the twin with the same flags.
 //!
 //! The launcher exports `RECOMPACT_SHELL=<state dir>`. Each file there has one writer, so no
 //! process read-modify-writes another's state:
-//! - `config.json`: the launcher (its child's pid, thresholds, the re-arm floor)
+//! - `config.json`: the launcher (its child's pid, thresholds, the re-arm floor, in-place mode)
 //! - `session.json`: the SessionStart hook of the launcher's own claude (live session)
 //! - `start.json`: the first SessionStart of this launcher (the directory claude started in)
 //! - `request.json`: hooks and `recompact handoff` (which session, why, whether to continue)
+//! - `handoff.json`: the launcher (an in-place handoff is under way)
+//! - `switch.json`: the launcher (the twin it is typing `/resume` for; the SessionStart hook
+//!   consumes it)
+//! - `child.json`: `recompact pty-leader` (claude's pid, when claude runs under it)
 //! - `nudged.json`: the PostToolUse hook (the last checkpoint request)
 //! - `prewarm.json`: the Stop hook (the running background prewarm)
 
@@ -25,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::term::Proxy;
 use crate::{
     calibrate_lineage, continue_session, has_active_goal, lineage_latest, lineage_remove,
     load_jsonl, locate_session, parse_opts, prompt_tokens, rec_type, resume_command, resume_flags,
@@ -179,6 +192,16 @@ impl Shell {
         }
         ancestors(4).contains(&child)
     }
+}
+
+/// The session this process runs inside. Under the launcher that is the one its claude has open
+/// now: CLAUDE_CODE_SESSION_ID keeps the id claude started with, even after a switch in place.
+fn own_session() -> Option<String> {
+    Shell::from_env()
+        .filter(|s| s.is_own_claude())
+        .and_then(|s| s.session())
+        .and_then(|s| get_s(&s, "session").map(String::from))
+        .or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok())
 }
 
 fn ancestors(depth: usize) -> Vec<u32> {
@@ -365,6 +388,133 @@ pub fn on_session_start(input: &Value) {
     }
 }
 
+fn file_len(p: &Path) -> u64 {
+    fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+}
+
+/// A prompt, a task notice or a reply in the main conversation. Hook output, queue bookkeeping,
+/// titles and subagent records are not.
+fn turn_record(r: &Value) -> bool {
+    matches!(rec_type(r), "user" | "assistant") && !truthy(r, "isSidechain")
+}
+
+/// The last `max` bytes of a file, from the first whole line in them.
+fn read_tail(path: &Path, max: u64) -> Option<String> {
+    let mut f = fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let start = len.saturating_sub(max);
+    f.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    Some(match (start, text.find('\n')) {
+        (0, _) | (_, None) => text,
+        (_, Some(i)) => text[i + 1..].to_string(),
+    })
+}
+
+/// Is the session between turns? After a turn, Claude Code writes its bookkeeping
+/// (`turn_duration`, `stop_hook_summary`), and it writes the turn's own last records after the
+/// Stop hooks run, so only the transcript can tell, not a hook.
+pub fn turn_ended(transcript: &Path) -> bool {
+    let Some(tail) = read_tail(transcript, 4 << 20) else {
+        return true;
+    };
+    for line in tail.lines().rev() {
+        let Ok(r) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if rec_type(&r) == "system"
+            && matches!(
+                get_s(&r, "subtype"),
+                Some("turn_duration" | "stop_hook_summary")
+            )
+        {
+            return true;
+        }
+        if turn_record(&r) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Did the session add a prompt, a task notice or a reply after its record `uuid`? Unknown
+/// counts as yes.
+pub fn activity_after(transcript: &Path, uuid: &str) -> bool {
+    let Ok(text) = fs::read_to_string(transcript) else {
+        return true;
+    };
+    let Some(at) = text.rfind(&format!("\"uuid\":\"{uuid}\"")) else {
+        return true;
+    };
+    text[at..]
+        .lines()
+        .skip(1)
+        .any(|line| serde_json::from_str::<Value>(line).is_ok_and(|r| turn_record(&r)))
+}
+
+/// The last prompt or reply a twin carries over from its source. The twin's own summary and
+/// preamble records have ids of their own; carried records keep theirs.
+pub fn last_carried_uuid(twin: &Path) -> Option<String> {
+    load_jsonl(twin)
+        .iter()
+        .rev()
+        .find(|r| {
+            turn_record(r) && !truthy(r, "recompactSynthetic") && !truthy(r, "recompactPreamble")
+        })
+        .and_then(|r| get_s(r, "uuid").map(String::from))
+}
+
+fn in_place(shell: &Shell) -> bool {
+    shell.config.get("inplace") == Some(&json!(true))
+}
+
+/// An in-place handoff for this session is already under way.
+fn in_flight(shell: &Shell, session: &str) -> bool {
+    read_json(&shell.dir.join("handoff.json"))
+        .is_some_and(|h| get_s(&h, "session") == Some(session))
+}
+
+/// SessionStart of the twin a switch in place opened: a line for the user and, when work was
+/// running, a note for the model that it still is.
+pub fn in_place_notice(input: &Value) -> Option<(String, Option<String>)> {
+    in_place_notice_in(Shell::from_env().filter(|s| s.is_own_claude()), input)
+}
+
+pub fn in_place_notice_in(shell: Option<Shell>, input: &Value) -> Option<(String, Option<String>)> {
+    if get_s(input, "source") != Some("resume") {
+        return None;
+    }
+    let shell = shell?;
+    let path = shell.dir.join("switch.json");
+    let sw = read_json(&path)?;
+    if get_s(&sw, "twin") != hook_session(input) {
+        return None;
+    }
+    let _ = fs::remove_file(&path);
+    Some((
+        get_s(&sw, "message")?.to_string(),
+        get_s(&sw, "context").map(String::from),
+    ))
+}
+
+/// A prompt that carries the `/resume <twin>` the launcher typed was not the switch: text the
+/// user left in the input box was in the way. It must not reach the model.
+fn switch_collision(shell: &Shell, prompt: &str) -> Option<String> {
+    let sw = read_json(&shell.dir.join("switch.json"))?;
+    let cmd = format!("resume {}", get_s(&sw, "twin")?);
+    if !prompt.contains(&cmd) || prompt.trim() == format!("/{cmd}") {
+        return None;
+    }
+    let left = prompt.replace(&format!("/{cmd}"), "").replace(&cmd, "");
+    Some(format!(
+        "recompact · not sent: unsent text was in the input box while this session switched to its \
+compacted copy. It read: {}",
+        left.trim()
+    ))
+}
+
 fn is_bare_recompact(prompt: &str) -> bool {
     matches!(prompt.trim(), "/recompact" | "/segment-recompact:recompact")
 }
@@ -412,7 +562,11 @@ fn remember_background(shell: &Shell, session: &str, input: &Value) {
 }
 
 fn carry_for(shell: &Shell, session: Option<&str>) -> Value {
-    read_json(&shell.dir.join("background.json"))
+    carry_in(&shell.dir, session)
+}
+
+fn carry_in(dir: &Path, session: Option<&str>) -> Value {
+    read_json(&dir.join("background.json"))
         .filter(|b| session.is_some() && get_s(b, "session") == session)
         .map(|b| json!({"tasks": b["tasks"], "crons": b["crons"]}))
         .unwrap_or(json!({"tasks": [], "crons": []}))
@@ -486,6 +640,13 @@ commands, CronCreate for scheduled prompts; check CronList first so none is doub
     ))
 }
 
+/// Stop a prompt and say why. Claude Code shows every hook block in its warning style, so the
+/// prompt is not echoed back under it as well.
+fn block(reason: impl Into<String>) -> Value {
+    json!({"decision": "block", "reason": reason.into(),
+           "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "suppressOriginalPrompt": true}})
+}
+
 /// UserPromptSubmit: a bare `/recompact` under the launcher is handled without the model. The
 /// prompt is blocked (never reaches the context) and the launcher takes over within ~100 ms.
 pub fn on_prompt(input: &Value) -> Option<Value> {
@@ -494,6 +655,9 @@ pub fn on_prompt(input: &Value) -> Option<Value> {
 
 pub fn on_prompt_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
     let prompt = get_s(input, "prompt")?;
+    if let Some(text) = shell.as_ref().and_then(|sh| switch_collision(sh, prompt)) {
+        return Some(block(text));
+    }
     if matches!(
         prompt.trim(),
         "/recompact setup" | "/segment-recompact:recompact setup"
@@ -504,7 +668,7 @@ pub fn on_prompt_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
         } else {
             format!("recompact setup failed: {}", lines.join(" "))
         };
-        return Some(json!({"decision": "block", "reason": text}));
+        return Some(block(text));
     }
     if let Some((cmd, arg)) = switch_command(prompt) {
         let transcript = get_s(input, "transcript_path").map(PathBuf::from);
@@ -519,7 +683,7 @@ pub fn on_prompt_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
             transcript.as_deref(),
             managed,
         );
-        return Some(json!({"decision": "block", "reason": text}));
+        return Some(block(text));
     }
     if !is_bare_recompact(prompt) {
         return None;
@@ -529,19 +693,27 @@ pub fn on_prompt_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
     if !shell.tracks(session) && !shell.is_own_claude() {
         return None;
     }
+    if in_place(&shell) {
+        if in_flight(&shell, session) {
+            return Some(block(
+                "recompact · already compacting; switches at the next pause",
+            ));
+        }
+        request(&shell, input, "manual", false, true, true);
+        return Some(block(
+            "recompact · compacting in the background; switches to the compacted copy at the next pause",
+        ));
+    }
     request(&shell, input, "manual", false, true, true);
     let restart = carry_items(&carry_for(&shell, Some(session))).len();
-    Some(json!({
-        "decision": "block",
-        "reason": format!(
-            "recompact: compacting this session; it resumes here in a moment{}.",
-            if restart > 0 {
-                format!(", and restarts its {restart} background task(s) and wakeup(s)")
-            } else {
-                String::new()
-            }
-        )
-    }))
+    Some(block(format!(
+        "recompact: compacting this session; it resumes here in a moment{}.",
+        if restart > 0 {
+            format!(", and restarts its {restart} background task(s) and wakeup(s)")
+        } else {
+            String::new()
+        }
+    )))
 }
 
 fn nudged_at(shell: &Shell, session: &str) -> Option<usize> {
@@ -595,14 +767,20 @@ pub fn on_stop_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
         return None;
     }
     remember_background(&shell, session, input);
+    let switching = in_place(&shell);
+    if switching && in_flight(&shell, session) {
+        return None;
+    }
     // A handoff the agent queued during the turn goes now.
     if let Some(mut req) = read_json(&shell.dir.join("request.json")) {
         if get_s(&req, "session") == Some(session) && req.get("ready") != Some(&json!(true)) {
             req["ready"] = json!(true);
             write_json(&shell.dir.join("request.json"), &req);
-            return Some(
-                json!({"systemMessage": "recompact: compacting this session; it resumes here in a moment."}),
-            );
+            return Some(json!({"systemMessage": if switching {
+                "recompact · compacting; switches to the compacted copy in a moment"
+            } else {
+                "recompact: compacting this session; it resumes here in a moment."
+            }}));
         }
     }
     let (on, source) = auto_for(&shell.config, Some(session));
@@ -619,13 +797,14 @@ pub fn on_stop_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
         }
         return None;
     }
-    // Wakeups and open-ended monitors are restarted after the handoff; a job with an end (a
-    // build, a test run) is worth waiting for, up to the checkpoint size.
+    // A restart stops background work: wakeups and open-ended monitors are restarted after it,
+    // and a job with an end (a build, a test run) is worth waiting for, up to the checkpoint
+    // size. A switch in place stops nothing.
     let finite: Vec<Value> = carry_for(&shell, Some(session))["tasks"]
         .as_array()
         .map(|a| a.iter().filter(|t| !is_open_ended(t)).cloned().collect())
         .unwrap_or_default();
-    if !finite.is_empty() && live < checkpoint {
+    if !switching && !finite.is_empty() && live < checkpoint {
         let mark = shell
             .dir
             .join(format!("deferred-{}.json", short_id(session)));
@@ -655,6 +834,11 @@ pub fn on_stop_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
             fmt_k(live), fmt_k(at))}));
     }
     request(&shell, input, "auto", kick, false, true);
+    if switching {
+        return Some(json!({"systemMessage": format!(
+            "recompact · {} ≥ {}: compacting in the background; switches to the compacted copy at the next pause",
+            fmt_k(live), fmt_k(at))}));
+    }
     let restart = carry_items(&carry_for(&shell, Some(session))).len();
     Some(json!({"systemMessage": format!(
         "recompact: context is {} (≥ {}); compacting and resuming here{}.", fmt_k(live), fmt_k(at),
@@ -901,11 +1085,7 @@ fn continue_opts(
 /// Without it, it compacts now and prints the resume command (also copied to the clipboard).
 pub fn cmd_handoff(args: &[String]) -> i32 {
     let (pos, mut opts) = parse_opts(args);
-    let Some(session) = pos
-        .first()
-        .cloned()
-        .or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok())
-    else {
+    let Some(session) = pos.first().cloned().or_else(own_session) else {
         eprintln!("handoff: no session given and CLAUDE_CODE_SESSION_ID is not set");
         return 2;
     };
@@ -1302,6 +1482,14 @@ struct Launch {
     max_cycles: usize,
     dir: Option<PathBuf>,
     interactive: bool,
+    /// Run claude on the launcher's own terminal and hand off in place (`--pty`, `--no-pty`,
+    /// `RECOMPACT_PTY=0`); unset means: when the launcher runs in a terminal.
+    pty: Option<bool>,
+    /// How long `/resume <twin>` may take to open the twin before it is typed again (then the
+    /// launcher restarts claude instead).
+    switch_timeout: Duration,
+    /// The recompact binary that runs `pty-leader` (this one, unless a test names it).
+    leader: PathBuf,
     copts_raw: serde_json::Map<String, Value>,
 }
 
@@ -1322,6 +1510,9 @@ and your last message says what was done and what is next."
         max_cycles: 0,
         dir: None,
         interactive: false,
+        pty: (std::env::var("RECOMPACT_PTY").ok().as_deref() == Some("0")).then_some(false),
+        switch_timeout: Duration::from_secs(12),
+        leader: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("recompact")),
         copts_raw: serde_json::Map::new(),
     };
     let mut claude = Vec::new();
@@ -1385,6 +1576,22 @@ and your last message says what was done and what is next."
             "--interactive" => {
                 l.interactive = true;
                 i += 1;
+            }
+            "--pty" => {
+                l.pty = Some(true);
+                i += 1;
+            }
+            "--no-pty" => {
+                l.pty = Some(false);
+                i += 1;
+            }
+            "--switch-timeout" => {
+                l.switch_timeout = Duration::from_secs_f64(val().parse().unwrap_or(12.0));
+                i += 2;
+            }
+            "--leader" => {
+                l.leader = PathBuf::from(val());
+                i += 2;
             }
             _ => {
                 claude.push(args[i].clone());
@@ -1458,6 +1665,11 @@ pub fn cmd_shell(args: &[String]) -> i32 {
     } else {
         "auto-compaction off · /recompact on turns it on for this session"
     });
+    let proxy = if l.pty.unwrap_or(!l.interactive) {
+        Proxy::start(&recompact_home().join("shell.log"))
+    } else {
+        None
+    };
 
     let mut cycles = 0usize;
     loop {
@@ -1468,20 +1680,31 @@ pub fn cmd_shell(args: &[String]) -> i32 {
             "session.json",
             "warned.json",
             "background.json",
+            "handoff.json",
+            "switch.json",
+            "child.json",
         ] {
             let _ = fs::remove_file(state.join(f));
         }
-        let config = |child: u32| {
+        let config = |child: u32, rearm: usize| {
             json!({
                 "launcher": std::process::id(), "child": child, "at": l.at,
                 "checkpoint_at": l.checkpoint_at, "auto": l.auto, "rearm": rearm,
                 "summarize": copts.summarize.is_some(),
                 "summarize_with": copts.summarize.as_ref().map(|c| c.model.clone()),
                 "target": copts.target, "launch_model": origin.launch_model,
+                "inplace": proxy.is_some(),
             })
         };
-        write_json(&state.join("config.json"), &config(0));
-        let mut cmd = Command::new(&l.bin);
+        write_json(&state.join("config.json"), &config(0, rearm));
+        let mut cmd = match &proxy {
+            Some(_) => {
+                let mut c = Command::new(&l.leader);
+                c.arg("pty-leader").arg(&l.bin);
+                c
+            }
+            None => Command::new(&l.bin),
+        };
         cmd.args(&next_args).env("RECOMPACT_SHELL", &state);
         if let Some(d) = read_json(&state.join("start.json"))
             .and_then(|s| get_s(&s, "cwd").map(PathBuf::from))
@@ -1489,7 +1712,11 @@ pub fn cmd_shell(args: &[String]) -> i32 {
         {
             cmd.current_dir(d);
         }
-        let child = match cmd.spawn() {
+        let spawned = match &proxy {
+            Some(p) => p.spawn(&mut cmd),
+            None => cmd.spawn(),
+        };
+        let child = match spawned {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("recompact shell: cannot run {}: {e}", l.bin);
@@ -1498,8 +1725,33 @@ pub fn cmd_shell(args: &[String]) -> i32 {
             }
         };
         let pid = child.id();
-        write_json(&state.join("config.json"), &config(pid));
-        let (code, req) = supervise(pid, &state);
+        let claude = if proxy.is_some() {
+            led_pid(&state).unwrap_or(pid)
+        } else {
+            pid
+        };
+        write_json(&state.join("config.json"), &config(claude, rearm));
+        let (code, req, built) = match &proxy {
+            Some(p) => {
+                let mut ip = InPlace {
+                    l: &l,
+                    copts: &copts,
+                    origin: &origin,
+                    state: &state,
+                    pid,
+                    claude,
+                    rearm,
+                    config: &config,
+                };
+                let out = supervise_in_place(p, &mut ip);
+                rearm = ip.rearm;
+                out
+            }
+            None => {
+                let (code, req) = supervise(pid, &state);
+                (code, req, None)
+            }
+        };
         let session = read_json(&state.join("session.json"));
         // SIGTERM from anyone else (an agent running `kill -TERM $CLAUDE_PID`) is a handoff too.
         let req = req.or_else(|| {
@@ -1532,16 +1784,8 @@ pub fn cmd_shell(args: &[String]) -> i32 {
             }
             continue;
         };
-        let at = user_at(get_s(&req, "session")).or(l.at).unwrap_or_else(|| {
-            let (live, model) = live_status(&transcript).unwrap_or((0, String::new()));
-            let model = if model.is_empty() {
-                origin.launch_model.clone().unwrap_or_default()
-            } else {
-                model
-            };
-            default_at_for(&model, live)
-        });
-        let (twin, est) = match run_handoff(&req, &copts, at) {
+        let at = handoff_at(&req, &l, &origin, &transcript);
+        let (twin, est) = match built.or_else(|| run_handoff(&req, &copts, at)) {
             Some(v) => v,
             None => (get_s(&req, "session").unwrap_or("").to_string(), 0),
         };
@@ -1567,6 +1811,413 @@ pub fn cmd_shell(args: &[String]) -> i32 {
         }
         let prompt = restore.or_else(|| kick.then(|| l.kick.clone()));
         next_args = relaunch_args(&origin, &twin, &transcript, prompt.as_deref());
+    }
+}
+
+/// Claude's pid under `recompact pty-leader`, which reports it as soon as it has forked.
+fn led_pid(state: &Path) -> Option<u32> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(pid) = read_json(&state.join("child.json")).and_then(|c| get_u(&c, "pid")) {
+            return Some(pid as u32);
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The trigger size a handoff of `req` compacts against.
+fn handoff_at(req: &Value, l: &Launch, origin: &Origin, transcript: &Path) -> usize {
+    user_at(get_s(req, "session")).or(l.at).unwrap_or_else(|| {
+        let (live, model) = live_status(transcript).unwrap_or((0, String::new()));
+        let model = if model.is_empty() {
+            origin.launch_model.clone().unwrap_or_default()
+        } else {
+            model
+        };
+        default_at_for(&model, live)
+    })
+}
+
+// ------------------------------------------------------------------------------------ in place
+
+/// What an in-place handoff needs from the launcher.
+struct InPlace<'a> {
+    l: &'a Launch,
+    copts: &'a ContinueOpts,
+    origin: &'a Origin,
+    state: &'a Path,
+    /// `recompact pty-leader`: what the launcher waits for and signals.
+    pid: u32,
+    /// Claude itself: what the hooks identify their claude by.
+    claude: u32,
+    rearm: usize,
+    config: &'a dyn Fn(u32, usize) -> Value,
+}
+
+enum Phase {
+    /// Compacting in a worker thread while claude keeps running.
+    Building(std::thread::JoinHandle<Option<(String, usize)>>),
+    /// The twin is ready; waiting for a pause: turn over, transcript and keyboard quiet, input
+    /// box empty.
+    Ready(Ready),
+    /// `/resume <twin>` was typed; waiting for the twin's SessionStart.
+    Switching {
+        twin: String,
+        est: usize,
+        since: Instant,
+        tries: u32,
+    },
+}
+
+struct Ready {
+    twin: String,
+    est: usize,
+    /// The last record of the session the twin carries: anything after it is not in the twin.
+    covered: String,
+    /// The transcript's length, and since when it has stayed that.
+    len: u64,
+    since: Instant,
+}
+
+struct Handoff {
+    req: Value,
+    session: String,
+    transcript: PathBuf,
+    at: usize,
+    live: usize,
+    rebuilds: u32,
+    phase: Option<Phase>,
+}
+
+enum Next {
+    Wait,
+    Done,
+    /// The switch did not take: restart claude on this twin.
+    Restart(String, usize),
+}
+
+/// How long the transcript and the keyboard must stay still before typing into claude: a turn
+/// that just started can take a moment to reach the transcript.
+const SETTLE: Duration = Duration::from_millis(1500);
+
+fn build(req: &Value, copts: &ContinueOpts, at: usize) -> Phase {
+    let (req, copts) = (req.clone(), copts.clone());
+    Phase::Building(std::thread::spawn(move || run_handoff(&req, &copts, at)))
+}
+
+/// Drop a twin that was never switched to.
+fn discard(transcript: &Path, twin: &str) {
+    if let Some(dir) = transcript.parent() {
+        let _ = fs::remove_file(dir.join(format!("{twin}.jsonl")));
+        lineage_remove(dir, twin);
+    }
+    let _ = fs::remove_file(session_setting_path(twin));
+}
+
+fn tracked_session(state: &Path) -> Option<String> {
+    read_json(&state.join("session.json")).and_then(|s| get_s(&s, "session").map(String::from))
+}
+
+/// Type `/resume <twin>` into claude. Esc first closes a picker or dialog left open (at the
+/// prompt it does nothing); the pause after it keeps Esc from reading as Alt with the next key.
+fn type_resume(p: &Proxy, twin: &str) {
+    p.type_keys(b"\x1b");
+    std::thread::sleep(Duration::from_millis(800));
+    p.type_keys(format!("/resume {twin}").as_bytes());
+    std::thread::sleep(Duration::from_millis(500));
+    p.type_keys(b"\r");
+}
+
+/// Typed into the terminal, these compact without a model turn or a hook (see `is_bare_recompact`).
+const TYPED: &[&str] = &["/recompact", "/segment-recompact:recompact"];
+
+/// The request a typed `/recompact` makes, as the UserPromptSubmit hook would.
+fn typed_request(state: &Path, session: &str) -> Option<Value> {
+    let s = read_json(&state.join("session.json"))?;
+    Some(json!({
+        "session": session, "transcript": s.get("transcript"), "reason": "manual",
+        "kick": false, "force": true, "ready": true, "carry": carry_in(state, Some(session)),
+    }))
+}
+
+fn start_handoff(ip: &InPlace, mut req: Value) -> Option<Handoff> {
+    let session = get_s(&req, "session")?.to_string();
+    let transcript = request_transcript(&req, ip.l)?;
+    req["transcript"] = json!(transcript);
+    let at = handoff_at(&req, ip.l, ip.origin, &transcript);
+    stop_prewarm(ip.state);
+    write_json(&ip.state.join("handoff.json"), &json!({"session": session}));
+    Some(Handoff {
+        live: live_tokens(&transcript).unwrap_or(0),
+        phase: Some(build(&req, ip.copts, at)),
+        req,
+        session,
+        transcript,
+        at,
+        rebuilds: 0,
+    })
+}
+
+/// The switch message for the user, and for the twin's model when work was running.
+fn switch_notice(h: &Handoff, twin: &str, est: usize) -> Value {
+    let running = ["tasks", "crons"]
+        .iter()
+        .any(|k| h.req["carry"][k].as_array().is_some_and(|a| !a.is_empty()));
+    json!({
+        "twin": twin,
+        "message": format!(
+            "recompact · compacted in place: {} → ~{}{}",
+            fmt_k(h.live),
+            fmt_k(est),
+            if running { " · background work kept running" } else { "" }
+        ),
+        "context": running.then_some(
+            "recompact compacted this session in place: the same Claude Code process switched to \
+    this compacted copy, so the background commands, monitors, agents and scheduled prompts started \
+    before that are still running, and their notices arrive here."
+        ),
+    })
+}
+
+fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
+    let tracked = tracked_session(ip.state);
+    let (next, phase) = match h.phase.take() {
+        None => (Next::Done, None),
+        Some(Phase::Building(job)) if !job.is_finished() => {
+            (Next::Wait, Some(Phase::Building(job)))
+        }
+        Some(Phase::Building(job)) => match job.join().ok().flatten() {
+            Some((twin, est)) if twin != h.session => {
+                match last_carried_uuid(&h.transcript.with_file_name(format!("{twin}.jsonl"))) {
+                    Some(covered) => {
+                        carry_session_setting(&h.session, &twin);
+                        let ready = Ready {
+                            twin,
+                            est,
+                            covered,
+                            len: file_len(&h.transcript),
+                            since: Instant::now(),
+                        };
+                        (Next::Wait, Some(Phase::Ready(ready)))
+                    }
+                    None => {
+                        discard(&h.transcript, &twin);
+                        (Next::Done, None)
+                    }
+                }
+            }
+            _ => (Next::Done, None),
+        },
+        Some(Phase::Ready(mut r)) => {
+            let len = file_len(&h.transcript);
+            if len != r.len {
+                r.len = len;
+                r.since = Instant::now();
+            }
+            let settled = r.since.elapsed() >= SETTLE && p.quiet_for() >= SETTLE;
+            if tracked.as_deref() != Some(h.session.as_str()) {
+                // The user opened another session (/resume, /clear): this twin is for one they left.
+                discard(&h.transcript, &r.twin);
+                (Next::Done, None)
+            } else if !(settled && p.input_clean() && turn_ended(&h.transcript)) {
+                (Next::Wait, Some(Phase::Ready(r)))
+            } else {
+                p.hold();
+                if !p.input_clean() {
+                    p.release();
+                    (Next::Wait, Some(Phase::Ready(r)))
+                } else if activity_after(&h.transcript, &r.covered) {
+                    // The session moved on while compacting: build again from where it is now.
+                    p.release();
+                    discard(&h.transcript, &r.twin);
+                    if h.rebuilds >= 3 {
+                        (Next::Done, None)
+                    } else {
+                        h.rebuilds += 1;
+                        (Next::Wait, Some(build(&h.req, ip.copts, h.at)))
+                    }
+                } else {
+                    write_json(
+                        &ip.state.join("switch.json"),
+                        &switch_notice(h, &r.twin, r.est),
+                    );
+                    type_resume(p, &r.twin);
+                    (
+                        Next::Wait,
+                        Some(Phase::Switching {
+                            twin: r.twin,
+                            est: r.est,
+                            since: Instant::now(),
+                            tries: 1,
+                        }),
+                    )
+                }
+            }
+        }
+        Some(Phase::Switching {
+            twin,
+            est,
+            since,
+            tries,
+        }) => {
+            if tracked.as_deref() == Some(twin.as_str()) {
+                ip.rearm = rearm_for(est, h.at);
+                write_json(
+                    &ip.state.join("config.json"),
+                    &(ip.config)(ip.claude, ip.rearm),
+                );
+                let records = load_jsonl(&h.transcript.with_file_name(format!("{twin}.jsonl")));
+                let kick = (h.req.get("kick") == Some(&json!(true)))
+                    .then(|| ip.l.kick.clone())
+                    .or_else(|| has_active_goal(&records).then(|| "continue".to_string()));
+                if let Some(k) = kick {
+                    // Let the resumed conversation finish drawing before typing into it.
+                    std::thread::sleep(Duration::from_millis(1500));
+                    p.type_keys(k.as_bytes());
+                    std::thread::sleep(Duration::from_millis(500));
+                    p.type_keys(b"\r");
+                }
+                p.release();
+                say(&format!(
+                    "switched in place to {} ({} → ~{})",
+                    short_id(&twin),
+                    fmt_k(h.live),
+                    fmt_k(est)
+                ));
+                (Next::Done, None)
+            } else if since.elapsed() < ip.l.switch_timeout {
+                (
+                    Next::Wait,
+                    Some(Phase::Switching {
+                        twin,
+                        est,
+                        since,
+                        tries,
+                    }),
+                )
+            } else if tries < 2 {
+                type_resume(p, &twin);
+                (
+                    Next::Wait,
+                    Some(Phase::Switching {
+                        twin,
+                        est,
+                        since: Instant::now(),
+                        tries: tries + 1,
+                    }),
+                )
+            } else {
+                let _ = fs::remove_file(ip.state.join("switch.json"));
+                (Next::Restart(twin, est), None)
+            }
+        }
+    };
+    h.phase = phase;
+    next
+}
+
+/// Claude quit with a handoff under way: stop the compaction (it removes its own output) or
+/// drop the twin that was never switched to.
+fn abandon(h: Handoff) {
+    match h.phase {
+        Some(Phase::Building(job)) => {
+            CANCEL.store(true, Ordering::SeqCst);
+            let _ = job.join();
+            CANCEL.store(false, Ordering::SeqCst);
+        }
+        Some(Phase::Ready(Ready { twin, .. })) | Some(Phase::Switching { twin, .. }) => {
+            discard(&h.transcript, &twin)
+        }
+        None => {}
+    }
+}
+
+/// `supervise` for claude on the launcher's terminal: handoffs happen in place while it runs.
+/// Returns claude's exit code, plus the request and its twin when a switch did not take and
+/// claude was stopped so the twin can be resumed the old way.
+fn supervise_in_place(
+    p: &Proxy,
+    ip: &mut InPlace,
+) -> (i32, Option<Value>, Option<(String, usize)>) {
+    let pid = ip.pid;
+    let req_path = ip.state.join("request.json");
+    let mut job: Option<Handoff> = None;
+    loop {
+        p.tick();
+        match poll_child(pid) {
+            ChildState::Exited(code) => {
+                p.child_gone();
+                if let Some(h) = job.take() {
+                    abandon(h);
+                }
+                for f in ["handoff.json", "switch.json"] {
+                    let _ = fs::remove_file(ip.state.join(f));
+                }
+                return (code, None, None);
+            }
+            // Claude stopped itself (Ctrl-Z): hand the terminal back and stop the launcher with
+            // it; `fg` resumes both.
+            ChildState::Stopped => {
+                p.suspend();
+                unsafe {
+                    kill(0, sigtstp());
+                }
+                p.resume();
+                send_signal(pid, libc::SIGCONT);
+            }
+            ChildState::Running => {}
+        }
+        let tracked = tracked_session(ip.state);
+        // After a restart, keys held during the failed switch go to the new claude once it is up.
+        if job.is_none() && p.holding() && tracked.is_some() {
+            p.release();
+        }
+        // A bare `/recompact` typed into the terminal never reaches claude: blocking it in a hook
+        // would show as an error. The hook still handles it when it arrives another way.
+        p.intercept(if tracked.is_some() { TYPED } else { &[] });
+        if p.take_typed().is_some() && job.is_none() {
+            if let Some(req) = tracked.and_then(|s| typed_request(ip.state, &s)) {
+                job = start_handoff(ip, req);
+            }
+        }
+        if job.is_none() {
+            if let Some(req) = read_json(&req_path).filter(|r| r.get("ready") == Some(&json!(true)))
+            {
+                let _ = fs::remove_file(&req_path);
+                job = start_handoff(ip, req);
+            }
+        }
+        if let Some(h) = job.as_mut() {
+            match step(h, ip, p) {
+                Next::Wait => {}
+                Next::Done => {
+                    job = None;
+                    let _ = fs::remove_file(ip.state.join("handoff.json"));
+                }
+                Next::Restart(twin, est) => {
+                    let req = job.take().map(|h| h.req);
+                    let _ = fs::remove_file(ip.state.join("handoff.json"));
+                    send_signal(pid, SIGTERM);
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    let code = loop {
+                        if let ChildState::Exited(code) = poll_child(pid) {
+                            break code;
+                        }
+                        if Instant::now() > deadline {
+                            send_signal(pid, SIGKILL);
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    };
+                    p.child_gone();
+                    p.say("\x1b[36mrecompact · the switch in place did not take; restarting claude on the compacted session\x1b[0m");
+                    return (code, req, Some((twin, est)));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -2543,7 +3194,7 @@ pub fn cmd_auto(args: &[String]) -> i32 {
         .get("session")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .or_else(|| std::env::var("CLAUDE_CODE_SESSION_ID").ok());
+        .or_else(own_session);
     let inside = std::env::var("CLAUDE_CODE_SESSION_ID").is_ok();
     let managed = !inside || shell.as_ref().is_some_and(|s| s.is_own_claude());
     let transcript = session.as_deref().and_then(|id| locate_session(None, id));

@@ -35,15 +35,17 @@ It installs the plugin with auto-update on, fetches the prebuilt binary for your
 through recompact. Aliases like `alias c='claude --model opus'` go through it too. Open a new
 terminal and use claude as always:
 
-- Type `/recompact` to compact the current session. It resumes in the same terminal.
+- Type `/recompact` to compact the current session. It compacts in the background while you
+  keep working, then the same claude switches to the compacted copy at the next pause.
 - Sessions you expect to run long: type `/recompact on` in them (or start them with
   `claude --auto`). When a turn ends past 500k tokens (140k on Haiku), that session compacts in
   place and carries on, through as many handoffs as it takes; long autonomous turns are asked to
   reach a checkpoint first. Everything else stays untouched: automatic compaction is off by
   default. Set `RECOMPACT_WINDOW=200k` if your Opus or Sonnet plan has a 200k window.
-- Background shells, monitors, and scheduled prompts (`/loop`) keep working: compaction records
-  them, and the resumed session starts them again. A build or test still running in the
-  background is waited for first.
+- Background shells, monitors, agents, and scheduled prompts (`/loop`) keep running: claude is
+  not restarted, so nothing stops, and their notices arrive in the compacted session. Where
+  claude must be restarted instead (no terminal, or `RECOMPACT_PTY=0`), compaction records them
+  and the resumed session starts them again.
 - `/recompact off` turns it off for that session, `/recompact on 600k` changes its size,
   `/recompact status` shows where it stands, and `/recompact default on` makes it the default for
   new sessions. They answer instantly, without a model turn.
