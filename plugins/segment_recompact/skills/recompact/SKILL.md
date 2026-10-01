@@ -198,16 +198,23 @@ A drop-in for `claude`: every argument it does not know goes to claude (`recompa
 opus --effort max`, `recompact shell -r <id>`). Print mode, `--help`, subcommands, and any flag it
 cannot classify run claude directly, unwrapped. It stays in the background and does three things:
 
-- **Typed `/recompact`:** compacts and resumes in the same terminal, no model turn spent.
+- **Typed `/recompact`:** compacts and continues in the same terminal, no model turn spent.
 - **Automatic, for sessions that ask for it** (`/recompact on`, below): when a turn ends with the
   context at or over `--at` (default 500k on a 1M window, 140k on 200k), it compacts toward
-  `--target` (default half of `--at`, at most 120k) and resumes. It waits while background tasks run or session crons are scheduled, and says so once.
+  `--target` (default half of `--at`, at most 120k) and continues in the compacted copy.
   From half of `--at`, a background prewarm keeps the summary cache warm, so the handoff itself
   usually takes seconds.
 - **Long autonomous turns:** past the checkpoint size (`--at` + 150k on 1M; on 200k, 30k more but
   under Claude Code's own compaction), a hook asks the main agent (not subagents) to reach a
   checkpoint and end its turn; the resumed session is told to continue. An active `/goal` is
   continued the same way.
+
+**How it switches.** Claude runs on a terminal the launcher owns. It compacts in the background
+while the session keeps going; at the next pause (turn over, input box empty, nothing typed or
+written for 1.5s) it types `/resume <twin>` into the same claude, which opens the compacted copy
+without restarting. A turn that lands while it compacts is built into the twin before the
+switch. If the switch does not take (twice, about 25s), it restarts claude on the twin instead.
+`--no-pty` or `RECOMPACT_PTY=0` always restarts. Ctrl-Z and `fg` work as with plain claude.
 
 **On and off, per session.** Automatic compaction is off unless a session asks for it:
 `/recompact on` turns it on for this session and every continuation of it (the setting follows
@@ -221,24 +228,26 @@ A bare `/recompact` always compacts, on or off.
 A session switched on (or started with `--auto`) compacts at the end of the turn that crosses its
 size; one that is on only because of the default gets the one-line notice first.
 
-**Background work across a compaction.** Restarting claude ends its background shells and
-monitors, and a new twin has no scheduled prompts. So a handoff records them (the Stop hook lists
-each command and schedule), and the resumed session gets a prompt to start them again, then
-continue or wait for the user. Open-ended work (watch loops, `tail -f`, monitors, scheduled
-prompts) never delays a handoff. A finite background job (a build, a test run) is waited for,
-until the checkpoint size at most, then restarted the same way. If you wake up to that prompt,
-restart only what is still needed, and check `CronList` before recreating a scheduled prompt.
+**Background work across a compaction.** Switched in place, nothing stops: background shells,
+monitors, agents, and scheduled prompts keep running, their notices arrive in the twin, and the
+twin is told so. Restarting claude ends them instead, so a handoff records them (the Stop hook
+lists each command and schedule), and the resumed session gets a prompt to start them again,
+then continue or wait for the user. Before a restart, open-ended work (watch loops, `tail -f`,
+monitors, scheduled prompts) never delays a handoff; a finite background job (a build, a test
+run) is waited for, until the checkpoint size at most, then restarted the same way. If you wake
+up to that prompt, restart only what is still needed, and check `CronList` before recreating a
+scheduled prompt.
 
 Transcripts do not record the context window: Haiku counts as 200k, other models as 1M (what the
 `opus` alias gives on current plans); set `RECOMPACT_WINDOW=200k` if yours differs.
 
 A resumed session always opens as it is. If it is already over `--at`, it gets another 100k (or
-a quarter of `--at`) of room before the warning. The relaunch keeps
+a quarter of `--at`) of room before the warning. A restart keeps
 every flag except the session-selecting ones and `--permission-mode` (the session restores the
 mode it was in; `--dangerously-skip-permissions` becomes `--allow-dangerously-skip-permissions`).
 It keeps the model you launched with, unless the session switched model family mid-way, and the
-session's effort. It runs in the directory claude started in. Ctrl-C during a compaction cancels
-it and resumes the session as it was. Defaults can also come from the environment:
+session's effort. It runs in the directory claude started in. Ctrl-C during a compaction before
+a restart cancels it and resumes the session as it was. Defaults can also come from the environment:
 `RECOMPACT_AT`, `RECOMPACT_TARGET`, `RECOMPACT_WINDOW`, `RECOMPACT_SUMMARIZE_WITH` (`mask` for
 none), `RECOMPACT_AUTO=0`.
 
