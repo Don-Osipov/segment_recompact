@@ -201,8 +201,12 @@ pub fn cmd_statusline(args: &[String]) -> i32 {
         .iter()
         .position(|a| a == "--")
         .map(|i| args[i + 1..].join(" "));
-    let progress = std::env::var_os("RECOMPACT_SHELL")
-        .map(|d| PathBuf::from(d).join("progress.json"))
+    // A background job's handoff reports in the job's own state folder.
+    let state = crate::Job::from_env()
+        .map(|j| crate::job_state_dir(&j.short))
+        .or_else(|| std::env::var_os("RECOMPACT_SHELL").map(PathBuf::from));
+    let progress = state
+        .map(|d| d.join("progress.json"))
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
     let cols = std::env::var("COLUMNS")

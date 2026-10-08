@@ -538,6 +538,27 @@ fn cloexec(fd: RawFd) {
     }
 }
 
+/// The text in terminal output: escape sequences, control characters and spacing left out (a
+/// screen drawn with cursor moves has no reliable spaces).
+pub fn plain_text(bytes: &[u8]) -> String {
+    let mut kept = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            0x1b => i += escape(&bytes[i..]).0.max(1),
+            b if b <= 0x20 || b == 0x7f => i += 1,
+            b => {
+                kept.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&kept)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
 /// A new pseudo-terminal: (master, slave).
 fn open_pty() -> io::Result<(File, File)> {
     unsafe {
@@ -560,6 +581,185 @@ fn open_pty() -> io::Result<(File, File)> {
         }
         cloexec(slave);
         Ok((master_file, File::from_raw_fd(slave)))
+    }
+}
+
+/// Run `cmd` as the session leader of a new pseudo-terminal of size `ws`: the child, and the
+/// master side to talk to it through.
+fn spawn_on_pty(cmd: &mut Command, ws: &libc::winsize) -> io::Result<(Child, File)> {
+    let (master, slave) = open_pty()?;
+    unsafe {
+        libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, ws);
+    }
+    cmd.stdin(Stdio::from(slave.try_clone()?))
+        .stdout(Stdio::from(slave.try_clone()?))
+        .stderr(Stdio::from(slave.try_clone()?));
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn();
+    // The child has its copies; the parent's must close, or the master never sees the end.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    drop(slave);
+    Ok((child?, master))
+}
+
+/// The size of the terminal `tty` names (`ttys013`, `pts/4`, as `ps` prints it).
+pub fn tty_size(tty: &str) -> Option<(u16, u16)> {
+    let tty = tty.trim();
+    if tty.is_empty() || tty.starts_with('?') || tty.contains("..") {
+        return None;
+    }
+    let path = std::ffi::CString::new(format!("/dev/{tty}")).ok()?;
+    unsafe {
+        let fd = libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_NOCTTY | libc::O_NONBLOCK,
+        );
+        if fd < 0 {
+            return None;
+        }
+        let mut ws: libc::winsize = std::mem::zeroed();
+        let ok = libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) == 0;
+        libc::close(fd);
+        (ok && ws.ws_row > 0 && ws.ws_col > 0).then_some((ws.ws_row, ws.ws_col))
+    }
+}
+
+#[derive(Default)]
+struct Drawn {
+    /// Bytes drawn since the start.
+    total: u64,
+    /// The last of them.
+    tail: Vec<u8>,
+    last: Option<Instant>,
+}
+
+const DRAWN_TAIL: usize = 64 << 10;
+
+/// A terminal recompact drives with no one at it: a background job opened with `claude attach`
+/// on a pseudo-terminal of recompact's own. It keeps the end of what the job draws, so a caller
+/// can read what a key did.
+pub struct Attach {
+    child: Child,
+    master: File,
+    drawn: Arc<Mutex<Drawn>>,
+    reader: Option<(JoinHandle<()>, Arc<AtomicBool>)>,
+}
+
+impl Attach {
+    pub fn open(cmd: &mut Command, rows: u16, cols: u16) -> io::Result<Attach> {
+        let ws = libc::winsize {
+            ws_row: rows,
+            ws_col: cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let (child, master) = spawn_on_pty(cmd, &ws)?;
+        let drawn = Arc::new(Mutex::new(Drawn::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (fd, sink, flag) = (master.as_raw_fd(), drawn.clone(), stop.clone());
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            loop {
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                match unsafe { libc::poll(&mut pfd, 1, 100) } {
+                    0 if flag.load(Ordering::SeqCst) => return,
+                    0 => continue,
+                    n if n < 0 => continue,
+                    _ => {}
+                }
+                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                if n <= 0 {
+                    return;
+                }
+                let mut d = sink.lock().unwrap();
+                d.total += n as u64;
+                d.tail.extend_from_slice(&buf[..n as usize]);
+                if d.tail.len() > DRAWN_TAIL {
+                    let cut = d.tail.len() - DRAWN_TAIL;
+                    d.tail.drain(..cut);
+                }
+                d.last = Some(Instant::now());
+            }
+        });
+        Ok(Attach {
+            child,
+            master,
+            drawn,
+            reader: Some((reader, stop)),
+        })
+    }
+
+    pub fn type_keys(&self, bytes: &[u8]) -> bool {
+        write_all(self.master.as_raw_fd(), bytes)
+    }
+
+    /// How much has been drawn: a mark for `text_since`.
+    pub fn mark(&self) -> u64 {
+        self.drawn.lock().unwrap().total
+    }
+
+    /// The text drawn since `mark`, as far back as the kept end reaches (see `plain_text`).
+    pub fn text_since(&self, mark: u64) -> String {
+        let d = self.drawn.lock().unwrap();
+        let new = (d.total.saturating_sub(mark) as usize).min(d.tail.len());
+        plain_text(&d.tail[d.tail.len() - new..])
+    }
+
+    /// How long since anything was drawn; `None` before the first output.
+    pub fn still_for(&self) -> Option<Duration> {
+        self.drawn.lock().unwrap().last.map(|t| t.elapsed())
+    }
+
+    pub fn running(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// Leave, with the job running: Ctrl+Z ends `claude attach` (measured: exit 0, CLI 2.1.293).
+    /// A client that stays is stopped when this is dropped.
+    pub fn detach(mut self) {
+        self.type_keys(b"\x1a");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while self.running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for Attach {
+    fn drop(&mut self) {
+        if self.running() {
+            unsafe {
+                libc::kill(self.child.id() as i32, libc::SIGTERM);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while self.running() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+        // The reader polls the master's descriptor: it must be done before the master closes.
+        if let Some((h, stop)) = self.reader.take() {
+            stop.store(true, Ordering::SeqCst);
+            let _ = h.join();
+        }
     }
 }
 
@@ -649,34 +849,11 @@ impl Proxy {
 
     /// Run `cmd` as the session leader of a fresh pseudo-terminal sized like the user's.
     pub fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
-        let (master, slave) = open_pty()?;
         // A new claude starts with an empty input box.
         self.shared.input.lock().unwrap().line = InputBox::Empty;
-        let ws = window_size();
-        unsafe {
-            libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws);
-        }
-        cmd.stdin(Stdio::from(slave.try_clone()?))
-            .stdout(Stdio::from(slave.try_clone()?))
-            .stderr(Stdio::from(slave.try_clone()?));
-        unsafe {
-            use std::os::unix::process::CommandExt;
-            cmd.pre_exec(|| {
-                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
         self.raw();
-        let child = cmd.spawn();
-        // The child has its copies; the parent's must close, or the master never sees the end.
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        drop(slave);
-        let child = match child {
-            Ok(c) => c,
+        let (child, master) = match spawn_on_pty(cmd, &window_size()) {
+            Ok(v) => v,
             Err(e) => {
                 self.cooked();
                 return Err(e);

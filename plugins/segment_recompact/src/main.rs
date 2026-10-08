@@ -4,7 +4,7 @@ use std::env;
 use std::process::exit;
 
 use recompact::{
-    cmd_assemble, cmd_auto, cmd_continue, cmd_doctor, cmd_extract, cmd_handoff, cmd_hook, cmd_install, cmd_mcp, cmd_prewarm, cmd_probe, cmd_recall,
+    cmd_assemble, cmd_auto, cmd_continue, cmd_doctor, cmd_extract, cmd_handoff, cmd_hook, cmd_install, cmd_job_handoff, cmd_mcp, cmd_prewarm, cmd_probe, cmd_recall,
     cmd_pty_leader, cmd_rehydrate, cmd_resume, cmd_scan, cmd_shell, cmd_statusline, cmd_uninstall, cmd_update, cmd_verify, USAGE,
 };
 
@@ -25,6 +25,7 @@ fn main() {
         "hook" => cmd_hook(&args[2..]),
         "handoff" => cmd_handoff(&args[2..]),
         "prewarm" => cmd_prewarm(&args[2..]),
+        "job-handoff" => cmd_job_handoff(&args[2..]),
         "install" => cmd_install(&args[2..]),
         "auto" => cmd_auto(&args[2..]),
         "doctor" => cmd_doctor(&args[2..]),

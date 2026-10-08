@@ -43,6 +43,9 @@ recompact handoff [--continue-after]
   ends, the launcher stops claude, compacts the session, and resumes the twin in the same
   terminal. Reply in one line ("Compacting when this turn ends.") and end your turn. A bare
   `/recompact` typed by the user never reaches you there: a hook takes it before the model runs.
+- **In a background job** (`CLAUDE_JOB_DIR` is set), it queues the handoff the same way: when
+  this turn ends, recompact compacts the session and switches the job to the twin. Reply in one
+  line and end your turn.
 - **Without the launcher**, it compacts now (Haiku summaries) and prints a
   `claude --resume …` command, also copied to the clipboard. Tell the user to `/exit` and paste
   it, and mention that starting claude through `recompact shell` makes this automatic.
@@ -221,6 +224,25 @@ switch. If the switch does not take (twice, about 25s), it restarts claude on th
 Progress shows as a bar under the status line: `recompact statusline -- '<command>'` wraps the
 user's status line command (re-running it only when its input changes) and adds the bar while a
 handoff runs; `install` sets that up when a status line exists, and `uninstall` restores it.
+
+**Background jobs.** `claude --bg` and agent view sessions run under Claude Code's daemon, never
+through the launcher, and need no setup. The hooks find the job from `CLAUDE_JOB_DIR` (its
+`state.json` says `"backend": "daemon"`, and `~/.claude/sessions/<pid>.json` names the job, so a
+claude started inside the job does not count). `/recompact`, automatic compaction, and checkpoint
+requests work as under the launcher; a ready request starts `recompact job-handoff`, which
+compacts while the job keeps working. A pause: `state.json` `tempo` is `idle` or `blocked` (a turn
+that ended asking the user something), not `active`; no tool call waits on a dialog; the
+transcript is still for 1.5s. The worker then runs `claude attach <short>` on a terminal of its
+own, the size of the job's terminal, presses Esc once, and types `/resume <twin>`. If the Esc
+shows "Esc again to clear", someone left text in the input box: it detaches and tries again 10s
+later (a second Esc would clear the text). Background shells, monitors, agents, and scheduled
+prompts keep running, and the job keeps its short id. When the switch does not take, the twin
+starts as a new job (`claude --bg --resume <twin>`, the job's restart flags, permission flags
+included, and its name), its first prompt restarts the old job's background work, and the old
+job is stopped once `claude agents --json` lists the new one. State and the worker's log:
+`~/.claude/recompact/jobs/<short>/`. Claude Code records the twin as the job's session only at
+the twin's first turn, so a `claude respawn` before that reopens the session as it was before
+the compaction.
 
 **On and off, per session.** Automatic compaction is off unless a session asks for it:
 `/recompact on` turns it on for this session and every continuation of it (the setting follows

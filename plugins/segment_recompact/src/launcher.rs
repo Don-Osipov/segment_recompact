@@ -15,6 +15,14 @@
 //! SIGTERM (Claude Code exits cleanly on it: terminal restored, transcript flushed, exit 143),
 //! compacts with progress on the terminal, and resumes the twin with the same flags.
 //!
+//! A background job (`claude --bg`, agent view) never runs through the launcher: Claude Code's
+//! daemon starts it on a terminal of its own. Its hooks find it from `CLAUDE_JOB_DIR` and keep
+//! the same files in `~/.claude/recompact/jobs/<short id>`, and start `recompact job-handoff`,
+//! which compacts, waits for the job to pause, opens it with `claude attach` on a terminal of its
+//! own, and types `/resume <twin>` there (measured, CLI 2.1.293: the job switches in place and
+//! keeps its short id and background work). When that does not take, the twin starts as a new
+//! job (`claude --bg --resume`) and the old one is stopped.
+//!
 //! The launcher exports `RECOMPACT_SHELL=<state dir>`. Each file there has one writer, so no
 //! process read-modify-writes another's state:
 //! - `config.json`: the launcher (its child's pid, thresholds, the re-arm floor, in-place mode)
@@ -27,6 +35,7 @@
 //! - `child.json`: `recompact pty-leader` (claude's pid, when claude runs under it)
 //! - `nudged.json`: the PostToolUse hook (the last checkpoint request)
 //! - `prewarm.json`: the Stop hook (the running background prewarm)
+//! - `worker.json`: `recompact job-handoff` (a background job's handoff worker)
 
 use std::fs;
 use std::io::{IsTerminal, Read, Seek, SeekFrom, Write};
@@ -145,7 +154,8 @@ fn get_s<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
     v.get(k).and_then(|x| x.as_str())
 }
 
-/// The launcher this process runs under, if any, and still alive.
+/// The launcher this process runs under (if any, and still alive), or the background job it
+/// runs in.
 pub struct Shell {
     pub dir: PathBuf,
     pub config: Value,
@@ -153,6 +163,14 @@ pub struct Shell {
 
 impl Shell {
     pub fn from_env() -> Option<Shell> {
+        let launcher = Shell::launcher_from_env();
+        if launcher.as_ref().is_some_and(|s| s.is_own_claude()) {
+            return launcher;
+        }
+        Shell::job_from_env().or(launcher)
+    }
+
+    fn launcher_from_env() -> Option<Shell> {
         let dir = PathBuf::from(std::env::var("RECOMPACT_SHELL").ok()?);
         let config = read_json(&dir.join("config.json"))?;
         let launcher = get_u(&config, "launcher")? as u32;
@@ -160,6 +178,19 @@ impl Shell {
             return None;
         }
         Some(Shell { dir, config })
+    }
+
+    /// The background job this process runs in, when it runs inside the job's own claude.
+    fn job_from_env() -> Option<Shell> {
+        let job = Job::from_env()?;
+        let pid = std::env::var("CLAUDE_PID").ok()?.parse::<u32>().ok()?;
+        runs_job(&home().join(".claude").join("sessions"), pid, &job.short)
+            .then(|| job_shell(&job, pid))
+    }
+
+    /// The short id of the background job this is the state of.
+    pub fn job(&self) -> Option<&str> {
+        get_s(&self.config, "job")
     }
 
     fn child(&self) -> u32 {
@@ -228,6 +259,200 @@ fn ancestors(depth: usize) -> Vec<u32> {
         }
     }
     out
+}
+
+// ------------------------------------------------------------------------------------ jobs
+
+/// A Claude Code background job (`claude --bg`, agent view). Its folder (`CLAUDE_JOB_DIR`) holds
+/// the daemon's `state.json`: the short id, whether a turn runs (`tempo`), queued prompts, the
+/// directory, and the flags it restarts with (measured, CLI 2.1.293).
+pub struct Job {
+    pub dir: PathBuf,
+    pub short: String,
+}
+
+impl Job {
+    pub fn at(dir: &Path) -> Option<Job> {
+        let state = read_json(&dir.join("state.json"))?;
+        if get_s(&state, "backend") != Some("daemon") {
+            return None;
+        }
+        let short = get_s(&state, "daemonShort")
+            .map(String::from)
+            .or_else(|| dir.file_name()?.to_str().map(String::from))?;
+        // It names a folder and goes on command lines.
+        (!short.is_empty() && short.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')).then(
+            || Job {
+                dir: dir.to_path_buf(),
+                short,
+            },
+        )
+    }
+
+    pub fn from_env() -> Option<Job> {
+        Job::at(Path::new(&std::env::var_os("CLAUDE_JOB_DIR")?))
+    }
+
+    pub fn state(&self) -> Value {
+        read_json(&self.dir.join("state.json")).unwrap_or(json!({}))
+    }
+}
+
+/// Is `pid` the job's own claude, rather than a claude started inside it that inherited
+/// `CLAUDE_JOB_DIR`? Claude Code records each running session in `sessions/<pid>.json`, with the
+/// job's short id only for the job itself (measured: a nested `claude -p` has none).
+pub fn runs_job(sessions: &Path, pid: u32, short: &str) -> bool {
+    read_json(&sessions.join(format!("{pid}.json")))
+        .is_some_and(|s| get_s(&s, "jobId") == Some(short))
+}
+
+pub fn job_state_dir(short: &str) -> PathBuf {
+    recompact_home().join("jobs").join(short)
+}
+
+/// The state a job's hooks and its handoff worker share, as a `Shell` for the job's claude
+/// `pid`. Only the re-arm floor persists (`config.json`, written by the worker); the rest is the
+/// launcher's defaults.
+pub fn job_shell(job: &Job, pid: u32) -> Shell {
+    let dir = job_state_dir(&job.short);
+    if !dir.exists() {
+        prune_job_states(job);
+        let _ = fs::create_dir_all(&dir);
+    }
+    let env_usize = |k: &str| std::env::var(k).ok().and_then(|s| s.parse::<usize>().ok());
+    let copts = continue_opts(&serde_json::Map::new(), Some("haiku"));
+    let mut config = json!({
+        "job": job.short, "job_dir": job.dir, "child": pid, "inplace": true,
+        "at": env_usize("RECOMPACT_AT"), "checkpoint_at": env_usize("RECOMPACT_CHECKPOINT_AT"),
+        "auto": std::env::var("RECOMPACT_AUTO").ok().map(|v| v != "0"),
+        "summarize": copts.summarize.is_some(),
+        "summarize_with": copts.summarize.as_ref().map(|c| c.model.clone()),
+        "target": copts.target,
+        "launch_model": job_origin(job).launch_model,
+    });
+    if let Some(Value::Object(saved)) = read_json(&dir.join("config.json")) {
+        for (k, v) in saved {
+            config[k] = v;
+        }
+    }
+    Shell { dir, config }
+}
+
+/// Dropped from a job's restart flags: the restart picks the session, model and effort itself,
+/// and the job's directory already exists.
+const JOB_SESSION_FLAGS: &[&str] = &[
+    "-r",
+    "--resume",
+    "-c",
+    "--continue",
+    "--session-id",
+    "--fork-session",
+    "--from-pr",
+    "--teleport",
+    "-w",
+    "--worktree",
+    "--tmux",
+    "--resume-session-at",
+    "--model",
+    "--effort",
+    "--bg",
+    "--background",
+    "-p",
+    "--print",
+];
+
+/// How a job restarts: the flags the daemon restarts it with (`respawnFlags`), less the
+/// session-selecting ones and its first prompt. Unlike a restart under the launcher, permission
+/// flags stay as they were: a background job may have no one to answer a permission prompt.
+/// Flags this cannot classify are all left out rather than risk mangling them.
+fn job_origin(job: &Job) -> Origin {
+    let state = job.state();
+    let flags: Vec<String> = state
+        .get("respawnFlags")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    let parsed = parse_claude_args(&flags);
+    let known = parsed
+        .iter()
+        .all(|a| a.flag.as_deref().is_none_or(known_flag));
+    let kept: Vec<Arg> = parsed
+        .iter()
+        .filter(|a| {
+            known
+                && a.flag
+                    .as_deref()
+                    .is_some_and(|f| !JOB_SESSION_FLAGS.contains(&f))
+        })
+        .cloned()
+        .collect();
+    let explicit = flag_value(&parsed, &["--model"]).map(String::from);
+    let cwd = get_s(&state, "cwd").map(PathBuf::from).unwrap_or_default();
+    Origin {
+        carry: flatten(&kept),
+        launch_model: explicit.clone().or_else(|| settings_model(&cwd)),
+        explicit_model: explicit.is_some(),
+        effort: flag_value(&parsed, &["--effort"]).map(String::from),
+    }
+}
+
+/// A claude the job's worker runs is a client of its own, not part of the job's session: it
+/// must not look like the job's claude or a child of it.
+fn plain_claude(cmd: &mut Command) {
+    for k in [
+        "CLAUDECODE",
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDE_CODE_SESSION_ATTENDED",
+        "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_EXECPATH",
+        "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN",
+        "CLAUDE_PID",
+        "CLAUDE_JOB_DIR",
+        "RECOMPACT_SHELL",
+    ] {
+        cmd.env_remove(k);
+    }
+}
+
+/// A one-time line for whoever next opens or finishes a turn in `session` (SessionStart or Stop).
+fn notice_path(session: &str) -> PathBuf {
+    let name: String = session
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    recompact_home()
+        .join("notices")
+        .join(format!("{name}.json"))
+}
+
+fn leave_notice(session: &str, message: &str) {
+    let path = notice_path(session);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    write_json(&path, &json!({"session": session, "message": message}));
+}
+
+pub fn take_notice(session: &str) -> Option<String> {
+    let path = notice_path(session);
+    let n = read_json(&path)?;
+    if get_s(&n, "session") != Some(session) {
+        return None;
+    }
+    let _ = fs::remove_file(&path);
+    get_s(&n, "message").map(String::from)
 }
 
 // ------------------------------------------------------------------------------------ sizing
@@ -381,6 +606,14 @@ pub fn on_session_start(input: &Value) {
     if !shell.is_own_claude() {
         return;
     }
+    write_session(&shell, input);
+    let start = shell.dir.join("start.json");
+    if !start.exists() {
+        write_json(&start, &json!({"cwd": get_s(input, "cwd")}));
+    }
+}
+
+fn write_session(shell: &Shell, input: &Value) {
     let Some(session) = hook_session(input) else {
         return;
     };
@@ -396,9 +629,13 @@ pub fn on_session_start(input: &Value) {
                 .map(|(t, _)| t),
         }),
     );
-    let start = shell.dir.join("start.json");
-    if !start.exists() {
-        write_json(&start, &json!({"cwd": get_s(input, "cwd")}));
+}
+
+/// A job whose claude started before recompact's hooks were on has no record of its session
+/// yet; the session its hooks report is the one it has open.
+fn track_job(shell: &Shell, input: &Value) {
+    if shell.job().is_some() && shell.session().is_none() {
+        write_session(shell, input);
     }
 }
 
@@ -529,6 +766,278 @@ fn claude_idle(p: &Proxy, transcript: &Path, r: &mut Ready) -> Idle {
     }
 }
 
+/// Is a background job at a pause? Its `state.json` says whether a turn runs: `tempo` is
+/// `active` during one, `idle` after it, and `blocked` after a turn that ended asking the user
+/// something. `state` stays `working` while a background task runs after the turn ended, and
+/// `inFlight.queued` can stay 1 while a job waits for the user, so neither says anything about
+/// turns (measured, CLI 2.1.293). A queued prompt that does start writes to the transcript
+/// within the settle time. Any other `tempo`: the transcript tells.
+fn job_busy(state: &Value, transcript: &Path) -> bool {
+    match get_s(state, "tempo") {
+        Some("active") => true,
+        Some("idle" | "blocked") => false,
+        _ => !turn_ended(transcript),
+    }
+}
+
+fn job_wait(state: &Value, transcript: &Path, r: &mut Ready) -> &'static str {
+    if job_busy(state, transcript) {
+        "turn"
+    } else if *r
+        .waiting
+        .get_or_insert_with(|| tool_call_waiting(transcript))
+    {
+        "answer"
+    } else {
+        "quiet"
+    }
+}
+
+/// Whether claude's input box can be taken for typing.
+enum Take {
+    Yes,
+    /// Not now: it holds text.
+    NotNow,
+    /// Claude cannot be reached to type into; the switch falls back to a restart.
+    Never,
+}
+
+/// The claude a switch in place types into: on the launcher's own terminal, or a background job
+/// opened with `claude attach`.
+trait Term {
+    /// What the switch waits for: `turn`, `answer`, `typing`, `draft`, `unknown`, or `quiet` at
+    /// a pause it may type at.
+    fn wait(&self, transcript: &Path, r: &mut Ready) -> &'static str;
+    /// No key has reached claude for a while.
+    fn settled(&self) -> bool;
+    /// Make sure the input box is empty and stays so while recompact types.
+    fn take(&mut self) -> Take;
+    /// Give the input box back.
+    fn give_back(&mut self);
+    fn type_resume(&mut self, twin: &str);
+    fn type_prompt(&mut self, text: &str);
+}
+
+/// Type `/resume <twin>` and Enter. Esc first closes a picker or dialog left open (at the prompt
+/// it does nothing); the pause after it keeps Esc from reading as Alt with the next key.
+fn type_resume_with(keys: &dyn Fn(&[u8]) -> bool, twin: &str, esc: bool) {
+    if esc {
+        keys(b"\x1b");
+        std::thread::sleep(Duration::from_millis(800));
+    }
+    keys(format!("/resume {twin}").as_bytes());
+    std::thread::sleep(Duration::from_millis(500));
+    keys(b"\r");
+}
+
+/// Type a prompt into the twin once its conversation has finished drawing.
+fn type_prompt_with(keys: &dyn Fn(&[u8]) -> bool, text: &str) {
+    std::thread::sleep(Duration::from_millis(1500));
+    keys(text.as_bytes());
+    std::thread::sleep(Duration::from_millis(500));
+    keys(b"\r");
+}
+
+/// Claude on the launcher's terminal: the user's keys pass through it, so the input box is
+/// followed and keys can be held.
+struct Own<'a>(&'a Proxy);
+
+impl Term for Own<'_> {
+    fn wait(&self, transcript: &Path, r: &mut Ready) -> &'static str {
+        match claude_idle(self.0, transcript, r) {
+            Idle::Busy => "turn",
+            Idle::Asking => "answer",
+            Idle::Yes if self.0.input_clean() => "quiet",
+            Idle::Yes => match self.0.input_box() {
+                InputBox::Unknown => "unknown",
+                InputBox::Empty => "typing",
+                InputBox::Text(_) | InputBox::Draft => "draft",
+            },
+        }
+    }
+
+    fn settled(&self) -> bool {
+        self.0.quiet_for() >= SETTLE
+    }
+
+    fn take(&mut self) -> Take {
+        self.0.hold();
+        if self.0.input_clean() {
+            Take::Yes
+        } else {
+            self.0.release();
+            Take::NotNow
+        }
+    }
+
+    fn give_back(&mut self) {
+        self.0.release();
+    }
+
+    fn type_resume(&mut self, twin: &str) {
+        type_resume_with(&|b| self.0.type_keys(b), twin, true);
+    }
+
+    fn type_prompt(&mut self, text: &str) {
+        type_prompt_with(&|b| self.0.type_keys(b), text);
+    }
+}
+
+/// After a draft turned up, the job is left alone this long before it is checked again.
+const DRAFT_BACKOFF: Duration = Duration::from_secs(10);
+/// Two Escs closer than this would clear a draft (Claude Code: "Esc again to clear").
+const ESC_GAP: Duration = Duration::from_secs(3);
+
+/// A background job, opened with `claude attach` only for the switch itself. No keys pass
+/// through recompact, so a draft in the job's input box shows only on its screen: Esc on a box
+/// with text makes Claude Code say "Esc again to clear" (measured, CLI 2.1.293). A draft typed
+/// after that check still cannot reach the model: the UserPromptSubmit hook blocks a prompt that
+/// carries the `/resume` (`switch_collision`).
+struct Attached<'a> {
+    job: &'a Job,
+    bin: &'a str,
+    /// The job's claude, whose terminal size an attach takes.
+    pid: u32,
+    term: Option<crate::term::Attach>,
+    esc_at: Option<Instant>,
+    draft_at: Option<Instant>,
+}
+
+impl<'a> Attached<'a> {
+    fn new(job: &'a Job, bin: &'a str, pid: u32) -> Attached<'a> {
+        Attached {
+            job,
+            bin,
+            pid,
+            term: None,
+            esc_at: None,
+            draft_at: None,
+        }
+    }
+
+    /// An Esc now neither clears a draft (a second Esc soon after the first) nor interrupts a turn
+    /// that started since the last look (attaching takes a moment).
+    fn esc_ok(&self) -> bool {
+        self.esc_at.is_none_or(|at| at.elapsed() >= ESC_GAP)
+            && get_s(&self.job.state(), "tempo") != Some("active")
+    }
+
+    /// Attached, or attach now (a second try after a pause: the daemon may be busy).
+    fn ensure_attached(&mut self) -> bool {
+        if !self.term.as_mut().is_some_and(|t| t.running()) {
+            self.term = None;
+        }
+        for pause in [0u64, 2000] {
+            if self.term.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(pause));
+            self.term = attach(self.bin, &self.job.short, self.pid);
+        }
+        self.term.is_some()
+    }
+}
+
+/// The terminal `pid` runs on, as `ps` names it.
+fn tty_of(pid: u32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-o", "tty=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|t| !t.is_empty())
+}
+
+/// Open a background job with `claude attach` on a terminal the size of the job's own (a person
+/// attached to it sees no resize), and wait until it has drawn.
+fn attach(bin: &str, short: &str, pid: u32) -> Option<crate::term::Attach> {
+    let (rows, cols) = tty_of(pid)
+        .and_then(|t| crate::term::tty_size(&t))
+        .unwrap_or((50, 200));
+    let mut cmd = Command::new(bin);
+    cmd.args(["attach", short]);
+    plain_claude(&mut cmd);
+    let mut t = crate::term::Attach::open(&mut cmd, rows, cols).ok()?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if !t.running() {
+            return None;
+        }
+        match t.still_for() {
+            Some(d) if d >= Duration::from_millis(700) => return Some(t),
+            drawn if Instant::now() > deadline => return drawn.map(|_| t),
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+impl Term for Attached<'_> {
+    fn wait(&self, transcript: &Path, r: &mut Ready) -> &'static str {
+        if self.draft_at.is_some_and(|t| t.elapsed() < DRAFT_BACKOFF) {
+            return "draft";
+        }
+        job_wait(&self.job.state(), transcript, r)
+    }
+
+    fn settled(&self) -> bool {
+        true
+    }
+
+    fn take(&mut self) -> Take {
+        if !self.esc_ok() {
+            return Take::NotNow;
+        }
+        if !self.ensure_attached() {
+            return Take::Never;
+        }
+        if !self.esc_ok() {
+            self.give_back();
+            return Take::NotNow;
+        }
+        let Some(t) = self.term.as_ref() else {
+            return Take::Never;
+        };
+        let mark = t.mark();
+        t.type_keys(b"\x1b");
+        self.esc_at = Some(Instant::now());
+        std::thread::sleep(Duration::from_millis(800));
+        if t.text_since(mark).contains("Escagaintoclear") {
+            self.draft_at = Some(Instant::now());
+            self.give_back();
+            return Take::NotNow;
+        }
+        Take::Yes
+    }
+
+    fn give_back(&mut self) {
+        if let Some(t) = self.term.take() {
+            t.detach();
+        }
+    }
+
+    fn type_resume(&mut self, twin: &str) {
+        if !self.ensure_attached() {
+            return;
+        }
+        let esc = self.esc_ok();
+        if esc {
+            self.esc_at = Some(Instant::now());
+        }
+        if let Some(t) = self.term.as_ref() {
+            type_resume_with(&|b| t.type_keys(b), twin, esc);
+        }
+    }
+
+    fn type_prompt(&mut self, text: &str) {
+        if !self.ensure_attached() {
+            return;
+        }
+        if let Some(t) = self.term.as_ref() {
+            type_prompt_with(&|b| t.type_keys(b), text);
+        }
+    }
+}
+
 /// Did the session add a prompt, a task notice or a reply after its record `uuid`? Unknown
 /// counts as yes.
 pub fn activity_after(transcript: &Path, uuid: &str) -> bool {
@@ -565,10 +1074,12 @@ fn in_place(shell: &Shell) -> bool {
     shell.config.get("inplace") == Some(&json!(true))
 }
 
-/// An in-place handoff for this session is already under way.
+/// An in-place handoff for this session is already under way (in a process still running it).
 fn in_flight(shell: &Shell, session: &str) -> bool {
-    read_json(&shell.dir.join("handoff.json"))
-        .is_some_and(|h| get_s(&h, "session") == Some(session))
+    read_json(&shell.dir.join("handoff.json")).is_some_and(|h| {
+        get_s(&h, "session") == Some(session)
+            && get_u(&h, "pid").is_none_or(|p| pid_alive(p as u32))
+    })
 }
 
 /// SessionStart of the twin a switch in place opened: a line for the user and, when work was
@@ -627,6 +1138,52 @@ fn request(shell: &Shell, input: &Value, reason: &str, kick: bool, force: bool, 
             "carry": carry_for(shell, hook_session(input)),
         }),
     );
+    if ready {
+        wake(shell);
+    }
+}
+
+/// The launcher watches for requests itself; a background job has no one watching, so a ready
+/// request starts its handoff worker (detached, like the prewarm), unless one runs already.
+fn wake(shell: &Shell) {
+    let (Some(dir), Some(pid)) = (
+        get_s(&shell.config, "job_dir"),
+        get_u(&shell.config, "child"),
+    ) else {
+        return;
+    };
+    let marker = shell.dir.join("worker.json");
+    if marked_process(&marker, " job-handoff ").is_some() {
+        return;
+    }
+    let Some(bin) = get_s(&shell.config, "worker_bin")
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+    else {
+        return;
+    };
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(shell.dir.join("worker.log"));
+    let mut cmd = Command::new(bin);
+    cmd.arg("job-handoff")
+        .arg(dir)
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log.map(Stdio::from).unwrap_or_else(|_| Stdio::null()))
+        .env_remove("RECOMPACT_SHELL");
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            setsid();
+            Ok(())
+        });
+    }
+    if let Ok(child) = cmd.spawn() {
+        write_json(&marker, &json!({"pid": child.id()}));
+    }
 }
 
 // ------------------------------------------------------------------------------------ carry
@@ -758,11 +1315,16 @@ pub fn on_prompt_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
         "/recompact setup" | "/segment-recompact:recompact setup"
     ) {
         let (ok, lines) = install(None);
-        let text = if ok {
+        let mut text = if ok {
             lines.join(" ")
         } else {
             format!("recompact setup failed: {}", lines.join(" "))
         };
+        if let Some(short) = shell.as_ref().and_then(Shell::job) {
+            text.push_str(&format!(
+                " Background job {short} needs none of this: it compacts in place as it is."
+            ));
+        }
         return Some(block(text));
     }
     if let Some((cmd, arg)) = switch_command(prompt) {
@@ -785,6 +1347,7 @@ pub fn on_prompt_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
     }
     let shell = shell?;
     let session = hook_session(input)?;
+    track_job(&shell, input);
     if !shell.tracks(session) && !shell.is_own_claude() {
         return None;
     }
@@ -858,6 +1421,7 @@ pub fn on_stop_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
     let Some(shell) = shell else {
         return suggest(session, &transcript);
     };
+    track_job(&shell, input);
     if !shell.tracks(session) {
         return None;
     }
@@ -871,6 +1435,7 @@ pub fn on_stop_in(shell: Option<Shell>, input: &Value) -> Option<Value> {
         if get_s(&req, "session") == Some(session) && req.get("ready") != Some(&json!(true)) {
             req["ready"] = json!(true);
             write_json(&shell.dir.join("request.json"), &req);
+            wake(&shell);
             return Some(json!({"systemMessage": if switching {
                 "recompact · compacting; switches to the compacted copy in a moment"
             } else {
@@ -953,6 +1518,7 @@ pub fn on_post_tool_use_in(shell: Option<Shell>, input: &Value) -> Option<Value>
     }
     let shell = shell?;
     let session = hook_session(input)?;
+    track_job(&shell, input);
     if !shell.tracks(session) || !auto_on(&shell.config, Some(session)) {
         return None;
     }
@@ -1001,19 +1567,24 @@ fn suggest(session: &str, transcript: &Path) -> Option<Value> {
 once to have it happen by itself.", fmt_k(live))}))
 }
 
-fn prewarm_running(marker: &Path) -> Option<u32> {
+/// The process `marker` names, if it is still running as `recompact <role>` (`" prewarm "`,
+/// `" job-handoff "`): the pid may have been reused since.
+fn marked_process(marker: &Path, role: &str) -> Option<u32> {
     let pid = get_u(&read_json(marker)?, "pid")? as u32;
     if !pid_alive(pid) {
         return None;
     }
-    // The pid may have been reused since; only a prewarm is ours to stop.
     let cmd = Command::new("ps")
         .args(["-o", "command=", "-p", &pid.to_string()])
         .output()
         .ok()?;
     String::from_utf8_lossy(&cmd.stdout)
-        .contains(" prewarm ")
+        .contains(role)
         .then_some(pid)
+}
+
+fn prewarm_running(marker: &Path) -> Option<u32> {
+    marked_process(marker, " prewarm ")
 }
 
 fn maybe_prewarm(shell: &Shell, session: &str, transcript: &Path, live: usize, target: usize) {
@@ -1197,9 +1768,17 @@ pub fn cmd_handoff(args: &[String]) -> i32 {
                         "kick": kick, "force": true, "ready": false}),
             );
             println!(
-                "Handoff queued. When this turn ends, recompact compacts session {} and resumes it in this terminal{}.",
+                "Handoff queued. When this turn ends, recompact compacts session {} and {}{}.",
                 short_id(&session),
-                if kick { ", and the resumed session continues the work" } else { "" }
+                match shell.job() {
+                    Some(short) => format!("switches background job {short} to the compacted copy"),
+                    None => "resumes it in this terminal".into(),
+                },
+                if kick {
+                    ", and the resumed session continues the work"
+                } else {
+                    ""
+                }
             );
             return 0;
         }
@@ -2020,16 +2599,6 @@ fn tracked_session(state: &Path) -> Option<String> {
     read_json(&state.join("session.json")).and_then(|s| get_s(&s, "session").map(String::from))
 }
 
-/// Type `/resume <twin>` into claude. Esc first closes a picker or dialog left open (at the
-/// prompt it does nothing); the pause after it keeps Esc from reading as Alt with the next key.
-fn type_resume(p: &Proxy, twin: &str) {
-    p.type_keys(b"\x1b");
-    std::thread::sleep(Duration::from_millis(800));
-    p.type_keys(format!("/resume {twin}").as_bytes());
-    std::thread::sleep(Duration::from_millis(500));
-    p.type_keys(b"\r");
-}
-
 /// Typed into the terminal, these compact without a model turn or a hook (see `is_bare_recompact`).
 const TYPED: &[&str] = &["/recompact", "/segment-recompact:recompact"];
 
@@ -2048,7 +2617,10 @@ fn start_handoff(ip: &InPlace, mut req: Value) -> Option<Handoff> {
     req["transcript"] = json!(transcript);
     let at = handoff_at(&req, ip.l, ip.origin, &transcript);
     stop_prewarm(ip.state);
-    write_json(&ip.state.join("handoff.json"), &json!({"session": session}));
+    write_json(
+        &ip.state.join("handoff.json"),
+        &json!({"session": session, "pid": std::process::id()}),
+    );
     let live = live_tokens(&transcript).unwrap_or(0);
     let feed = ip.state.join("progress.json");
     let _ = fs::remove_file(&feed);
@@ -2089,7 +2661,7 @@ fn switch_notice(h: &Handoff, twin: &str, est: usize) -> Value {
     })
 }
 
-fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
+fn step(h: &mut Handoff, ip: &mut InPlace, t: &mut dyn Term) -> Next {
     let tracked = tracked_session(ip.state);
     let (next, phase) = match h.phase.take() {
         None => (Next::Done, None),
@@ -2131,7 +2703,7 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
         },
         Some(Phase::Ready(r)) if tracked.as_deref() == Some(r.twin.as_str()) => {
             // The user typed `/resume <twin>` themselves: that is the switch.
-            (finish_switch(h, ip, p, &r.twin, r.est), None)
+            (finish_switch(h, ip, t, &r.twin, r.est), None)
         }
         Some(Phase::Ready(mut r)) => {
             let len = file_len(&h.transcript);
@@ -2140,17 +2712,8 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
                 r.since = Instant::now();
                 r.waiting = None;
             }
-            let settled = r.since.elapsed() >= SETTLE && p.quiet_for() >= SETTLE;
-            let wait = match claude_idle(p, &h.transcript, &mut r) {
-                Idle::Busy => "turn",
-                Idle::Asking => "answer",
-                Idle::Yes if p.input_clean() => "quiet",
-                Idle::Yes => match p.input_box() {
-                    InputBox::Unknown => "unknown",
-                    InputBox::Empty => "typing",
-                    InputBox::Text(_) | InputBox::Draft => "draft",
-                },
-            };
+            let settled = r.since.elapsed() >= SETTLE && t.settled();
+            let wait = t.wait(&h.transcript, &mut r);
             if wait != r.wait {
                 crate::progress_update(json!({"wait": wait}));
                 r.wait = wait;
@@ -2163,38 +2726,44 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
             } else if !(settled && wait == "quiet") {
                 (Next::Wait, Some(Phase::Ready(r)))
             } else {
-                p.hold();
-                if !p.input_clean() {
-                    p.release();
-                    (Next::Wait, Some(Phase::Ready(r)))
-                } else if activity_after(&h.transcript, &r.covered) {
-                    // The session moved on while compacting: build again from where it is now.
-                    p.release();
-                    discard(&h.transcript, &r.twin);
-                    if h.rebuilds >= 3 {
+                match t.take() {
+                    Take::NotNow => (Next::Wait, Some(Phase::Ready(r))),
+                    Take::Never => {
                         progress_end(ip.state, None);
-                        (Next::Done, None)
-                    } else {
-                        h.rebuilds += 1;
-                        crate::progress_update(json!({"phase": "reading", "done": 0, "total": 0}));
-                        (Next::Wait, Some(build(&h.req, ip.copts, h.at)))
+                        (Next::Restart(r.twin, r.est), None)
                     }
-                } else {
-                    write_json(
-                        &ip.state.join("switch.json"),
-                        &switch_notice(h, &r.twin, r.est),
-                    );
-                    crate::progress_update(json!({"phase": "switching"}));
-                    type_resume(p, &r.twin);
-                    (
-                        Next::Wait,
-                        Some(Phase::Switching {
-                            twin: r.twin,
-                            est: r.est,
-                            since: Instant::now(),
-                            tries: 1,
-                        }),
-                    )
+                    Take::Yes if activity_after(&h.transcript, &r.covered) => {
+                        // The session moved on while compacting: build again from where it is now.
+                        t.give_back();
+                        discard(&h.transcript, &r.twin);
+                        if h.rebuilds >= 3 {
+                            progress_end(ip.state, None);
+                            (Next::Done, None)
+                        } else {
+                            h.rebuilds += 1;
+                            crate::progress_update(
+                                json!({"phase": "reading", "done": 0, "total": 0}),
+                            );
+                            (Next::Wait, Some(build(&h.req, ip.copts, h.at)))
+                        }
+                    }
+                    Take::Yes => {
+                        write_json(
+                            &ip.state.join("switch.json"),
+                            &switch_notice(h, &r.twin, r.est),
+                        );
+                        crate::progress_update(json!({"phase": "switching"}));
+                        t.type_resume(&r.twin);
+                        (
+                            Next::Wait,
+                            Some(Phase::Switching {
+                                twin: r.twin,
+                                est: r.est,
+                                since: Instant::now(),
+                                tries: 1,
+                            }),
+                        )
+                    }
                 }
             }
         }
@@ -2205,7 +2774,7 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
             tries,
         }) => {
             if tracked.as_deref() == Some(twin.as_str()) {
-                (finish_switch(h, ip, p, &twin, est), None)
+                (finish_switch(h, ip, t, &twin, est), None)
             } else if since.elapsed() < ip.l.switch_timeout {
                 (
                     Next::Wait,
@@ -2217,7 +2786,7 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
                     }),
                 )
             } else if tries < 2 {
-                type_resume(p, &twin);
+                t.type_resume(&twin);
                 (
                     Next::Wait,
                     Some(Phase::Switching {
@@ -2239,7 +2808,7 @@ fn step(h: &mut Handoff, ip: &mut InPlace, p: &Proxy) -> Next {
 }
 
 /// Claude now has the twin open: re-arm, continue the work if it was mid-task, report.
-fn finish_switch(h: &Handoff, ip: &mut InPlace, p: &Proxy, twin: &str, est: usize) -> Next {
+fn finish_switch(h: &Handoff, ip: &mut InPlace, t: &mut dyn Term, twin: &str, est: usize) -> Next {
     ip.rearm = rearm_for(est, h.at);
     write_json(
         &ip.state.join("config.json"),
@@ -2250,13 +2819,9 @@ fn finish_switch(h: &Handoff, ip: &mut InPlace, p: &Proxy, twin: &str, est: usiz
         .then(|| ip.l.kick.clone())
         .or_else(|| has_active_goal(&records).then(|| "continue".to_string()));
     if let Some(k) = kick {
-        // Let the resumed conversation finish drawing before typing into it.
-        std::thread::sleep(Duration::from_millis(1500));
-        p.type_keys(k.as_bytes());
-        std::thread::sleep(Duration::from_millis(500));
-        p.type_keys(b"\r");
+        t.type_prompt(&k);
     }
-    p.release();
+    t.give_back();
     progress_end(ip.state, Some("done"));
     say(&format!(
         "switched in place to {} ({} → ~{})",
@@ -2351,7 +2916,7 @@ fn supervise_in_place(
             }
         }
         if let Some(h) = job.as_mut() {
-            match step(h, ip, p) {
+            match step(h, ip, &mut Own(p)) {
                 Next::Wait => {}
                 Next::Done => {
                     job = None;
@@ -2552,6 +3117,257 @@ fn prune_stale_states(root: &Path) {
     for e in rd.flatten() {
         let pid = e.file_name().to_string_lossy().parse::<u32>().unwrap_or(0);
         if pid != 0 && pid != std::process::id() && !pid_alive(pid) {
+            let _ = fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+// ------------------------------------------------------------------------------------ job handoff
+
+/// The claude a job's worker runs: `RECOMPACT_CLAUDE_BIN` (or `--claude-bin`), else `claude`
+/// on the PATH, else the binary the job itself runs.
+fn job_claude_bin(l: &Launch) -> String {
+    let on_path = std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(&l.bin).is_file()));
+    if l.bin != "claude" || on_path {
+        return l.bin.clone();
+    }
+    std::env::var("CLAUDE_CODE_EXECPATH")
+        .ok()
+        .filter(|p| Path::new(p).is_file())
+        .unwrap_or_else(|| l.bin.clone())
+}
+
+/// `recompact job-handoff <job dir> <claude pid> [shell options]`: hand a background job off in
+/// place. Its hooks start this, detached, for a ready request. It compacts while the job keeps
+/// working, waits for a pause, attaches, types `/resume <twin>`, and detaches. It takes requests
+/// until none is left, and stops when the job's claude does.
+pub fn cmd_job_handoff(args: &[String]) -> i32 {
+    let (Some(dir), Some(pid)) = (
+        args.first(),
+        args.get(1).and_then(|p| p.parse::<u32>().ok()),
+    ) else {
+        eprintln!("usage: recompact job-handoff <job dir> <claude pid>");
+        return 2;
+    };
+    let Some(job) = Job::at(Path::new(dir)) else {
+        eprintln!("job-handoff: {dir} is not a background job");
+        return 1;
+    };
+    let (l, _) = split_launcher_args(&args[2..]);
+    let bin = job_claude_bin(&l);
+    let shell = job_shell(&job, pid);
+    let state = shell.dir.clone();
+    let marker = state.join("worker.json");
+    if marked_process(&marker, " job-handoff ").is_some_and(|w| w != std::process::id()) {
+        return 0;
+    }
+    write_json(&marker, &json!({"pid": std::process::id()}));
+    prune_job_states(&job);
+    let copts = continue_opts(&l.copts_raw, Some("haiku"));
+    let origin = job_origin(&job);
+    let config = |_: u32, rearm: usize| json!({ "rearm": rearm });
+    let mut ip = InPlace {
+        l: &l,
+        copts: &copts,
+        origin: &origin,
+        state: &state,
+        pid,
+        claude: pid,
+        rearm: get_u(&shell.config, "rearm").unwrap_or(0),
+        config: &config,
+    };
+    let mut term = Attached::new(&job, &bin, pid);
+    let req_path = state.join("request.json");
+    let mut current: Option<Handoff> = None;
+    loop {
+        if !pid_alive(pid) {
+            // The job stopped or restarted: there is nothing to switch.
+            if let Some(h) = current.take() {
+                abandon(h, &state);
+            }
+            let _ = fs::remove_file(state.join("handoff.json"));
+            break;
+        }
+        let Some(h) = current.as_mut() else {
+            let Some(req) = read_json(&req_path).filter(|r| r.get("ready") == Some(&json!(true)))
+            else {
+                break;
+            };
+            let _ = fs::remove_file(&req_path);
+            current = start_handoff(&ip, req);
+            continue;
+        };
+        match step(h, &mut ip, &mut term) {
+            Next::Wait => {}
+            Next::Done => {
+                current = None;
+                let _ = fs::remove_file(state.join("handoff.json"));
+            }
+            Next::Restart(twin, est) => {
+                term.give_back();
+                if let Some(h) = current.take() {
+                    restart_job(&job, &ip, &bin, &h, &twin, est);
+                }
+                let _ = fs::remove_file(state.join("handoff.json"));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    term.give_back();
+    if read_json(&marker).and_then(|m| get_u(&m, "pid")) == Some(std::process::id() as usize) {
+        let _ = fs::remove_file(&marker);
+    }
+    0
+}
+
+/// The switch did not take: start the twin as a new background job (`claude --bg --resume`) and
+/// stop the old job once the new one runs. The old job's background work ends with it, so the
+/// twin's first prompt restarts it, and the twin's first session start says what happened.
+fn restart_job(job: &Job, ip: &InPlace, bin: &str, h: &Handoff, twin: &str, est: usize) -> bool {
+    let kick = h.req.get("kick") == Some(&json!(true));
+    let carry = h.req.get("carry").cloned().unwrap_or(json!({}));
+    let prompt = restore_prompt(&carry, kick).or_else(|| kick.then(|| ip.l.kick.clone()));
+    let state = job.state();
+    let mut args = vec!["--bg".to_string()];
+    // A new job is otherwise named after its first prompt; keep the name the old one showed.
+    let named = ip
+        .origin
+        .carry
+        .iter()
+        .any(|a| a == "-n" || a == "--name" || a.starts_with("--name="));
+    if let Some(name) = get_s(&state, "name").filter(|n| !named && !n.is_empty()) {
+        args.extend(["--name".to_string(), name.to_string()]);
+    }
+    args.extend(relaunch_args(
+        ip.origin,
+        twin,
+        &h.transcript,
+        prompt.as_deref(),
+    ));
+    leave_notice(
+        twin,
+        &format!(
+            "recompact · compacted {} → ~{} into this new background job: background job {} could \
+not be switched in place, so it was stopped{}",
+            fmt_k(h.live),
+            fmt_k(est),
+            job.short,
+            if carry_items(&carry).is_empty() {
+                ""
+            } else {
+                "; its background work is restarted here"
+            }
+        ),
+    );
+    let mut cmd = Command::new(bin);
+    cmd.args(&args).stdin(Stdio::null()).stderr(Stdio::null());
+    plain_claude(&mut cmd);
+    if let Some(cwd) = get_s(&state, "cwd")
+        .map(PathBuf::from)
+        .filter(|d| d.is_dir())
+    {
+        cmd.current_dir(cwd);
+    }
+    let printed = cmd
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let named = printed.as_deref().and_then(started_job);
+    let new = printed
+        .as_ref()
+        .and_then(|_| wait_for_job(bin, named.as_deref(), twin));
+    let Some(short) = new else {
+        let _ = fs::remove_file(notice_path(twin));
+        leave_notice(
+            &h.session,
+            &format!(
+                "recompact: this background job could not be switched to its compacted copy. \
+`claude --resume {twin}` opens the copy, or `claude --bg --resume {twin}` as a new job."
+            ),
+        );
+        say(&format!(
+            "could not switch job {} or start {} as a new one",
+            job.short,
+            short_id(twin)
+        ));
+        return false;
+    };
+    let _ = fs::create_dir_all(job_state_dir(&short));
+    write_json(
+        &job_state_dir(&short).join("config.json"),
+        &json!({"rearm": rearm_for(est, h.at)}),
+    );
+    let mut stop = Command::new(bin);
+    stop.args(["stop", &job.short])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    plain_claude(&mut stop);
+    let _ = stop.status();
+    say(&format!(
+        "job {} could not be switched in place: started job {short} on the compacted session {}, \
+then stopped job {}",
+        job.short,
+        short_id(twin),
+        job.short
+    ));
+    true
+}
+
+/// The short id `claude --bg` prints: `backgrounded · 1a2b3c4d`, then (CLI 2.1.293) the job's
+/// name and, without a prompt, a hint that it waits for one.
+fn started_job(printed: &str) -> Option<String> {
+    printed
+        .lines()
+        .find_map(|l| {
+            let mut words = l.split_whitespace();
+            (words.next()? == "backgrounded").then_some(())?;
+            words.find(|w| *w != "·")
+        })
+        .filter(|s| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+        .map(String::from)
+}
+
+/// Wait, up to a minute, until `claude agents --json` lists the new job with a process; its
+/// short id.
+fn wait_for_job(bin: &str, short: Option<&str>, session: &str) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut cmd = Command::new(bin);
+        cmd.args(["agents", "--json"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        plain_claude(&mut cmd);
+        let list = cmd
+            .output()
+            .ok()
+            .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok());
+        for a in list.iter().filter_map(Value::as_array).flatten() {
+            let id = get_s(a, "id");
+            let ours = (short.is_some() && id == short) || get_s(a, "sessionId") == Some(session);
+            if ours && get_s(a, "kind") == Some("background") && a.get("pid").is_some() {
+                return id.or(short).map(String::from);
+            }
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Forget the state of jobs that no longer exist (`claude rm`).
+fn prune_job_states(job: &Job) {
+    let Some(jobs) = job.dir.parent() else {
+        return;
+    };
+    let Ok(rd) = fs::read_dir(recompact_home().join("jobs")) else {
+        return;
+    };
+    for e in rd.flatten() {
+        if !jobs.join(e.file_name()).exists() {
             let _ = fs::remove_dir_all(e.path());
         }
     }
@@ -2817,10 +3633,14 @@ old setup until restarted. Check with `recompact doctor`; undo with `recompact u
 }
 
 /// Why this claude cannot compact in place, if it cannot, and what fixes it. `None` when it
-/// runs under the launcher, or the user removed the setup on purpose.
-pub fn setup_gap(under_launcher: bool) -> Option<String> {
-    if under_launcher || recompact_home().join("declined").exists() {
+/// runs under the launcher or is a background job recompact drives (`managed`), or the user
+/// removed the setup on purpose.
+pub fn setup_gap(managed: bool) -> Option<String> {
+    if managed || recompact_home().join("declined").exists() {
         return None;
+    }
+    if let Some(job) = Job::from_env() {
+        return Some(unidentified_job(&job));
     }
     match rc_file() {
         Err(_) => Some(
@@ -2852,6 +3672,16 @@ once, then open a new terminal."
             }
         }
     }
+}
+
+/// A background job whose claude `runs_job` cannot confirm (Claude Code changed how it records
+/// sessions): no setup or new terminal changes that.
+fn unidentified_job(job: &Job) -> String {
+    format!(
+        "recompact: background job {} cannot compact in place (recompact could not identify its \
+claude process), so /recompact here compacts and prints a resume command.",
+        job.short
+    )
 }
 
 /// At session start, say once a day when this claude cannot compact in place and why.
@@ -3013,13 +3843,20 @@ pub fn doctor_report(home: &Path, rc: Option<&Path>) -> (Vec<String>, bool) {
         None => lines.push("note  shell is not zsh or bash: see `recompact install`".into()),
     }
     if std::env::var("CLAUDE_CODE_SESSION_ID").is_ok() {
-        let managed = Shell::from_env().is_some_and(|s| s.is_own_claude());
-        lines.push(if managed {
-            "ok    this claude session runs through recompact".into()
-        } else {
-            "note  this claude session started before setup: /recompact here compacts and prints a \
-resume command; sessions started from a new terminal compact in place"
-                .into()
+        let shell = Shell::from_env().filter(|s| s.is_own_claude());
+        lines.push(match (shell.as_ref().map(Shell::job), Job::from_env()) {
+            (Some(Some(short)), _) => format!(
+                "ok    this claude session is background job {short}: it compacts in place through \
+`claude attach`"
+            ),
+            (Some(None), _) => "ok    this claude session runs through recompact".into(),
+            (None, Some(job)) => format!(
+                "note  {}",
+                unidentified_job(&job).trim_start_matches("recompact: ")
+            ),
+            (None, None) => "note  this claude session started before setup: /recompact here \
+compacts and prints a resume command; sessions started from a new terminal compact in place"
+                .into(),
         });
     }
     let defaults = user_settings();
@@ -3334,10 +4171,16 @@ to checkpoint first. /recompact off turns it off.",
         ),
     };
     if on && !managed {
-        text.push_str(
-            " This claude was not started through recompact, so it cannot compact in place: run \
-/recompact setup once, then open a new terminal.",
-        );
+        match Job::from_env() {
+            Some(job) => {
+                text.push(' ');
+                text.push_str(unidentified_job(&job).trim_start_matches("recompact: "));
+            }
+            None => text.push_str(
+                " This claude was not started through recompact, so it cannot compact in place: \
+run /recompact setup once, then open a new terminal.",
+            ),
+        }
     }
     text.trim_end().to_string()
 }

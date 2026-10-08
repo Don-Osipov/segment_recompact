@@ -39,7 +39,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ -n \"$RECOMPACT_SHELL\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook post-tool-use 2>/dev/null || true",
+            "command": "[ -n \"$RECOMPACT_SHELL$CLAUDE_JOB_DIR\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook post-tool-use 2>/dev/null || true",
             "timeout": 5
           }
         ]
