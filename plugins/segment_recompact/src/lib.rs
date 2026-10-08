@@ -29,7 +29,8 @@ pub use statusline::{
     cmd_statusline, render_progress, status_line, with_statusline, without_statusline, wrapped_command,
 };
 pub use term::{
-    cmd_pty_leader, title_state, InputBox, InputKind, InputSplitter, TitleState, TitleWatch,
+    cmd_pty_leader, plain_text, title_state, InputBox, InputKind, InputSplitter, TitleState,
+    TitleWatch,
 };
 
 pub const TOOL_RESULT_TRUNC: usize = 1500;
@@ -58,6 +59,8 @@ recompact handoff   [sessionId] [--continue-after]  (compact the current session
 queued for turn end under `shell`; otherwise compacts now and\n                      \
 prints the resume command)\n  \
 recompact prewarm   <session> [--target T]  (summarize ahead into the cache)\n  \
+recompact job-handoff <job dir> <claude pid>  (a background job's in-place\n                      \
+handoff; its hooks start it)\n  \
 recompact install   (make interactive `claude` run through `shell`, turn on plugin\n                      \
 auto-update; `uninstall` undoes the shell part)\n  \
 recompact update    (newest plugin version, binary, and setup, then `doctor`)\n  \
@@ -6020,14 +6023,40 @@ pub fn cmd_hook(args: &[String]) -> i32 {
                 out["hookSpecificOutput"] =
                     json!({"hookEventName": "SessionStart", "additionalContext": ctx.join("\n\n")});
             }
-            let lines: Vec<String> = switched.into_iter().chain(setup_notice(&v)).collect();
+            let notice = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .and_then(take_notice);
+            let lines: Vec<String> = switched
+                .into_iter()
+                .chain(notice)
+                .chain(setup_notice(&v))
+                .collect();
             if !lines.is_empty() {
                 out["systemMessage"] = json!(lines.join("\n"));
             }
             (out != json!({})).then_some(out)
         }
         Some("user-prompt-submit") => on_prompt(&v),
-        Some("stop") => on_stop(&v),
+        Some("stop") => {
+            let notice = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .and_then(take_notice);
+            match (on_stop(&v), notice) {
+                (out, None) => out,
+                (None, Some(n)) => Some(json!({ "systemMessage": n })),
+                (Some(mut out), Some(n)) => {
+                    let msg = out
+                        .get("systemMessage")
+                        .and_then(|m| m.as_str())
+                        .map(|m| format!("{n}\n{m}"))
+                        .unwrap_or(n);
+                    out["systemMessage"] = json!(msg);
+                    Some(out)
+                }
+            }
+        }
         Some("post-tool-use") => on_post_tool_use(&v),
         _ => None,
     };

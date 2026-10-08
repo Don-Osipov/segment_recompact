@@ -46,6 +46,11 @@ terminal and use claude as always:
   not restarted, so nothing stops, and their notices arrive in the compacted session. Where
   claude must be restarted instead (no terminal, or `RECOMPACT_PTY=0`), compaction records them
   and the resumed session starts them again.
+- Background jobs (`claude --bg`, agent view) compact in place too, with no setup. Claude Code's
+  daemon starts them, not your shell, so recompact opens the job with `claude attach` only for
+  the moment of the switch. The job keeps its short id, and its background work keeps running.
+  If the switch does not take, the compacted session starts as a new background job with the
+  same name, and the old job is stopped.
 - While a session compacts, a progress bar runs under your Claude Code status line, then the
   result for a few seconds. `recompact install` and `recompact update` add it to the status line
   you already have; `recompact uninstall` takes it out.
