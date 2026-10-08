@@ -331,7 +331,7 @@ fn a_notice_is_shown_once_to_the_session_it_is_for() {
 /// `claude`, as the worker uses it: `attach <short>` reads keys raw, as Claude Code does, and
 /// opens a session given `/resume <id>` (its SessionStart hook would write session.json);
 /// Ctrl+Z detaches. `--bg`, `agents --json`, and `stop` act like a daemon that starts the twin
-/// as a new job. `mode`: `switch`, `ignore` (never opens the twin), `draft` (the first Esc finds
+/// as a new job, folder included (a worker forgets the state of jobs with no folder). `mode`: `switch`, `ignore` (never opens the twin), `draft` (the first Esc finds
 /// text in the box).
 fn claude_stub(dir: &Path, state: &Path, mode: &str) -> String {
     write_stub(
@@ -371,6 +371,10 @@ case "$1" in
     echo "$*" >> "$D/bg.log"
     twin=$(echo "$*" | sed -n 's/.*--resume \([^ ]*\).*/\1/p')
     echo "$twin" > "$D/twin.txt"
+    # The daemon makes the new job's folder before it lists the job.
+    s=$(echo "$twin" | cut -c1-8)
+    mkdir -p "{jobs}/$s"
+    printf '{{"backend":"daemon","daemonShort":"%s","sessionId":"%s"}}' "$s" "$twin" > "{jobs}/$s/state.json"
     printf 'backgrounded · %s · a name (idle — send a prompt to start)\n' "$(echo "$twin" | cut -c1-8)";;
   agents)
     twin=$(cat "$D/twin.txt" 2>/dev/null)
@@ -380,7 +384,8 @@ case "$1" in
 esac
 exit 0
 "#,
-            state = state.display()
+            state = state.display(),
+            jobs = jobs_root().display()
         ),
     )
 }
@@ -581,6 +586,9 @@ fn a_job_that_will_not_switch_restarts_as_a_new_job_on_the_twin() {
     );
     let notice = take_notice(&twin).expect("the twin hears what happened");
     assert!(notice.contains(&job.short), "{notice}");
+    // Another job's first hook forgets the state of jobs with no folder; the new job has one.
+    let (other, _) = job_folder(json!({}));
+    job_shell(&other, std::process::id());
     assert!(
         read(job_state_dir(&twin[..8]).join("config.json")).unwrap()["rearm"]
             .as_u64()
