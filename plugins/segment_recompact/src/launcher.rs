@@ -276,7 +276,8 @@ pub fn live_tokens(path: &Path) -> Option<usize> {
 
 /// The context window a session runs in. Transcripts do not record it (a 1M Opus session logs
 /// plain `claude-opus-5-5`, and the `opus` alias gives 1M on current plans), so: an explicit
-/// `RECOMPACT_WINDOW`, usage already past 200k, else Haiku at 200k and everything else at 1M.
+/// `RECOMPACT_WINDOW`, usage already past 200k, else Haiku 4.5 and older at 200k and everything
+/// else at 1M (Claude Code gives Haiku 5.5 a 1M window).
 pub fn window_for(model: &str, live: usize) -> usize {
     if let Ok(w) = std::env::var("RECOMPACT_WINDOW") {
         let w = w.trim().to_lowercase();
@@ -294,7 +295,7 @@ pub fn window_for(model: &str, live: usize) -> usize {
     if live > 200_000 {
         return 1_000_000;
     }
-    if model.to_lowercase().contains("haiku") {
+    if crate::is_haiku_4_or_older(model) {
         200_000
     } else {
         1_000_000

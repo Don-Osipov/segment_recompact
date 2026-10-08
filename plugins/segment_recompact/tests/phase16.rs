@@ -186,10 +186,20 @@ fn relaunch_keeps_flags_and_drops_the_prompt_and_session_selection() {
 
 #[test]
 fn defaults_follow_the_context_window() {
-    // Transcripts log `claude-opus-5-5` for 1M sessions; only Haiku is assumed to be 200k.
+    // Transcripts log `claude-opus-5-5` for 1M sessions; only Haiku 4.5 and older are assumed to
+    // be 200k. Claude Code gives Haiku 5.5 1M (`/context` on `cc/claude-haiku-5-5`, 2026-10-08).
     assert_eq!(default_at_for("claude-opus-5-5", 10), 500_000);
     assert_eq!(default_at_for("claude-opus-5-5[1m]", 10), 500_000);
     assert_eq!(default_at_for("claude-haiku-4-5-20251001", 10), 140_000);
+    assert_eq!(default_at_for("cc/claude-haiku-4-5-20251001", 10), 140_000);
+    assert_eq!(default_at_for("claude-3-5-haiku-20241022", 10), 140_000);
+    assert_eq!(default_at_for("claude-haiku-5-5", 10), 500_000);
+    assert_eq!(default_at_for("cc/claude-haiku-5-5", 10), 500_000);
+    assert_eq!(
+        default_at_for("haiku", 10),
+        500_000,
+        "the alias names the current Haiku"
+    );
     assert_eq!(
         default_at_for("claude-haiku-4-5", 250_000),
         500_000,

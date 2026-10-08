@@ -3389,6 +3389,9 @@ fn call_claude_stdin(bin: &str, model: &str, prompt: &str) -> Result<String, Str
     let mut child = Command::new(bin)
         .current_dir(&tmp)
         .args(["-p", "--model", model, "--strict-mcp-config", "--no-session-persistence"])
+        // No tools: a batch is untrusted transcript text the model could otherwise act on under
+        // the user's allow rules, and tool definitions were ~18k tokens of every call.
+        .args(["--tools", ""])
         // Our own hooks stay out of the summarizer, and it must never signal a launcher.
         .env("RECOMPACT_INTERNAL", "1")
         .env_remove("RECOMPACT_SHELL")

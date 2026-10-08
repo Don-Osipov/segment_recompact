@@ -80,7 +80,7 @@ fn write_stub(dir: &PathBuf, name: &str, body: &str) -> String {
 }
 
 /// Stub summarizer: reads the prompt on stdin, emits a JSON object with one canned summary per
-/// "### UNIT <key>" marker, and logs the model it was invoked with.
+/// "### UNIT <key>" marker, and logs the model and the arguments it was invoked with.
 fn summarizer_stub(dir: &PathBuf) -> String {
     write_stub(
         dir,
@@ -88,6 +88,7 @@ fn summarizer_stub(dir: &PathBuf) -> String {
         r#"#!/bin/sh
 # argv: -p --model <M> --strict-mcp-config
 echo "$3" >> "$(dirname "$0")/models.log"
+for a in "$@"; do printf '[%s]\n' "$a"; done >> "$(dirname "$0")/args.log"
 keys=$(sed -n 's/^### UNIT //p')
 printf '{'
 first=1
@@ -157,6 +158,26 @@ fn continue_summarize_with_stub_compacts_prose() {
         ]),
         0
     );
+}
+
+#[test]
+fn the_summarizer_gets_no_tools() {
+    // A batch is untrusted transcript text; the summarizer must have nothing to act on it with.
+    let dir = tmp_dir();
+    let src = write_session(&dir, &prose_session());
+    let stub = summarizer_stub(&dir);
+    let rc = cmd_continue(&[
+        src.to_string_lossy().into_owned(),
+        "--threshold".into(),
+        "2000".into(),
+        "--summarize-with".into(),
+        "stub-model".into(),
+        "--claude-bin".into(),
+        stub,
+    ]);
+    assert_eq!(rc, 0);
+    let args = fs::read_to_string(dir.join("args.log")).unwrap();
+    assert!(args.contains("[--tools]\n[]\n"), "tools disabled: {args}");
 }
 
 #[test]
