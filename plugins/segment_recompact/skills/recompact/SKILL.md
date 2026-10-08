@@ -244,8 +244,9 @@ run) is waited for, until the checkpoint size at most, then restarted the same w
 up to that prompt, restart only what is still needed, and check `CronList` before recreating a
 scheduled prompt.
 
-Transcripts do not record the context window: Haiku counts as 200k, other models as 1M (what the
-`opus` alias gives on current plans); set `RECOMPACT_WINDOW=200k` if yours differs.
+Transcripts do not record the context window: Haiku 4.5 and older count as 200k, other models
+(Haiku 5.5 included) as 1M (what the `opus` alias gives on current plans); set
+`RECOMPACT_WINDOW=200k` if yours differs.
 
 A resumed session always opens as it is. If it is already over `--at`, it gets another 100k (or
 a quarter of `--at`) of room before the warning. A restart keeps

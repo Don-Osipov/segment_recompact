@@ -10,7 +10,9 @@
 //!   input: in one Fable twin it was 38% of the live context (~0.65 tokens per signature char),
 //!   invisible in the transcript text. So live usage cannot calibrate a chars-per-token ratio.
 //! - The ratio is the tokenizer's: the same content ran 2.39 chars/token on Opus 5.5, ~2.65 on
-//!   Fable 5.1 and 3.06 on Haiku 4.5 (dense content; prose runs higher).
+//!   Fable 5.1 and 3.06 on Haiku 4.5 (dense content; prose runs higher). Haiku 5.5 shares Opus
+//!   5.5's tokenizer: on three 120 KB transcript samples (2026-10-08) both counted exactly the
+//!   same tokens, 1.28-1.36x what Haiku 4.5 counted.
 //!
 //! Hence: visible chars at the model's measured ratio for sizing a twin (twins carry no
 //! thinking), plus a fixed system+tools overhead (`--overhead` overrides it), and the last usage
@@ -28,14 +30,33 @@ pub const DEFAULT_CHARS_PER_TOKEN: f64 = 2.5;
 /// a bare project; projects with many MCP servers run higher).
 pub const DEFAULT_OVERHEAD: usize = 35_000;
 
+/// Haiku 4.5 and older: a 200k window and the older tokenizer. The bare `haiku` alias names the
+/// current Haiku, so it does not match.
+pub fn is_haiku_4_or_older(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let Some(at) = m.find("haiku") else {
+        return false;
+    };
+    let version: String = m[at + "haiku".len()..]
+        .trim_start_matches('-')
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    match version.parse::<u32>() {
+        Ok(major) if version.len() <= 2 => major < 5,
+        // `claude-3-5-haiku-20241022`: the version comes before the name, a date after it.
+        _ => m[..at].contains("claude-3"),
+    }
+}
+
 /// Measured tokenizer density for visible transcript content, by model family.
 pub fn chars_per_token_for(model: &str) -> f64 {
     let m = model.to_ascii_lowercase();
-    if m.contains("haiku") {
+    if is_haiku_4_or_older(&m) {
         3.1
     } else if m.contains("fable") || m.contains("mythos") {
         2.65
-    } else if m.contains("opus") || m.contains("sonnet") {
+    } else if m.contains("opus") || m.contains("sonnet") || m.contains("haiku") {
         2.4
     } else {
         DEFAULT_CHARS_PER_TOKEN
@@ -191,13 +212,7 @@ pub(crate) fn prompt_tokens(usage: &Value) -> Option<usize> {
 
 /// Model ratio from the table; live size from the last usage record.
 pub fn calibrate(records: &[Value]) -> Calib {
-    let model = records
-        .iter()
-        .rev()
-        .filter(|r| crate::is_real_assistant(r))
-        .find_map(|r| r.pointer("/message/model").and_then(|v| v.as_str()))
-        .filter(|m| m.starts_with("claude-"));
-    let mut c = Calib::for_model(model);
+    let mut c = Calib::for_model(crate::last_reply_model(records));
     for r in records {
         if rec_type(r) == "assistant" {
             if let Some(y) = r.pointer("/message/usage").and_then(prompt_tokens) {

@@ -441,6 +441,19 @@ pub fn is_real_assistant(r: &Value) -> bool {
         && !crate::truthy(r, "recompactLedger")
 }
 
+/// The model that last answered. An API error logs model `<synthetic>`, so look past it.
+pub fn last_reply_model(records: &[Value]) -> Option<&str> {
+    records
+        .iter()
+        .rev()
+        .filter(|r| is_real_assistant(r))
+        .find_map(|r| {
+            r.pointer("/message/model")
+                .and_then(|v| v.as_str())
+                .filter(|m| m.starts_with("claude-"))
+        })
+}
+
 /// What a resume should restore: the model the session last ran, whether it ran with the 1M
 /// window, and effort set "for this session only". A resume starts on the saved default model and
 /// drops session-only effort: in the sample, 9 of 56 resumed twins opened with the user re-running
@@ -457,12 +470,7 @@ pub struct ResumeProfile {
 impl ResumeProfile {
     pub fn of(records: &[Value]) -> ResumeProfile {
         let stamp = records.iter().rev().find_map(|r| r.get("recompactCalibration"));
-        let model = records
-            .iter()
-            .rev()
-            .filter(|r| is_real_assistant(r))
-            .find_map(|r| r.pointer("/message/model").and_then(|v| v.as_str()))
-            .filter(|m| m.starts_with("claude-"))
+        let model = last_reply_model(records)
             .map(str::to_string)
             .or_else(|| stamp.and_then(|s| s.get("model")).and_then(|v| v.as_str()).map(str::to_string));
         let mut long_context = stamp

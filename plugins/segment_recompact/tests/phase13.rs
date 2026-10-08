@@ -196,6 +196,27 @@ fn calibration_takes_the_ratio_from_the_model_and_the_live_size_from_the_last_us
         .collect();
     assert!(calibrate(&bare).live.is_none());
     assert!((chars_per_token_for("claude-haiku-4-5-20251001") - 3.1).abs() < 1e-9);
+    assert!((chars_per_token_for("claude-3-5-haiku-20241022") - 3.1).abs() < 1e-9);
+    // Haiku 5.5 counts exactly the tokens Opus 5.5 counts for the same text.
+    assert_eq!(
+        chars_per_token_for("cc/claude-haiku-5-5"),
+        chars_per_token_for("claude-opus-5-5")
+    );
+
+    // A trailing API error logs model `<synthetic>`; the model that last answered still counts.
+    let mut answered = assistant("h1", "u0", "answer");
+    answered["message"]["model"] = json!("claude-haiku-4-5-20251001");
+    let mut failed = assistant("h2", "h1", "API Error: 500");
+    failed["message"]["model"] = json!("<synthetic>");
+    failed["isApiErrorMessage"] = json!(true);
+    let errored = [user("u0", None, "start"), answered, failed];
+    let c = calibrate(&errored);
+    assert_eq!(c.model.as_deref(), Some("claude-haiku-4-5-20251001"));
+    assert!((1.0 / c.tokens_per_char - 3.1).abs() < 1e-9);
+    assert_eq!(
+        resume_flags(&errored),
+        vec!["--model", "claude-haiku-4-5-20251001"]
+    );
 
     // Older transcripts lack `rendered`; their attachments still reached the model.
     let mut old = attachment("x9", "a5", "skill_listing", None);
