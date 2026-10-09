@@ -55,7 +55,9 @@ terminal and use claude as always:
   shell startup file), `claude` starts every session as a background job and attaches your
   terminal to it, so switches follow Claude Code's own record of when a turn runs. Your
   terminal's exported variables (direnv's included) reach the session through a settings file
-  only you can read. The session outlives the terminal: Ctrl+Z returns to your shell, `/exit`
+  only you can read. Claude Code tells background sessions never to merge and to open draft
+  pull requests; recompact appends a line so your own git rules apply instead. The session
+  outlives the terminal: Ctrl+Z returns to your shell, `/exit`
   opens the session list, and `claude stop <id>` ends it (an idle session holds ~430 MB).
   A session picker (`claude --resume` with no id), `--settings`, and `--tmux` run in the
   terminal as before.

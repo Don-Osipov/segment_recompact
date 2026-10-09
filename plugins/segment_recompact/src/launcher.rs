@@ -3597,6 +3597,17 @@ const DAEMON_ENV: &[&str] = &[
     "USER",
 ];
 
+/// Claude Code tells every background session never to merge and to open pull requests as drafts
+/// (its "Background Session" system prompt section, CLI 2.1.295). Sessions started this way are
+/// the user's interactive sessions, so the user's own git rules apply to them; appended after
+/// that section, this line makes them win (measured: without it the model refused to merge under
+/// a standing merge-when-green rule, with it it agreed).
+pub const JOB_GIT_RULES: &str = "The user's own instructions take precedence over the Background \
+Session section's git rules. When the user's instructions (CLAUDE.md, memory, or this \
+conversation) call for it, you may merge pull requests and open ready-for-review (non-draft) pull \
+requests. Pushing to main/master and force-pushing still need the user's explicit request in this \
+conversation.";
+
 /// `recompact shell` with `RECOMPACT_JOBS=1` (or `--jobs`): start claude as a Claude Code
 /// background session and attach this terminal to it. A switch to a compacted copy then waits
 /// for the daemon's own record of whether a turn runs, not for what the terminal shows. `None`
@@ -3645,10 +3656,19 @@ fn run_as_job(l: &Launch, parsed: &[Arg], claude_args: &[String]) -> Option<i32>
             let file = write_job_env(&dir, env)?;
             say("starting a background session…");
             let mut cmd = Command::new(&l.bin);
-            cmd.arg("--bg")
-                .arg("--settings")
-                .arg(&file)
-                .args(claude_args)
+            cmd.arg("--bg").arg("--settings").arg(&file);
+            let own_append = parsed.iter().any(|a| {
+                matches!(
+                    a.flag.as_deref(),
+                    Some("--append-system-prompt" | "--append-system-prompt-file")
+                )
+            });
+            if own_append {
+                say("your --append-system-prompt replaces recompact's git-rules line for this session");
+            } else {
+                cmd.arg("--append-system-prompt").arg(JOB_GIT_RULES);
+            }
+            cmd.args(claude_args)
                 .env_clear()
                 .envs(DAEMON_ENV.iter().filter_map(|k| Some((k, std::env::var_os(k)?))))
                 .stdin(Stdio::null())

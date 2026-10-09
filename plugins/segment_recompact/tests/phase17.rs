@@ -176,6 +176,7 @@ trap 'exit 143' TERM\nsleep 30 & wait $!\n",
     }
     let args: Vec<String> = [
         "--interactive",
+        "--no-jobs",
         "--mask",
         "--dir",
         proj.to_str().unwrap(),

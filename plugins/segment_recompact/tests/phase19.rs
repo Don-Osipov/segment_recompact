@@ -432,6 +432,7 @@ exit 0
 fn run_in_place(dir: &Path, stub: &str) -> String {
     let rc = cmd_shell(&s(&[
         "--interactive",
+        "--no-jobs",
         "--pty",
         "--leader",
         env!("CARGO_BIN_EXE_recompact"),
@@ -519,6 +520,7 @@ sleep 60 & wait $!
     );
     let rc = cmd_shell(&s(&[
         "--interactive",
+        "--no-jobs",
         "--pty",
         "--leader",
         env!("CARGO_BIN_EXE_recompact"),
@@ -802,6 +804,7 @@ exit 0
 fn in_place_args(dir: &Path, stub: &str) -> Vec<String> {
     s(&[
         "--interactive",
+        "--no-jobs",
         "--pty",
         "--leader",
         env!("CARGO_BIN_EXE_recompact"),
