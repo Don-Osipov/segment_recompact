@@ -850,6 +850,41 @@ fn a_prompt_whose_query_was_dropped_does_not_hold_the_switch_forever() {
 }
 
 #[test]
+fn a_title_that_spins_only_for_background_agents_does_not_hold_the_switch() {
+    // Claude Code keeps the spinner while a background agent runs, after the turn has ended.
+    let dir = tmp_dir();
+    let t = big_session(&dir, 20_000);
+    let stub = write_stub(
+        &dir,
+        "claude-stub.sh",
+        &format!(
+            r#"#!/bin/sh
+D="$(dirname "$0")"
+echo spawn >> "$D/spawns.log"
+[ "$(wc -l < "$D/spawns.log")" -eq 1 ] || exit 0
+{hooks}
+(sleep 40; kill $$) &
+printf '\033]0;\342\227\220 Background agent\007'
+while IFS= read -r line; do
+  echo "got $line" >> "$D/typed.log"
+  case "$line" in
+    *"/resume "*)
+      printf '{{"session":"%s"}}' "${{line##*/resume }}" > "$S/session.json"
+      sleep 1
+      exit 0;;
+  esac
+done
+exit 0
+"#,
+            hooks = hooks_say(&t)
+        ),
+    );
+    assert_eq!(cmd_shell(&in_place_args(&dir, &stub)), 0);
+    let typed = fs::read_to_string(dir.join("typed.log")).unwrap_or_default();
+    assert!(typed.contains("/resume "), "switched: {typed}");
+}
+
+#[test]
 fn nothing_is_typed_into_claude_while_its_title_says_it_is_working() {
     let dir = tmp_dir();
     let t = big_session(&dir, 20_000);

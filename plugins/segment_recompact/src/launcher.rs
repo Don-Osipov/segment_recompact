@@ -745,14 +745,31 @@ enum Idle {
     Asking,
 }
 
+/// Claude Code keeps the spinner in its title while a background agent runs, also after the turn
+/// has ended and the prompt is free (measured, CLI 2.1.294). A turn writes its prompt to the
+/// transcript as it starts, so a title busy this long over an ended turn, in a transcript this
+/// quiet, is a pause.
+const BUSY_TITLE_PAUSE: Duration = Duration::from_secs(10);
+
+fn paused_under_busy_title(p: &Proxy, transcript: &Path) -> bool {
+    let quiet = fs::metadata(transcript)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .unwrap_or(Duration::ZERO);
+    p.title_busy_for().is_some_and(|d| d >= BUSY_TITLE_PAUSE)
+        && quiet >= BUSY_TITLE_PAUSE
+        && turn_ended(transcript)
+}
+
 /// Is claude between turns, with nothing waiting on the user? Claude Code's terminal title says
-/// whether it is working; a dialog shows the idle title too, so a tool call without a result
-/// means it is asking. A prompt whose query was dropped (a hook blocked its batch) leaves a turn
-/// open in the transcript, so the transcript alone is only the fallback, for when Claude Code
-/// sets no title.
+/// whether it is working, except while background agents run (see `BUSY_TITLE_PAUSE`); a dialog
+/// shows the idle title too, so a tool call without a result means it is asking. A prompt whose
+/// query was dropped (a hook blocked its batch) leaves a turn open in the transcript, so the
+/// transcript alone is only the fallback, for when Claude Code sets no title.
 fn claude_idle(p: &Proxy, transcript: &Path, r: &mut Ready) -> Idle {
     match p.title_idle_for() {
-        Some(d) if d < SETTLE => Idle::Busy,
+        Some(d) if d < SETTLE && !paused_under_busy_title(p, transcript) => Idle::Busy,
         Some(_)
             if *r
                 .waiting
