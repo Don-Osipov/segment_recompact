@@ -987,6 +987,16 @@ impl Proxy {
         })
     }
 
+    /// How long claude's title has said it is busy (zero while it says idle); `None` until it
+    /// has set a title of its own.
+    pub fn title_busy_for(&self) -> Option<Duration> {
+        let title = self.shared.title.lock().unwrap();
+        title.state.map(|s| match s {
+            TitleState::Busy => title.since.elapsed(),
+            TitleState::Idle => Duration::ZERO,
+        })
+    }
+
     /// How long since the user's last key reached claude.
     pub fn quiet_for(&self) -> Duration {
         self.shared
