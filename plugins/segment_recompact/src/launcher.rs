@@ -3600,6 +3600,9 @@ fn run_as_job(l: &Launch, parsed: &[Arg], claude_args: &[String]) -> Option<i32>
         ));
         return None;
     }
+    // A Ctrl+C that reaches this process group (while claude starts, or as `claude attach`
+    // changes screens) must not end the launcher before it says which session runs.
+    catch_interrupts();
     let here = std::env::current_dir().ok()?;
     let short = match flag_value(parsed, &["-r", "--resume"])
         .and_then(|s| running_job_for(&l.bin, s))
@@ -3632,6 +3635,7 @@ fn run_as_job(l: &Launch, parsed: &[Arg], claude_args: &[String]) -> Option<i32>
                 }
             }
             let file = write_job_env(&dir, env)?;
+            say("starting a background session…");
             let mut cmd = Command::new(&l.bin);
             cmd.arg("--bg")
                 .arg("--settings")
@@ -3648,6 +3652,12 @@ fn run_as_job(l: &Launch, parsed: &[Arg], claude_args: &[String]) -> Option<i32>
                 .and_then(|o| started_job(&String::from_utf8_lossy(&o.stdout)));
             match started {
                 Some(short) => short,
+                None if crate::cancelled() => {
+                    let _ = fs::remove_file(&file);
+                    say("stopped before a background session opened; `claude agents` lists any \
+that started");
+                    return Some(130);
+                }
                 None => {
                     let _ = fs::remove_file(&file);
                     say("could not start a background session; running claude in this terminal");
@@ -3656,14 +3666,19 @@ fn run_as_job(l: &Launch, parsed: &[Arg], claude_args: &[String]) -> Option<i32>
             }
         }
     };
+    let how = format!("`claude attach {short}` reopens it · `claude stop {short}` ends it");
+    if crate::cancelled() {
+        say(&format!("background session {short} keeps running · {how}"));
+        return Some(130);
+    }
+    say(&format!(
+        "background session {short} · Ctrl+Z returns to your shell and leaves it running · {how}"
+    ));
     let mut attach = Command::new(&l.bin);
     attach.args(["attach", &short]);
     plain_claude(&mut attach);
     let code = attach.status().ok().and_then(|s| s.code()).unwrap_or(1);
-    say(&format!(
-        "session {short} keeps running in the background · `claude attach {short}` returns to it \
-· `claude stop {short}` ends it"
-    ));
+    say(&format!("background session {short} keeps running · {how}"));
     Some(code)
 }
 
