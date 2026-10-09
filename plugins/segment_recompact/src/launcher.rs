@@ -15,6 +15,10 @@
 //! SIGTERM (Claude Code exits cleanly on it: terminal restored, transcript flushed, exit 143),
 //! compacts with progress on the terminal, and resumes the twin with the same flags.
 //!
+//! With `RECOMPACT_JOBS=1` (off by default) the launcher starts claude as a background job
+//! instead and attaches this terminal to it with `claude attach`; the job path below then handles
+//! compaction, and the terminal's environment reaches the job through its `--settings` file.
+//!
 //! A background job (`claude --bg`, agent view) never runs through the launcher: Claude Code's
 //! daemon starts it on a terminal of its own. Its hooks find it from `CLAUDE_JOB_DIR` and keep
 //! the same files in `~/.claude/recompact/jobs/<short id>`, and start `recompact job-handoff`,
@@ -2182,6 +2186,9 @@ struct Launch {
     /// The recompact binary that runs `pty-leader` (this one, unless a test names it).
     leader: PathBuf,
     copts_raw: serde_json::Map<String, Value>,
+    /// Run claude as a Claude Code background session and attach this terminal to it
+    /// (`RECOMPACT_JOBS=1`, `--jobs`; off by default).
+    jobs: bool,
 }
 
 /// Split `recompact shell` arguments into the launcher's own options and claude's. None of the
@@ -2205,6 +2212,7 @@ and your last message says what was done and what is next."
         switch_timeout: Duration::from_secs(12),
         leader: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("recompact")),
         copts_raw: serde_json::Map::new(),
+        jobs: std::env::var("RECOMPACT_JOBS").ok().as_deref() == Some("1"),
     };
     let mut claude = Vec::new();
     let mut i = 0;
@@ -2272,6 +2280,14 @@ and your last message says what was done and what is next."
                 l.pty = Some(true);
                 i += 1;
             }
+            "--jobs" => {
+                l.jobs = true;
+                i += 1;
+            }
+            "--no-jobs" => {
+                l.jobs = false;
+                i += 1;
+            }
             "--no-pty" => {
                 l.pty = Some(false);
                 i += 1;
@@ -2327,6 +2343,11 @@ pub fn cmd_shell(args: &[String]) -> i32 {
     let parsed = parse_claude_args(&claude_args);
     if is_passthrough(&parsed) || !(l.interactive || std::io::stdin().is_terminal()) {
         return exec_claude(&l.bin, &claude_args);
+    }
+    if l.jobs {
+        if let Some(code) = run_as_job(&l, &parsed, &claude_args) {
+            return code;
+        }
     }
     catch_interrupts();
     let state = l.state_root.join(std::process::id().to_string());
@@ -3388,6 +3409,262 @@ fn prune_job_states(job: &Job) {
             let _ = fs::remove_dir_all(e.path());
         }
     }
+}
+
+// ------------------------------------------------------------------------- background sessions
+
+/// The terminal's identity and Claude Code's own process variables: a background session has a
+/// terminal of its own, so these never come from the terminal that started it.
+const JOB_ENV_SKIP: &[&str] = &[
+    "_",
+    "CLAUDECODE",
+    "CLAUDE_PID",
+    "COLORTERM",
+    "COLUMNS",
+    "LINES",
+    "OLDPWD",
+    "PWD",
+    "RECOMPACT_INTERNAL",
+    "RECOMPACT_JOBS",
+    "RECOMPACT_SHELL",
+    "SHLVL",
+    "SSH_TTY",
+    "STY",
+    "TERM",
+    "TERMINFO",
+    "TERMINFO_DIRS",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "TERM_SESSION_ID",
+    "TMUX",
+    "TMUX_PANE",
+    "WINDOWID",
+];
+const JOB_ENV_SKIP_PREFIXES: &[&str] = &[
+    "ALACRITTY_",
+    "CLAUDE_CODE_",
+    "CLAUDE_JOB",
+    "GHOSTTY_",
+    "ITERM_",
+    "KITTY_",
+    "VSCODE_",
+    "WEZTERM_",
+    "XPC_",
+    "__CF",
+];
+
+/// What a background session takes from the terminal that starts it. Claude Code's daemon starts
+/// every session with the daemon's own environment, fixed when the daemon started (measured, CLI
+/// 2.1.295), so a variable a terminal exported (direnv's, `RECOMPACT_AT`) would be missing. The
+/// launcher hands them over in the session's `--settings` file: Claude Code applies its `env` to
+/// the session's commands and hooks and restarts the session with the same file. A key a
+/// settings file sets keeps that file's value, as in a terminal session.
+pub fn job_env(
+    vars: impl IntoIterator<Item = (String, String)>,
+    settings_keys: &std::collections::HashSet<String>,
+) -> serde_json::Map<String, Value> {
+    vars.into_iter()
+        .filter(|(k, _)| {
+            !JOB_ENV_SKIP.contains(&k.as_str())
+                && !JOB_ENV_SKIP_PREFIXES.iter().any(|p| k.starts_with(p))
+                && !settings_keys.contains(k)
+        })
+        .map(|(k, v)| (k, Value::String(v)))
+        .collect()
+}
+
+/// The `env` keys of the settings files Claude Code reads in `cwd`.
+fn settings_env_keys(cwd: &Path) -> std::collections::HashSet<String> {
+    [
+        home().join(".claude").join("settings.json"),
+        cwd.join(".claude").join("settings.json"),
+        cwd.join(".claude").join("settings.local.json"),
+    ]
+    .iter()
+    .filter_map(|p| read_json(p))
+    .filter_map(|v| {
+        v.get("env")
+            .and_then(Value::as_object)
+            .map(|m| m.keys().cloned().collect::<Vec<_>>())
+    })
+    .flatten()
+    .collect()
+}
+
+/// A picker, a second settings file and tmux need claude on this terminal.
+pub fn job_unsupported(args: &[Arg]) -> Option<&'static str> {
+    let flag = |names: &[&str]| {
+        args.iter()
+            .find(|a| a.flag.as_deref().is_some_and(|f| names.contains(&f)))
+    };
+    if flag(&["-r", "--resume"]).is_some_and(|a| a.values.is_empty()) {
+        Some("the session picker")
+    } else if flag(&["--settings"]).is_some() {
+        Some("--settings")
+    } else if flag(&["--tmux"]).is_some() {
+        Some("--tmux")
+    } else {
+        None
+    }
+}
+
+/// The session settings file, readable only by the user: it holds whatever the terminal
+/// exported, secrets included.
+fn write_job_env(dir: &Path, env: serde_json::Map<String, Value>) -> Option<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .ok()?;
+    let path = dir.join(format!("{}.json", crate::uuid_v4()));
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .ok()?;
+    f.write_all(json!({ "env": env }).to_string().as_bytes()).ok()?;
+    Some(path)
+}
+
+/// Delete settings files no session restarts with any more: `claude rm` leaves them behind.
+fn prune_job_env(dir: &Path) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut used = String::new();
+    if let Ok(jobs) = fs::read_dir(home().join(".claude").join("jobs")) {
+        for j in jobs.flatten() {
+            used.push_str(&fs::read_to_string(j.path().join("state.json")).unwrap_or_default());
+        }
+    }
+    for e in rd.flatten() {
+        let path = e.path();
+        let old = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|d| d > Duration::from_secs(3600));
+        if old && !used.contains(path.to_string_lossy().as_ref()) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// The running background session that has `session` open.
+fn running_job_for(bin: &str, session: &str) -> Option<String> {
+    let mut cmd = Command::new(bin);
+    cmd.args(["agents", "--json"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    plain_claude(&mut cmd);
+    let list = cmd
+        .output()
+        .ok()
+        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())?;
+    list.as_array()?
+        .iter()
+        .find(|a| get_s(a, "sessionId") == Some(session) && a.get("pid").is_some())
+        .and_then(|a| get_s(a, "id"))
+        .map(String::from)
+}
+
+/// Variables the daemon gets if this call starts it: enough to run, and nothing a later session
+/// could inherit by accident (each session gets its own terminal's through `job_env`).
+const DAEMON_ENV: &[&str] = &[
+    "COLORTERM",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LOGNAME",
+    "PATH",
+    "SHELL",
+    "TERM",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "TMPDIR",
+    "USER",
+];
+
+/// `recompact shell` with `RECOMPACT_JOBS=1` (or `--jobs`): start claude as a Claude Code
+/// background session and attach this terminal to it. A switch to a compacted copy then waits
+/// for the daemon's own record of whether a turn runs, not for what the terminal shows. `None`
+/// when this invocation cannot run that way; the launcher then runs claude here as usual.
+fn run_as_job(l: &Launch, parsed: &[Arg], claude_args: &[String]) -> Option<i32> {
+    if let Some(what) = job_unsupported(parsed) {
+        say(&format!(
+            "a background session cannot use {what}; running claude in this terminal"
+        ));
+        return None;
+    }
+    let here = std::env::current_dir().ok()?;
+    let short = match flag_value(parsed, &["-r", "--resume"])
+        .and_then(|s| running_job_for(&l.bin, s))
+    {
+        Some(short) => short,
+        None => {
+            let dir = l
+                .state_root
+                .parent()
+                .map_or_else(|| recompact_home().join("job-env"), |p| p.join("job-env"));
+            prune_job_env(&dir);
+            let vars = std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+            let mut env = job_env(vars, &settings_env_keys(&here));
+            let opts = [
+                ("RECOMPACT_AT", l.at.map(|n| n.to_string())),
+                ("RECOMPACT_CHECKPOINT_AT", l.checkpoint_at.map(|n| n.to_string())),
+                ("RECOMPACT_AUTO", l.auto.map(|a| if a { "1" } else { "0" }.to_string())),
+                (
+                    "RECOMPACT_SUMMARIZE_WITH",
+                    l.copts_raw
+                        .get("summarize-with")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                ),
+            ];
+            for (k, v) in opts {
+                if let Some(v) = v {
+                    env.insert(k.into(), Value::String(v));
+                }
+            }
+            let file = write_job_env(&dir, env)?;
+            let mut cmd = Command::new(&l.bin);
+            cmd.arg("--bg")
+                .arg("--settings")
+                .arg(&file)
+                .args(claude_args)
+                .env_clear()
+                .envs(DAEMON_ENV.iter().filter_map(|k| Some((k, std::env::var_os(k)?))))
+                .stdin(Stdio::null())
+                .stderr(Stdio::inherit());
+            let started = cmd
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| started_job(&String::from_utf8_lossy(&o.stdout)));
+            match started {
+                Some(short) => short,
+                None => {
+                    let _ = fs::remove_file(&file);
+                    say("could not start a background session; running claude in this terminal");
+                    return None;
+                }
+            }
+        }
+    };
+    let mut attach = Command::new(&l.bin);
+    attach.args(["attach", &short]);
+    plain_claude(&mut attach);
+    let code = attach.status().ok().and_then(|s| s.code()).unwrap_or(1);
+    say(&format!(
+        "session {short} keeps running in the background · `claude attach {short}` returns to it \
+· `claude stop {short}` ends it"
+    ));
+    Some(code)
 }
 
 // ------------------------------------------------------------------------------------ setup
