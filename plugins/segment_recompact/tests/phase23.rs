@@ -99,13 +99,14 @@ fn claude_starts_in_the_background_and_this_terminal_attaches_to_it() {
     let calls = fs::read_to_string(dir.join("calls.log")).unwrap();
     let calls: Vec<&str> = calls.lines().collect();
     let env_dir = dir.join("job-env");
-    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert_eq!(calls.len(), 3, "{calls:?}");
     assert!(
         calls[0].starts_with(&format!("--bg --settings {}", env_dir.display()))
             && calls[0].ends_with(" --model haiku"),
         "{calls:?}"
     );
     assert_eq!(calls[1], "attach abcd1234");
+    assert_eq!(calls[2], "agents --json", "whether the session still runs");
 
     let copy: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.join("settings-copy.json")).unwrap()).unwrap();
@@ -129,6 +130,6 @@ fn resuming_a_session_that_already_runs_in_the_background_attaches_to_it() {
     );
     assert_eq!(cmd_shell(&shell_args(&dir, &stub, &["--resume", "S1"])), 7);
     let calls = fs::read_to_string(dir.join("calls.log")).unwrap();
-    assert_eq!(calls, "agents --json\nattach feedbeef\n");
+    assert_eq!(calls, "agents --json\nattach feedbeef\nagents --json\n");
     assert!(!dir.join("job-env").exists(), "no new session, no settings file");
 }
