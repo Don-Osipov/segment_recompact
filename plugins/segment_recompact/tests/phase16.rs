@@ -521,6 +521,7 @@ exit 0
     );
     let rc = cmd_shell(&s(&[
         "--interactive",
+        "--no-jobs",
         "--mask",
         "--dir",
         dir.to_str().unwrap(),
@@ -572,6 +573,7 @@ fn a_resumed_session_opens_as_it_is_however_big() {
     );
     let rc = cmd_shell(&s(&[
         "--interactive",
+        "--no-jobs",
         "--mask",
         "--at",
         "100000",
@@ -610,6 +612,7 @@ exit 7
     );
     let rc = cmd_shell(&s(&[
         "--interactive",
+        "--no-jobs",
         "--dir",
         dir.to_str().unwrap(),
         "--state-root",

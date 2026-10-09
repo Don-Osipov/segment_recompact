@@ -107,6 +107,10 @@ fn claude_starts_in_the_background_and_this_terminal_attaches_to_it() {
     );
     assert_eq!(calls[1], "attach abcd1234");
     assert_eq!(calls[2], "agents --json", "whether the session still runs");
+    assert!(
+        calls[0].contains(&format!("--append-system-prompt {JOB_GIT_RULES} --model haiku")),
+        "the user's git rules win over the background ones: {calls:?}"
+    );
 
     let copy: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(dir.join("settings-copy.json")).unwrap()).unwrap();
@@ -132,4 +136,16 @@ fn resuming_a_session_that_already_runs_in_the_background_attaches_to_it() {
     let calls = fs::read_to_string(dir.join("calls.log")).unwrap();
     assert_eq!(calls, "agents --json\nattach feedbeef\nagents --json\n");
     assert!(!dir.join("job-env").exists(), "no new session, no settings file");
+}
+
+#[test]
+fn a_users_own_appended_prompt_replaces_the_git_rules_line() {
+    let dir = tmp_dir();
+    let stub = job_stub(&dir, "[]");
+    let args = shell_args(&dir, &stub, &["--append-system-prompt", "be brief"]);
+    assert_eq!(cmd_shell(&args), 7);
+    let calls = fs::read_to_string(dir.join("calls.log")).unwrap();
+    let first = calls.lines().next().unwrap();
+    assert!(first.ends_with("--append-system-prompt be brief"), "{first}");
+    assert_eq!(first.matches("--append-system-prompt").count(), 1, "{first}");
 }
