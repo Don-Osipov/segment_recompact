@@ -3553,20 +3553,28 @@ fn prune_job_env(dir: &Path) {
     }
 }
 
-/// The running background session that has `session` open.
-fn running_job_for(bin: &str, session: &str) -> Option<String> {
+/// The background sessions `claude agents --json` lists with a running process.
+fn running_jobs(bin: &str) -> Vec<Value> {
     let mut cmd = Command::new(bin);
     cmd.args(["agents", "--json"])
         .stdin(Stdio::null())
         .stderr(Stdio::null());
     plain_claude(&mut cmd);
-    let list = cmd
-        .output()
+    cmd.output()
         .ok()
-        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())?;
-    list.as_array()?
+        .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| a.get("pid").is_some())
+        .collect()
+}
+
+/// The running background session that has `session` open.
+fn running_job_for(bin: &str, session: &str) -> Option<String> {
+    running_jobs(bin)
         .iter()
-        .find(|a| get_s(a, "sessionId") == Some(session) && a.get("pid").is_some())
+        .find(|a| get_s(a, "sessionId") == Some(session))
         .and_then(|a| get_s(a, "id"))
         .map(String::from)
 }
@@ -3678,7 +3686,17 @@ that started");
     attach.args(["attach", &short]);
     plain_claude(&mut attach);
     let code = attach.status().ok().and_then(|s| s.code()).unwrap_or(1);
-    say(&format!("background session {short} keeps running · {how}"));
+    // `/exit` then Ctrl+X in the session list ends the session before the attach returns.
+    if running_jobs(&l.bin)
+        .iter()
+        .any(|a| get_s(a, "id") == Some(&short))
+    {
+        say(&format!("background session {short} keeps running · {how}"));
+    } else {
+        say(&format!(
+            "background session {short} ended · `claude attach {short}` reopens it"
+        ));
+    }
     Some(code)
 }
 
