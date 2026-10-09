@@ -51,6 +51,14 @@ terminal and use claude as always:
   the moment of the switch. The job keeps its short id, and its background work keeps running.
   If the switch does not take, the compacted session starts as a new background job with the
   same name, and the old job is stopped.
+- Experimental, off by default: with `RECOMPACT_JOBS=1` (in one terminal, or exported in your
+  shell startup file), `claude` starts every session as a background job and attaches your
+  terminal to it, so switches follow Claude Code's own record of when a turn runs. Your
+  terminal's exported variables (direnv's included) reach the session through a settings file
+  only you can read. The session outlives the terminal: Ctrl+Z returns to your shell, `/exit`
+  opens the session list, and `claude stop <id>` ends it (an idle session holds ~430 MB).
+  A session picker (`claude --resume` with no id), `--settings`, and `--tmux` run in the
+  terminal as before.
 - While a session compacts, a progress bar runs under your Claude Code status line, then the
   result for a few seconds. `recompact install` and `recompact update` add it to the status line
   you already have; `recompact uninstall` takes it out.
