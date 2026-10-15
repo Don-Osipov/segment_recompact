@@ -159,6 +159,127 @@ fn compacted_session_keeps_only_post_boundary() {
     assert!(file_contains(&out, "Summary of everything before the boundary."));
 }
 
+/// A "Summarize from here" boundary as Claude Code writes it: a fresh chain root that lists the
+/// records it kept (`allUuids` also names records that only lived in memory).
+fn partial_boundary(uuid: &str, kept: &[&str]) -> Value {
+    let mut all: Vec<&str> = kept.to_vec();
+    all.insert(1, "in-memory-only");
+    json!({
+        "type": "system", "subtype": "compact_boundary", "uuid": uuid, "parentUuid": null,
+        "logicalParentUuid": kept.last(), "sessionId": SESSION, "isSidechain": false,
+        "timestamp": "2026-07-17T00:00:05.000Z", "content": "Conversation compacted",
+        "compactMetadata": {
+            "trigger": "manual", "preTokens": 5000, "messagesSummarized": 2,
+            "preservedSegment": {"headUuid": kept[0], "anchorUuid": uuid, "tailUuid": kept.last()},
+            "preservedMessages": {"anchorUuid": uuid, "uuids": kept, "allUuids": all}
+        }
+    })
+}
+
+fn summary_after(uuid: &str, boundary: &str, text: &str) -> Value {
+    let mut r = compact_summary(uuid, text);
+    r["parentUuid"] = json!(boundary);
+    r
+}
+
+#[test]
+fn a_partial_compaction_keeps_the_records_it_preserved() {
+    let dir = tmp_dir();
+    let records = vec![
+        user("u0", None, "KEPT ask one"),
+        assistant("a0", "u0", "KEPT answer one"),
+        user("u1", Some("a0"), "KEPT ask two"),
+        assistant("a1", "u1", "KEPT answer two"),
+        user("u2", Some("a1"), "SUMMARIZED ask"),
+        assistant("a2", "u2", "SUMMARIZED answer"),
+        partial_boundary("b", &["u0", "a0", "u1", "a1"]),
+        summary_after("cs", "b", "Summary of the summarized part."),
+        user("u3", Some("cs"), "after ask"),
+        assistant("a3", "u3", "after answer"),
+        last_prompt("a3", "after ask"),
+    ];
+    let src = write_session(&dir, "partial.jsonl", &records);
+
+    let (kept, dropped) = select_active(load_jsonl(&src));
+    assert_eq!(dropped, 2, "only the summarized records are off-path");
+    for u in ["u0", "a0", "u1", "a1", "b", "cs", "u3", "a3"] {
+        assert!(kept.iter().any(|r| rec_uuid(r) == Some(u)), "{u} kept");
+    }
+
+    let out = assemble_to(
+        &dir,
+        &src,
+        &json!({"0": "Summary of the first kept turn."}),
+        2,
+    );
+    verify_ok(&out, Some(&src));
+    assert!(file_contains(&out, "KEPT ask one") && file_contains(&out, "KEPT answer two"));
+    assert!(
+        !file_contains(&out, "KEPT answer one"),
+        "the first kept turn was summarized"
+    );
+    assert!(file_contains(&out, "Summary of the first kept turn."));
+    assert!(!file_contains(&out, "SUMMARIZED ask"));
+
+    let twin = load_jsonl(&out);
+    let b = twin.iter().position(|r| rec_uuid(r) == Some("b")).unwrap();
+    let before: Vec<&str> = twin[..b].iter().filter_map(rec_uuid).collect();
+    let meta = &twin[b]["compactMetadata"];
+    let listed: Vec<&str> = meta["preservedMessages"]["uuids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        listed, before,
+        "the boundary lists every twin record before it"
+    );
+    assert!(
+        twin[..b]
+            .iter()
+            .any(|r| truthy(r, "recompactSynthetic") && listed.contains(&rec_uuid(r).unwrap())),
+        "a summarized part is listed by its new uuid"
+    );
+    assert_eq!(
+        meta["preservedMessages"]["allUuids"],
+        meta["preservedMessages"]["uuids"]
+    );
+    assert_eq!(meta["preservedSegment"]["headUuid"], json!(before[0]));
+    assert_eq!(meta["preservedSegment"]["tailUuid"], json!("a1"));
+    assert_eq!(meta["preservedSegment"]["anchorUuid"], json!("b"));
+    assert_eq!(
+        twin[b]["parentUuid"],
+        Value::Null,
+        "a fresh chain root, as Claude Code writes it"
+    );
+    assert_eq!(twin[b]["logicalParentUuid"], json!("a1"));
+}
+
+#[test]
+fn a_boundary_whose_kept_records_are_gone_becomes_a_plain_boundary() {
+    // An older twin started at the boundary and lost what it listed.
+    let dir = tmp_dir();
+    let records = vec![
+        partial_boundary("b", &["gone-1", "gone-2"]),
+        summary_after("cs", "b", "Summary of the summarized part."),
+        user("u3", Some("cs"), "after ask"),
+        assistant("a3", "u3", "after answer"),
+        last_prompt("a3", "after ask"),
+    ];
+    let src = write_session(&dir, "stale.jsonl", &records);
+    let out = assemble_to(&dir, &src, &json!({}), 1);
+    verify_ok(&out, Some(&src));
+    let twin = load_jsonl(&out);
+    let b = twin.iter().find(|r| rec_uuid(r) == Some("b")).unwrap();
+    assert!(b["compactMetadata"].get("preservedMessages").is_none());
+    assert!(b["compactMetadata"].get("preservedSegment").is_none());
+    assert_eq!(
+        b["compactMetadata"]["trigger"], "manual",
+        "the rest of the boundary stays"
+    );
+}
+
 #[test]
 fn compact_summary_segment_is_pinned_verbatim() {
     // A compaction summary landing inside a segment (not head) must pin that segment verbatim:
