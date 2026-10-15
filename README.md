@@ -71,7 +71,8 @@ terminal and use claude as always:
 Anything removed stays readable through the `recall` tool. `claude -p`, subcommands, and flags the
 launcher does not recognize run plain claude. New versions install themselves when claude starts
 (the plugin's auto-update); the first run of each version downloads its binary from GitHub, so it
-needs network access (or `cargo`). `recompact update` updates on demand, and `recompact doctor`
+needs network access (or `cargo`). A hook does that download in the background, so a prompt never
+waits for it. `recompact update` updates on demand, and `recompact doctor`
 checks the whole setup. To undo the shell change: `~/.claude/recompact/bin/recompact uninstall`.
 
 ### Installing or updating with an agent
