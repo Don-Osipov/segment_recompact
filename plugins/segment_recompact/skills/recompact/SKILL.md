@@ -231,8 +231,9 @@ through the launcher, and need no setup. The hooks find the job from `CLAUDE_JOB
 claude started inside the job does not count). `/recompact`, automatic compaction, and checkpoint
 requests work as under the launcher; a ready request starts `recompact job-handoff`, which
 compacts while the job keeps working. A pause: `state.json` `tempo` is `idle` or `blocked` (a turn
-that ended asking the user something), not `active`; no tool call waits on a dialog; the
-transcript is still for 1.5s. The worker then runs `claude attach <short>` on a terminal of its
+that ended asking the user something), or `active` only because background agents still run after
+the turn ended (its `turn_duration` counts them, `inFlight` lists them) and the transcript has been
+still for 10s; no tool call waits on a dialog; the transcript is still for 1.5s. The worker then runs `claude attach <short>` on a terminal of its
 own, the size of the job's terminal, presses Esc once, and types `/resume <twin>`. If the Esc
 shows "Esc again to clear", someone left text in the input box: it detaches and tries again 10s
 later (a second Esc would clear the text). Background shells, monitors, agents, and scheduled

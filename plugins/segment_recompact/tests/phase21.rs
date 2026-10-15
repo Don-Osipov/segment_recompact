@@ -504,6 +504,140 @@ fn a_busy_job_is_left_alone_until_its_turn_ends() {
     assert!(lines(dir.join("typed.log")).contains(&format!("got /resume {twin}")));
 }
 
+/// Leave the transcript as a session that has written nothing for a minute.
+fn age(transcript: &Path) {
+    fs::File::options()
+        .write(true)
+        .open(transcript)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+        .unwrap();
+}
+
+fn start_worker(job_dir: &Path, dir: &Path, stub: &str) -> std::thread::JoinHandle<i32> {
+    let (job_dir, dir, stub) = (job_dir.to_path_buf(), dir.to_path_buf(), stub.to_string());
+    std::thread::spawn(move || run_worker(&job_dir, &dir, &stub))
+}
+
+/// Did the worker switch and end within `within` while the job stayed `active`? If not, the
+/// agents finish then (`tempo` goes idle), so a worker that waits for them ends too.
+fn ended_while_active(
+    worker: std::thread::JoinHandle<i32>,
+    job_dir: &Path,
+    within: Duration,
+) -> bool {
+    let deadline = Instant::now() + within;
+    while !worker.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let ended = worker.is_finished();
+    if !ended {
+        let state = job_dir.join("state.json");
+        let mut s: Value = serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+        s["tempo"] = json!("idle");
+        fs::write(&state, s.to_string()).unwrap();
+    }
+    assert_eq!(worker.join().unwrap(), 0);
+    ended
+}
+
+#[test]
+fn agents_that_run_after_the_turn_do_not_hold_a_jobs_switch() {
+    // Claude Code keeps the job `active` while background agents run, after the turn has ended.
+    let dir = tmp_dir();
+    let t = big_session(&dir, 20_000);
+    let (job, job_dir) = job_folder(json!({"state": "working", "tempo": "active",
+        "inFlight": {"tasks": 2, "queued": 0, "kinds": ["local_agent", "local_bash"],
+                     "drainableMonitors": 0}}));
+    let shell = job_state(&job, &t, json!({}));
+    ready_request(&shell, &t, false);
+    let stub = claude_stub(&dir, &shell.dir, "switch");
+    age(&t);
+    let worker = start_worker(&job_dir, &dir, &stub);
+    assert!(
+        ended_while_active(worker, &job_dir, Duration::from_secs(8)),
+        "switched while the agents ran"
+    );
+    let twin = lineage_latest(&dir, SESSION);
+    let typed = lines(dir.join("typed.log"));
+    assert_eq!(typed[0], "esc", "Esc first, alone: {typed:?}");
+    assert_eq!(typed[1], format!("got /resume {twin}"), "{typed:?}");
+    assert_eq!(
+        read(shell.dir.join("session.json")).unwrap()["session"],
+        twin
+    );
+}
+
+#[test]
+fn the_agents_a_turn_left_running_count_without_the_daemons_list() {
+    let dir = tmp_dir();
+    let t = big_session(&dir, 20_000);
+    append(
+        &t,
+        &[
+            user("u3", Some("a3"), "start three agents"),
+            assistant("a4", "u3", "started them", Some(20_000)),
+            json!({"type": "system", "subtype": "stop_hook_summary", "sessionId": SESSION}),
+            json!({"type": "system", "subtype": "turn_duration", "sessionId": SESSION,
+                   "pendingBackgroundAgentCount": 3}),
+        ],
+    );
+    let (job, job_dir) = job_folder(json!({"state": "working", "tempo": "active"}));
+    let shell = job_state(&job, &t, json!({}));
+    ready_request(&shell, &t, false);
+    let stub = claude_stub(&dir, &shell.dir, "switch");
+    age(&t);
+    let worker = start_worker(&job_dir, &dir, &stub);
+    assert!(
+        ended_while_active(worker, &job_dir, Duration::from_secs(8)),
+        "switched while the agents ran"
+    );
+    let twin = lineage_latest(&dir, SESSION);
+    assert!(lines(dir.join("typed.log")).contains(&format!("got /resume {twin}")));
+}
+
+#[test]
+fn a_turn_that_runs_while_agents_run_holds_a_jobs_switch_until_it_ends() {
+    let dir = tmp_dir();
+    let t = big_session(&dir, 20_000);
+    // The next prompt's turn runs and has written nothing for a while (a long first reply).
+    append(&t, &[user("u3", Some("a3"), "and the tests?")]);
+    let (job, job_dir) = job_folder(json!({"state": "working", "tempo": "active",
+        "inFlight": {"tasks": 1, "queued": 0, "kinds": ["local_agent"], "drainableMonitors": 0}}));
+    let shell = job_state(&job, &t, json!({}));
+    ready_request(&shell, &t, false);
+    let stub = claude_stub(&dir, &shell.dir, "switch");
+    age(&t);
+    let worker = start_worker(&job_dir, &dir, &stub);
+    std::thread::sleep(Duration::from_secs(4));
+    assert!(
+        !dir.join("runs.log").exists(),
+        "nothing typed into a running turn"
+    );
+    // The turn ends; its agent runs on.
+    append(
+        &t,
+        &[
+            assistant("a4", "u3", "they pass", Some(20_000)),
+            json!({"type": "system", "subtype": "stop_hook_summary", "sessionId": SESSION}),
+            json!({"type": "system", "subtype": "turn_duration", "sessionId": SESSION,
+                   "pendingBackgroundAgentCount": 1}),
+        ],
+    );
+    age(&t);
+    assert!(
+        ended_while_active(worker, &job_dir, Duration::from_secs(8)),
+        "switched once the turn ended, while the agent ran"
+    );
+    let twin = lineage_latest(&dir, SESSION);
+    assert_eq!(
+        last_carried_uuid(&dir.join(format!("{twin}.jsonl"))).as_deref(),
+        Some("a4"),
+        "the twin carries the turn that ended"
+    );
+    assert!(lines(dir.join("typed.log")).contains(&format!("got /resume {twin}")));
+}
+
 #[test]
 fn a_draft_in_the_jobs_input_box_holds_the_switch_until_it_is_gone() {
     let dir = tmp_dir();
