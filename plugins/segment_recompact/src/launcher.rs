@@ -668,36 +668,48 @@ fn read_tail(path: &Path, max: u64) -> Option<String> {
     })
 }
 
-/// Is the session between turns? After a turn, Claude Code writes its bookkeeping
-/// (`turn_duration`, `stop_hook_summary`), and it writes the turn's own last records after the
-/// Stop hooks run, so only the transcript can tell, not a hook.
-pub fn turn_ended(transcript: &Path) -> bool {
-    // Read often while a switch waits: a small tail answers almost always.
+/// The last record of the transcript that `pick` takes. Read often while a switch waits: a small
+/// tail answers almost always.
+fn find_back(transcript: &Path, pick: impl Fn(&Value) -> bool) -> Option<Value> {
     for window in [64u64 << 10, 4 << 20] {
-        let Some(tail) = read_tail(transcript, window) else {
-            return true;
-        };
+        let tail = read_tail(transcript, window)?;
         for line in tail.lines().rev() {
             let Ok(r) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
-            if rec_type(&r) == "system"
-                && matches!(
-                    get_s(&r, "subtype"),
-                    Some("turn_duration" | "stop_hook_summary")
-                )
-            {
-                return true;
-            }
-            if turn_record(&r) {
-                return false;
+            if pick(&r) {
+                return Some(r);
             }
         }
         if file_len(transcript) <= window {
             break;
         }
     }
-    true
+    None
+}
+
+fn bookkeeping(r: &Value, subtypes: &[&str]) -> bool {
+    rec_type(r) == "system" && get_s(r, "subtype").is_some_and(|s| subtypes.contains(&s))
+}
+
+/// Is the session between turns? After a turn, Claude Code writes its bookkeeping
+/// (`turn_duration`, `stop_hook_summary`), and it writes the turn's own last records after the
+/// Stop hooks run, so only the transcript can tell, not a hook.
+pub fn turn_ended(transcript: &Path) -> bool {
+    find_back(transcript, |r| {
+        turn_record(r) || bookkeeping(r, &["turn_duration", "stop_hook_summary"])
+    })
+    .is_none_or(|r| !turn_record(&r))
+}
+
+/// The background agents the session's last turn left running, as its `turn_duration` counts
+/// them; none while a turn runs.
+fn agents_left_running(transcript: &Path) -> usize {
+    find_back(transcript, |r| {
+        turn_record(r) || bookkeeping(r, &["turn_duration"])
+    })
+    .and_then(|r| get_u(&r, "pendingBackgroundAgentCount"))
+    .unwrap_or(0)
 }
 
 /// A tool call in the current turn has no result yet: claude is running it, or a dialog for it
@@ -755,14 +767,33 @@ enum Idle {
 /// quiet, is a pause.
 const BUSY_TITLE_PAUSE: Duration = Duration::from_secs(10);
 
-fn paused_under_busy_title(p: &Proxy, transcript: &Path) -> bool {
-    let quiet = fs::metadata(transcript)
+/// How long nothing has been written to the transcript.
+fn quiet_for(transcript: &Path) -> Duration {
+    fs::metadata(transcript)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
-        .unwrap_or(Duration::ZERO);
+        .unwrap_or(Duration::ZERO)
+}
+
+fn paused_under_busy_title(p: &Proxy, transcript: &Path) -> bool {
     p.title_busy_for().is_some_and(|d| d >= BUSY_TITLE_PAUSE)
-        && quiet >= BUSY_TITLE_PAUSE
+        && quiet_for(transcript) >= BUSY_TITLE_PAUSE
+        && turn_ended(transcript)
+}
+
+/// A background job stays `active` while background agents run, also after the turn has ended
+/// and the prompt is free: the turn's `turn_duration` counts the agents it left running, and
+/// `inFlight` lists them (measured, CLI 2.1.296 and 2.1.300: still `active` 70 min after the turn
+/// ended, while three agents ran). As with a busy title, an ended turn in a transcript this quiet
+/// is a pause.
+fn paused_under_agents(state: &Value, transcript: &Path) -> bool {
+    let listed = state
+        .pointer("/inFlight/kinds")
+        .and_then(Value::as_array)
+        .is_some_and(|k| k.iter().any(|k| k == "local_agent"));
+    quiet_for(transcript) >= BUSY_TITLE_PAUSE
+        && (listed || agents_left_running(transcript) > 0)
         && turn_ended(transcript)
 }
 
@@ -788,14 +819,15 @@ fn claude_idle(p: &Proxy, transcript: &Path, r: &mut Ready) -> Idle {
 }
 
 /// Is a background job at a pause? Its `state.json` says whether a turn runs: `tempo` is
-/// `active` during one, `idle` after it, and `blocked` after a turn that ended asking the user
-/// something. `state` stays `working` while a background task runs after the turn ended, and
-/// `inFlight.queued` can stay 1 while a job waits for the user, so neither says anything about
-/// turns (measured, CLI 2.1.293). A queued prompt that does start writes to the transcript
-/// within the settle time. Any other `tempo`: the transcript tells.
+/// `active` during one (and while background agents run after it, see `paused_under_agents`),
+/// `idle` after it, and `blocked` after a turn that ended asking the user something. `state`
+/// stays `working` while a background task runs after the turn ended, and `inFlight.queued` can
+/// stay 1 while a job waits for the user, so neither says anything about turns (measured, CLI
+/// 2.1.293). A queued prompt that does start writes to the transcript within the settle time.
+/// Any other `tempo`: the transcript tells.
 fn job_busy(state: &Value, transcript: &Path) -> bool {
     match get_s(state, "tempo") {
-        Some("active") => true,
+        Some("active") => !paused_under_agents(state, transcript),
         Some("idle" | "blocked") => false,
         _ => !turn_ended(transcript),
     }
@@ -832,10 +864,10 @@ trait Term {
     /// No key has reached claude for a while.
     fn settled(&self) -> bool;
     /// Make sure the input box is empty and stays so while recompact types.
-    fn take(&mut self) -> Take;
+    fn take(&mut self, transcript: &Path) -> Take;
     /// Give the input box back.
     fn give_back(&mut self);
-    fn type_resume(&mut self, twin: &str);
+    fn type_resume(&mut self, twin: &str, transcript: &Path);
     fn type_prompt(&mut self, text: &str);
 }
 
@@ -881,7 +913,7 @@ impl Term for Own<'_> {
         self.0.quiet_for() >= SETTLE
     }
 
-    fn take(&mut self) -> Take {
+    fn take(&mut self, _: &Path) -> Take {
         self.0.hold();
         if self.0.input_clean() {
             Take::Yes
@@ -895,7 +927,7 @@ impl Term for Own<'_> {
         self.0.release();
     }
 
-    fn type_resume(&mut self, twin: &str) {
+    fn type_resume(&mut self, twin: &str, _: &Path) {
         type_resume_with(&|b| self.0.type_keys(b), twin, true);
     }
 
@@ -938,9 +970,9 @@ impl<'a> Attached<'a> {
 
     /// An Esc now neither clears a draft (a second Esc soon after the first) nor interrupts a turn
     /// that started since the last look (attaching takes a moment).
-    fn esc_ok(&self) -> bool {
+    fn esc_ok(&self, transcript: &Path) -> bool {
         self.esc_at.is_none_or(|at| at.elapsed() >= ESC_GAP)
-            && get_s(&self.job.state(), "tempo") != Some("active")
+            && !job_busy(&self.job.state(), transcript)
     }
 
     /// Attached, or attach now (a second try after a pause: the daemon may be busy).
@@ -1004,14 +1036,14 @@ impl Term for Attached<'_> {
         true
     }
 
-    fn take(&mut self) -> Take {
-        if !self.esc_ok() {
+    fn take(&mut self, transcript: &Path) -> Take {
+        if !self.esc_ok(transcript) {
             return Take::NotNow;
         }
         if !self.ensure_attached() {
             return Take::Never;
         }
-        if !self.esc_ok() {
+        if !self.esc_ok(transcript) {
             self.give_back();
             return Take::NotNow;
         }
@@ -1036,11 +1068,11 @@ impl Term for Attached<'_> {
         }
     }
 
-    fn type_resume(&mut self, twin: &str) {
+    fn type_resume(&mut self, twin: &str, transcript: &Path) {
         if !self.ensure_attached() {
             return;
         }
-        let esc = self.esc_ok();
+        let esc = self.esc_ok(transcript);
         if esc {
             self.esc_at = Some(Instant::now());
         }
@@ -2764,7 +2796,7 @@ fn step(h: &mut Handoff, ip: &mut InPlace, t: &mut dyn Term) -> Next {
             } else if !(settled && wait == "quiet") {
                 (Next::Wait, Some(Phase::Ready(r)))
             } else {
-                match t.take() {
+                match t.take(&h.transcript) {
                     Take::NotNow => (Next::Wait, Some(Phase::Ready(r))),
                     Take::Never => {
                         progress_end(ip.state, None);
@@ -2791,7 +2823,7 @@ fn step(h: &mut Handoff, ip: &mut InPlace, t: &mut dyn Term) -> Next {
                             &switch_notice(h, &r.twin, r.est),
                         );
                         crate::progress_update(json!({"phase": "switching"}));
-                        t.type_resume(&r.twin);
+                        t.type_resume(&r.twin, &h.transcript);
                         (
                             Next::Wait,
                             Some(Phase::Switching {
@@ -2824,7 +2856,7 @@ fn step(h: &mut Handoff, ip: &mut InPlace, t: &mut dyn Term) -> Next {
                     }),
                 )
             } else if tries < 2 {
-                t.type_resume(&twin);
+                t.type_resume(&twin, &h.transcript);
                 (
                     Next::Wait,
                     Some(Phase::Switching {
