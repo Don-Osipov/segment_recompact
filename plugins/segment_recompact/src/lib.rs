@@ -229,8 +229,10 @@ pub fn fidelity_text(r: &Value) -> String {
 /// branches and pre-compaction history.
 ///
 /// Keeps the records on the leaf→root chain plus records that carry no uuid (they are not part of
-/// the chain), preserving file order. Falls back to the full file when no leaf can be determined.
-/// Returns (kept records, number of off-path records dropped).
+/// the chain), preserving file order. A partial compaction ("Summarize from here") is the
+/// exception: its boundary starts a fresh chain root but lists the records it kept, and Claude
+/// Code loads those as well, so they are kept too. Falls back to the full file when no leaf can
+/// be determined. Returns (kept records, number of off-path records dropped).
 pub fn select_active(records: Vec<Value>) -> (Vec<Value>, usize) {
     let mut by_uuid: HashMap<String, usize> = HashMap::new();
     for (i, r) in records.iter().enumerate() {
@@ -262,14 +264,23 @@ pub fn select_active(records: Vec<Value>) -> (Vec<Value>, usize) {
         return (records, 0);
     };
     let mut on_path: HashSet<usize> = HashSet::new();
+    let mut root = None;
     while let Some(&i) = by_uuid.get(&cur) {
         if !on_path.insert(i) {
             break; // cycle guard: malformed files must not hang us
         }
+        root = Some(i);
         match records[i].get("parentUuid").and_then(|v| v.as_str()) {
             Some(p) => cur = p.to_string(),
             None => break,
         }
+    }
+    if let Some(r) = root {
+        on_path.extend(
+            preserved_uuids(&records[r])
+                .iter()
+                .filter_map(|u| by_uuid.get(u.as_str())),
+        );
     }
     let total = records.len();
     let kept: Vec<Value> = records
@@ -280,6 +291,83 @@ pub fn select_active(records: Vec<Value>) -> (Vec<Value>, usize) {
         .collect();
     let dropped = total - kept.len();
     (kept, dropped)
+}
+
+/// The records a partial compaction kept, as its boundary lists them in
+/// `compactMetadata.preservedMessages`. Claude Code honors the list only when it names an anchor
+/// and holds nothing but uuids; otherwise there is none.
+pub fn preserved_uuids(r: &Value) -> Vec<String> {
+    if rec_type(r) != "system"
+        || r.get("subtype").and_then(|v| v.as_str()) != Some("compact_boundary")
+    {
+        return Vec::new();
+    }
+    let Some(pm) = r.pointer("/compactMetadata/preservedMessages") else {
+        return Vec::new();
+    };
+    let uuids = pm.get("uuids").and_then(|v| v.as_array());
+    match uuids {
+        Some(a)
+            if pm.get("anchorUuid").is_some_and(Value::is_string)
+                && a.iter().all(Value::is_string) =>
+        {
+            a.iter()
+                .filter_map(|u| u.as_str().map(String::from))
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Point a partial compaction's boundary at the records the twin kept. Claude Code loads only the
+/// listed records, and compaction gives summarized parts new uuids, so the twin's boundary lists
+/// every record before it. As Claude Code writes it, the boundary starts a fresh chain whose
+/// logical parent is the last kept record. With nothing kept before it, it is a plain boundary.
+fn relist_preserved(out: &mut [Value]) {
+    let Some(b) = out.iter().rposition(|r| !preserved_uuids(r).is_empty()) else {
+        return;
+    };
+    let kept: Vec<String> = out[..b]
+        .iter()
+        .filter_map(|r| rec_uuid(r).map(String::from))
+        .collect();
+    let anchor = out[b]
+        .pointer("/compactMetadata/preservedMessages/anchorUuid")
+        .and_then(|v| v.as_str())
+        .filter(|a| out.iter().any(|r| rec_uuid(r) == Some(*a)))
+        .or_else(|| rec_uuid(&out[b]))
+        .map(String::from);
+    let r = &mut out[b];
+    r["parentUuid"] = Value::Null;
+    if let Some(tail) = kept.last() {
+        r["logicalParentUuid"] = json!(tail);
+    }
+    let Some(m) = r.get_mut("compactMetadata").and_then(|m| m.as_object_mut()) else {
+        return;
+    };
+    let (Some(head), Some(tail)) = (kept.first(), kept.last()) else {
+        m.remove("preservedMessages");
+        m.remove("preservedSegment");
+        return;
+    };
+    if let Some(pm) = m
+        .get_mut("preservedMessages")
+        .and_then(|p| p.as_object_mut())
+    {
+        pm.insert("anchorUuid".into(), json!(anchor));
+        pm.insert("uuids".into(), json!(kept));
+        if pm.contains_key("allUuids") {
+            pm.insert("allUuids".into(), json!(kept));
+        }
+    }
+    if let Some(ps) = m
+        .get_mut("preservedSegment")
+        .and_then(|p| p.as_object_mut())
+    {
+        ps.insert("headUuid".into(), json!(head));
+        ps.insert("anchorUuid".into(), json!(anchor));
+        ps.insert("tailUuid".into(), json!(tail));
+    }
 }
 
 /// The record set every unit-hashing path must agree on: the active path minus the PREVIOUS
@@ -2640,6 +2728,7 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
             }
         }
     }
+    relist_preserved(&mut out);
     let leaf = prev.clone().unwrap_or_default();
 
     if let Some(t) = title_record(&records, &new_session, generation) {
@@ -4755,14 +4844,16 @@ pub fn cmd_verify(args: &[String]) -> i32 {
     checks.push(("single sessionId", ids.len() == 1, format!("found {}", ids.len())));
 
     // Linear parent chain over uuid-carrying records: root has parentUuid null, each next record
-    // points at the previous one.
+    // points at the previous one. A partial compaction's boundary starts a fresh chain, as Claude
+    // Code writes it.
     let mut prev: Option<&str> = None;
     let mut chain_ok = true;
     let mut chain_detail = String::new();
     for r in &new {
         if let Some(u) = rec_uuid(r) {
             let p = r.get("parentUuid").and_then(|v| v.as_str());
-            if p != prev {
+            let restart = p.is_none() && !preserved_uuids(r).is_empty();
+            if p != prev && !restart {
                 chain_ok = false;
                 chain_detail = format!("record {u}: parentUuid {p:?}, expected {prev:?}");
                 break;
@@ -4771,6 +4862,22 @@ pub fn cmd_verify(args: &[String]) -> i32 {
         }
     }
     checks.push(("linear parent chain", chain_ok, chain_detail));
+
+    // Claude Code loads only the records a partial compaction's boundary lists: one missing from
+    // the twin is gone from the conversation.
+    let have: HashSet<&str> = new.iter().filter_map(rec_uuid).collect();
+    let listed = new
+        .iter()
+        .rev()
+        .map(preserved_uuids)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default();
+    let missing = listed.iter().filter(|u| !have.contains(u.as_str())).count();
+    checks.push((
+        "kept records of a partial compaction present",
+        missing == 0,
+        format!("{missing} of {} listed records missing", listed.len()),
+    ));
 
     // Tool pairing: every tool_use has a later tool_result; every tool_result has an earlier
     // tool_use. The Messages API 400s on violations, which bricks resume.

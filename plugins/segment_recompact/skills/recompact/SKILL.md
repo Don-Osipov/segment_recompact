@@ -294,7 +294,9 @@ stays bounded across unlimited handoffs.
 ## Notes and gotchas
 
 - **Only the active path is processed.** Abandoned branches and pre-auto-compaction history are
-  dropped, never resurrected.
+  dropped, never resurrected. A partial compaction ("Summarize from here") is the exception: its
+  boundary lists the messages it kept, Claude Code still loads them, and the twin keeps them and
+  lists the twin's own records in their place.
 - **Provenance survives moves.** A summary records its source path and session id; when Claude Code
   relocates a session between project dirs (worktree resumes), recall finds it by id.
 - **Durability.** Originals live under `~/.claude/projects`, subject to `cleanupPeriodDays`; a
