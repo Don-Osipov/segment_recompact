@@ -93,6 +93,24 @@ build() {
     chmod +x "$cached.part.$$" && mv -f "$cached.part.$$" "$cached"
 }
 
+# Claude Code stops a hook at its timeout, and a download or build can take longer, so it would
+# never finish and every prompt would wait on it again. A hook starts it in the background and
+# does nothing this time; the next hook finds the binary.
+if [ "${1:-}" = hook ]; then
+  lock="$cached.fetching"
+  # A download that died with the machine must not block the ones after it.
+  if [ -n "$(find "$lock" -prune -mmin +30 2>/dev/null)" ]; then
+    rmdir "$lock" 2>/dev/null
+  fi
+  if mkdir "$lock" 2>/dev/null; then
+    (
+      fetch || build
+      rmdir "$lock"
+    ) </dev/null >/dev/null 2>&1 &
+  fi
+  exit 0
+fi
+
 if fetch || build; then
   run "$cached" "$@"
 fi

@@ -24,3 +24,18 @@ jobs:
           got=$(RECOMPACT_HOME="$RUNNER_TEMP/rc" ./bin/recompact version)
           echo "plugin.json $want, binary: $got"
           [ "$got" = "recompact $want" ]
+      - name: a hook never waits for a download
+        run: |
+          d="$RUNNER_TEMP/fresh"
+          mkdir -p "$d/fake"
+          cp -R bin .claude-plugin "$d/"
+          printf '#!/bin/sh\necho x >> "%s/calls"\nsleep 30\nexit 28\n' "$d" > "$d/fake/curl"
+          chmod +x "$d/fake/curl"
+          for _ in 1 2; do
+            start=$(date +%s)
+            out=$(echo '{"prompt":"hi"}' | PATH="$d/fake:$PATH" RECOMPACT_HOME="$d/home" \
+              "$d/bin/recompact" hook user-prompt-submit)
+            [ $(( $(date +%s) - start )) -lt 5 ] && [ -z "$out" ]
+          done
+          sleep 1
+          [ "$(wc -l < "$d/calls")" -eq 1 ]
