@@ -663,6 +663,10 @@ fn work_session() -> Vec<Value> {
     recs.push(json!({"type": "agent-name", "agentName": "Deploy fix", "sessionId": SESSION}));
     recs.push(json!({"type": "agent-color", "agentColor": "yellow", "sessionId": SESSION}));
     recs.push(json!({"type": "agent-color", "agentColor": "blue", "sessionId": SESSION}));
+    let pr = |n: u64| json!({"type": "pr-link", "sessionId": SESSION, "prNumber": n, "prUrl": format!("https://github.com/o/r/pull/{n}"), "prRepository": "o/r", "timestamp": "2026-11-02T22:19:23.095Z"});
+    recs.insert(4, pr(5073));
+    recs.insert(8, pr(5074));
+    recs.push(pr(5073));
     recs
 }
 
@@ -713,6 +717,13 @@ fn the_preamble_briefs_state_and_pins_standing_instructions_verbatim() {
     assert_eq!(colored.len(), 1);
     assert_eq!(colored[0]["agentColor"], "blue");
     assert_eq!(colored[0]["sessionId"], twin_id);
+    // Each PR link rides along once, under the twin's id, in the order each was last linked.
+    let linked: Vec<_> = out.iter().filter(|r| r["type"] == "pr-link").collect();
+    assert_eq!(
+        linked.iter().map(|r| r["prNumber"].as_u64().unwrap()).collect::<Vec<_>>(),
+        vec![5074, 5073]
+    );
+    assert!(linked.iter().all(|r| r["sessionId"] == twin_id && r["prRepository"] == "o/r"));
     // Resume flags: the model (1M: usage ran past 200k) and the session-only effort.
     let flags = resume_flags(&work_session());
     assert_eq!(

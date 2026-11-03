@@ -2188,6 +2188,31 @@ fn identity_records(records: &[Value], new_session: &str) -> Vec<Value> {
         .collect()
 }
 
+/// The session's pull-request links, carried to the twin under its own id. Claude Code records a
+/// `pr-link` when the session opens or views a PR and shows the latest as the session's PR; a twin
+/// without them lost that link, and so did anything reading the transcript for it. One per PR, in
+/// the order each was last linked.
+fn pr_link_records(records: &[Value], new_session: &str) -> Vec<Value> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<Value> = records
+        .iter()
+        .rev()
+        .filter(|r| rec_type(r) == "pr-link")
+        .filter(|r| {
+            r.get("prUrl")
+                .and_then(|v| v.as_str())
+                .is_some_and(|url| seen.insert(url.to_string()))
+        })
+        .map(|r| {
+            let mut r = r.clone();
+            r["sessionId"] = json!(new_session);
+            r
+        })
+        .collect();
+    out.reverse();
+    out
+}
+
 /// Core of assemble, returning the new session id and output path (None for --plan previews).
 fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     let (pos, opts) = parse_opts(args);
@@ -2735,6 +2760,7 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
         out.push(t);
     }
     out.extend(identity_records(&records, &new_session));
+    out.extend(pr_link_records(&records, &new_session));
     // Fresh last-prompt tail pointing at the new leaf.
     let last_prompt = last_prompt_text(&records)
         .or_else(|| segs.last().map(|seg| user_text(&records[seg.user_idx])))
