@@ -422,7 +422,9 @@ pub fn is_compaction_request(body: &Value) -> bool {
     else {
         return false;
     };
-    if last.get("role").and_then(|r| r.as_str()) != Some("user") {
+    // Claude Code sends the prompt as the last user message, or (desktop app sessions, 2.1.317)
+    // as a closing system message.
+    if !matches!(last.get("role").and_then(|r| r.as_str()), Some("user" | "system")) {
         return false;
     }
     let texts: Vec<&str> = match last.get("content") {

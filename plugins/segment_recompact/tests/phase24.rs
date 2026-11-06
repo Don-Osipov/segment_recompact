@@ -73,6 +73,11 @@ fn a_compaction_request_is_told_apart_from_other_requests() {
     assert!(is_compaction_request(&compaction_body("m", &retry)));
     assert!(!is_compaction_request(&compaction_body("m", "What is the code word?")));
     assert!(!is_compaction_request(&json!({"model": "m", "messages": []})));
+    // The desktop app sends it as a closing system message.
+    let mut system = compaction_body("m", PROMPT);
+    system["messages"].as_array_mut().unwrap().pop();
+    system["messages"].as_array_mut().unwrap().push(json!({"role": "system", "content": PROMPT}));
+    assert!(is_compaction_request(&system));
     // The prompt can follow the conversation's last words in the same text block.
     let joined = format!("and that was the last step.\n\n{PROMPT}");
     assert!(is_compaction_request(&compaction_body("m", &joined)));
