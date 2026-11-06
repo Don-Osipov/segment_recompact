@@ -97,8 +97,30 @@ inside claude instead.
 
 If a claude session cannot compact in place, it says why when it starts (at most once a day):
 setup not done yet (type `/recompact setup`), a terminal opened before setup (open a new one), or
-a shell file that defines `claude` itself. Editors and the desktop app do not go through the shell,
-so there `/recompact` compacts and prints a resume command instead.
+a shell file that defines `claude` itself. Editors do not go through the shell, so there `/recompact`
+compacts and prints a resume command instead. The Claude desktop app has its own way in: see below.
+
+### The Claude desktop app
+
+The desktop app runs Claude Code itself, so the launcher cannot switch its sessions, and a restart
+would end their background work. `recompact gateway` compacts them in place instead. It sits between
+the app and your inference endpoint and forwards every request, except Claude Code's own compaction
+request: that one it answers with recompact's twin of the session. The session keeps its process and
+its background shells, monitors and agents, and recall reads the twin chain.
+
+It needs the app in third-party mode with a gateway, at an `http://` endpoint:
+
+1. `recompact gateway install --upstream http://127.0.0.1:62896` (your endpoint) starts the gateway
+   at login on port 62897. `recompact gateway status` checks it; `recompact update` restarts it.
+2. In the app, open Developer → Configure Third-Party Inference…, set the gateway base URL to
+   `http://127.0.0.1:62897`, and restart the app.
+3. Set `"autoCompactWindow": 600000` (or your `RECOMPACT_AT`) in `~/.claude/settings.json`, so that
+   desktop sessions compact at that size. The launcher starts its own sessions with
+   `--autocompact auto`, so they still compact on recompact's terms.
+
+`/compact` in a desktop session runs recompact too. When recompact cannot make a session smaller,
+the request goes on to the endpoint unchanged and Claude Code's own summary applies. The log is
+`~/.claude/recompact/gateway.log`.
 
 ### Share with a team
 

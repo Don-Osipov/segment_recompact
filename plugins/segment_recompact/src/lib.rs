@@ -18,12 +18,14 @@ use serde_json::{json, Map, Value};
 mod accounting;
 mod anchor;
 mod brief;
+mod gateway;
 mod launcher;
 mod statusline;
 mod term;
 pub use accounting::*;
 pub use anchor::*;
 pub use brief::*;
+pub use gateway::*;
 pub use launcher::*;
 pub use statusline::{
     cmd_statusline, render_progress, status_line, with_statusline, without_statusline, wrapped_command,
@@ -60,7 +62,7 @@ queued for turn end under `shell`; otherwise compacts now and\n                 
 prints the resume command)\n  \
 recompact prewarm   <session> [--target T]  (summarize ahead into the cache)\n  \
 recompact job-handoff <job dir> <claude pid>  (a background job's in-place\n                      \
-handoff; its hooks start it)\n  \
+handoff; its hooks start it)\n  recompact gateway   [--port P] --upstream URL [--all]  (compaction in place for\n                      desktop app sessions: answers Claude Code's own compaction\n                      request with the twin; `gateway install|uninstall|status`)\n  \
 recompact install   (make interactive `claude` run through `shell`, turn on plugin\n                      \
 auto-update; `uninstall` undoes the shell part)\n  \
 recompact update    (newest plugin version, binary, and setup, then `doctor`)\n  \
@@ -4019,6 +4021,18 @@ pub fn continue_session(dir: &Path, start_id: &str, o: &ContinueOpts) -> (String
     if !latest_file.exists() {
         eprintln!("error: session file not found: {}", latest_file.display());
         return (start_id.to_string(), 1);
+    }
+    continue_file(dir, &latest, o)
+}
+
+/// Compact the session file `latest` as it is, without following its lineage first. Returns the
+/// twin's id, or `latest` when nothing was made.
+pub fn continue_file(dir: &Path, latest: &str, o: &ContinueOpts) -> (String, i32) {
+    let latest = latest.to_string();
+    let latest_file = dir.join(format!("{latest}.jsonl"));
+    if !latest_file.exists() {
+        eprintln!("error: session file not found: {}", latest_file.display());
+        return (latest, 1);
     }
     let cache_path = dir.join(".recompact-summary-cache.json");
 

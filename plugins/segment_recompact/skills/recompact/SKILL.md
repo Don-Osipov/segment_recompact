@@ -46,6 +46,9 @@ recompact handoff [--continue-after]
 - **In a background job** (`CLAUDE_JOB_DIR` is set), it queues the handoff the same way: when
   this turn ends, recompact compacts the session and switches the job to the twin. Reply in one
   line and end your turn.
+- **In the Claude desktop app with the gateway** (`CLAUDE_CODE_ENTRYPOINT` starts with
+  `claude-desktop`), it only prints how compaction works there: tell the user to type `/compact`.
+  recompact answers that compaction in the same session, and background work keeps running.
 - **Without the launcher**, it compacts now (Haiku summaries) and prints a
   `claude --resume …` command, also copied to the clipboard. Tell the user to `/exit` and paste
   it, and mention that starting claude through `recompact shell` makes this automatic.
