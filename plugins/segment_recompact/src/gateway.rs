@@ -308,14 +308,19 @@ fn handle(client: TcpStream, cfg: &Cfg) {
         return;
     };
     let (method, target) = (method.to_string(), target.to_string());
+    // A request without Content-Length or chunked framing has no body.
     let mut body = Vec::new();
-    if c
-        .read_body(&head, |p| {
-            body.extend_from_slice(p);
-            Ok(())
-        })
-        .is_err()
-        && head.get("content-length").is_some()
+    let framed = head.get("content-length").is_some()
+        || head
+            .get("transfer-encoding")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+    if framed
+        && c
+            .read_body(&head, |p| {
+                body.extend_from_slice(p);
+                Ok(())
+            })
+            .is_err()
     {
         return;
     }
@@ -381,20 +386,24 @@ fn passthrough(mut c: Conn, cfg: &Cfg, head: &Head, method: &str, target: &str, 
     if c.s.write_all(out.as_bytes()).is_err() {
         return;
     }
-    // The body goes through byte for byte (chunk framing too), so the client decodes it.
-    let first = std::mem::take(&mut up.buf);
-    if !first.is_empty() && c.s.write_all(&first).is_err() {
-        return;
-    }
-    let mut tmp = [0u8; 16384];
-    loop {
-        match up.s.read(&mut tmp) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if c.s.write_all(&tmp[..n]).is_err() || c.s.flush().is_err() {
-                    break;
-                }
+    // The body ends where its own framing says, not when the upstream closes, which a server
+    // that keeps the connection open would never do. Chunks go on as chunks, as they arrive.
+    let chunked = rh
+        .get("transfer-encoding")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+    let no_body = rh.line.split(' ').nth(1).is_some_and(|s| s == "204" || s == "304") || method == "HEAD";
+    if !no_body {
+        let client = &mut c.s;
+        let sent = up.read_body(&rh, |p| {
+            if chunked {
+                write_chunk(client, p)
+            } else {
+                client.write_all(p)?;
+                client.flush()
             }
+        });
+        if sent.is_ok() && chunked {
+            let _ = write_chunk(&mut c.s, b"");
         }
     }
     let _ = up.s.shutdown(Shutdown::Both);

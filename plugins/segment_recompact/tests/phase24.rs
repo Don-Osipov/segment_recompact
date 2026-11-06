@@ -187,11 +187,24 @@ fn fake_upstream() -> u16 {
                 }
                 let line = head.lines().next().unwrap_or("").to_string();
                 let body = format!("event: message_stop\ndata: {}\n\n", json!({"type": "message_stop", "upstream": line}));
+                if line.contains("/chunked") {
+                    // Chunked, and the connection stays open after the last chunk.
+                    let half = body.len() / 2;
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{}\r\n{:x}\r\n{}\r\n0\r\n\r\n",
+                        half, &body[..half], body.len() - half, &body[half..]
+                    );
+                    std::thread::sleep(Duration::from_secs(30));
+                    return;
+                }
                 let _ = write!(
                     s,
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n{body}",
                     body.len()
                 );
+                // Like a server that keeps connections alive: it does not close first.
+                std::thread::sleep(Duration::from_secs(30));
             });
         }
     });
@@ -203,12 +216,9 @@ fn send(port: u16, method: &str, path: &str, session: Option<&str>, body: &str) 
     let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
     let sid = session.map(|v| format!("X-Claude-Code-Session-Id: {v}\r\n")).unwrap_or_default();
-    write!(
-        s,
-        "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n{sid}Content-Length: {}\r\n\r\n{body}",
-        body.len()
-    )
-    .unwrap();
+    // A GET carries no Content-Length, as real clients send it.
+    let len = if body.is_empty() { String::new() } else { format!("Content-Length: {}\r\n", body.len()) };
+    write!(s, "{method} {path} HTTP/1.1\r\nHost: x\r\n{sid}{len}\r\n{body}").unwrap();
     let mut raw = Vec::new();
     s.read_to_end(&mut raw).unwrap();
     let text = String::from_utf8_lossy(&raw).to_string();
@@ -270,6 +280,8 @@ fn the_gateway_forwards_requests_and_answers_a_desktop_sessions_compaction_itsel
     // Everything else goes through to the upstream, path and all.
     let (status, body) = send(port, "GET", "/v1/models", None, "");
     assert!(status.contains("200") && body.contains("GET /v1/models HTTP/1.1"), "{status} {body}");
+    let (_, body) = send(port, "GET", "/v1/chunked", None, "");
+    assert!(body.contains("GET /v1/chunked HTTP/1.1"), "chunks reach the client in one piece: {body}");
     let compact = compaction_body("cc/claude-opus-5-5", PROMPT).to_string();
     let (_, body) = send(port, "POST", "/v1/messages?beta=true", Some(terminal), &compact);
     assert!(body.contains("POST /v1/messages?beta=true"), "a terminal session's compaction is Claude Code's: {body}");
