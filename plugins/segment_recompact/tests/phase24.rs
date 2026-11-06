@@ -73,6 +73,9 @@ fn a_compaction_request_is_told_apart_from_other_requests() {
     assert!(is_compaction_request(&compaction_body("m", &retry)));
     assert!(!is_compaction_request(&compaction_body("m", "What is the code word?")));
     assert!(!is_compaction_request(&json!({"model": "m", "messages": []})));
+    // The prompt can follow the conversation's last words in the same text block.
+    let joined = format!("and that was the last step.\n\n{PROMPT}");
+    assert!(is_compaction_request(&compaction_body("m", &joined)));
     // The prompt quoted earlier in a conversation is not a compaction request.
     let mut quoted = compaction_body("m", PROMPT);
     quoted["messages"].as_array_mut().unwrap().push(json!({"role": "assistant", "content": "noted"}));
@@ -145,6 +148,10 @@ fn desktop_sessions_are_told_apart_by_their_entrypoint() {
     compressible(&c, "c", "cli");
     assert!(is_desktop_session(&d));
     assert!(!is_desktop_session(&c));
+    // A terminal session continued in the app is the app's now.
+    let mut f = fs::OpenOptions::new().append(true).open(&c).unwrap();
+    writeln!(f, "{}", rec("user", "u9", Some("afin2"), "c", "claude-desktop-3p", json!("more"))).unwrap();
+    assert!(is_desktop_session(&c));
 }
 
 // ------------------------------------------------------------------------------------ http

@@ -43,6 +43,7 @@ pub const GATEWAY_MARK: &str = "recompact-gateway";
 /// How Claude Code's compaction prompt starts (CLI 2.1.317 to 2.1.319). The request is otherwise
 /// an ordinary Messages request: the conversation, with this prompt as the last user text.
 const COMPACT_PROMPT: &str = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.";
+const COMPACT_REMINDER: &str = "<analysis> block followed by a <summary> block";
 const DEFAULT_PORT: u16 = 62897;
 const LABEL: &str = "com.segment-recompact.gateway";
 const PING_EVERY: Duration = Duration::from_secs(5);
@@ -433,19 +434,34 @@ pub fn is_compaction_request(body: &Value) -> bool {
             .collect(),
         _ => vec![],
     };
+    // The prompt can share a text block with the conversation's last words, so it is found
+    // anywhere in the message, together with its closing reminder.
     texts
         .iter()
-        .any(|t| t.starts_with(COMPACT_PROMPT) && t.contains("<summary>"))
+        .any(|t| t.contains(COMPACT_PROMPT) && t.contains(COMPACT_REMINDER))
 }
 
 /// The session a compaction request is for, when the gateway serves it.
 fn compaction_job(cfg: &Cfg, head: &Head, body: &[u8]) -> Option<Job> {
     let v: Value = serde_json::from_slice(body).ok()?;
     if !is_compaction_request(&v) {
+        if find(body, COMPACT_PROMPT.as_bytes()).is_some() {
+            log(&format!(
+                "{}: a request quotes the compaction prompt but is not one (last message: {})",
+                head.get("x-claude-code-session-id").unwrap_or("no session id"),
+                last_message_shape(&v)
+            ));
+        }
         return None;
     }
-    let session = head.get("x-claude-code-session-id")?.to_string();
-    let path = locate_session(None, &session)?;
+    let Some(session) = head.get("x-claude-code-session-id").map(String::from) else {
+        log("a compaction request without X-Claude-Code-Session-Id passed through");
+        return None;
+    };
+    let Some(path) = locate_session(None, &session) else {
+        log(&format!("{session}: compaction passed through (no transcript found)"));
+        return None;
+    };
     if !cfg.all && !is_desktop_session(&path) {
         log(&format!("{session}: compaction passed through (not a desktop session)"));
         return None;
@@ -456,17 +472,36 @@ fn compaction_job(cfg: &Cfg, head: &Head, body: &[u8]) -> Option<Job> {
     Some(Job { session, path, key: std::hash::Hasher::finish(&h) })
 }
 
-/// A Code session the Claude desktop app runs (`entrypoint` "claude-desktop", "claude-desktop-3p").
+/// A Code session the Claude desktop app runs now (`entrypoint` "claude-desktop",
+/// "claude-desktop-3p"). The latest record decides: a terminal session opened in the app is one.
 pub fn is_desktop_session(path: &Path) -> bool {
     let Ok(f) = fs::File::open(path) else { return false };
-    for line in BufReader::new(f).lines().map_while(Result::ok).take(400) {
+    let mut last = None;
+    for line in BufReader::new(f).lines().map_while(Result::ok) {
+        if !line.contains("\"entrypoint\"") {
+            continue;
+        }
         if let Ok(r) = serde_json::from_str::<Value>(&line) {
             if let Some(e) = r.get("entrypoint").and_then(|e| e.as_str()) {
-                return e.starts_with("claude-desktop");
+                last = Some(e.starts_with("claude-desktop"));
             }
         }
     }
-    false
+    last.unwrap_or(false)
+}
+
+/// The role and block types of a request's last message, for the log (no content).
+fn last_message_shape(v: &Value) -> String {
+    let Some(last) = v.get("messages").and_then(|m| m.as_array()).and_then(|m| m.last()) else {
+        return "none".into();
+    };
+    let role = last.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+    let kinds: Vec<&str> = match last.get("content") {
+        Some(Value::String(_)) => vec!["string"],
+        Some(Value::Array(a)) => a.iter().map(|b| b.get("type").and_then(|t| t.as_str()).unwrap_or("?")).collect(),
+        _ => vec![],
+    };
+    format!("{role} [{}]", kinds.join(", "))
 }
 
 fn serve_compaction(mut c: Conn, cfg: &Cfg, head: &Head, method: &str, target: &str, body: &[u8], job: Job) {
