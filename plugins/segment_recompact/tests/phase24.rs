@@ -78,6 +78,14 @@ fn a_compaction_request_is_told_apart_from_other_requests() {
     system["messages"].as_array_mut().unwrap().pop();
     system["messages"].as_array_mut().unwrap().push(json!({"role": "system", "content": PROMPT}));
     assert!(is_compaction_request(&system));
+    // System notes Claude Code adds after the prompt are passed over.
+    let mut noted = compaction_body("m", PROMPT);
+    noted["messages"].as_array_mut().unwrap().push(json!({"role": "system", "content": "The following deferred tools are now available"}));
+    assert!(is_compaction_request(&noted));
+    // A system note after an ordinary user message is not a compaction request.
+    let mut plain = compaction_body("m", "What is the code word?");
+    plain["messages"].as_array_mut().unwrap().push(json!({"role": "system", "content": "notes"}));
+    assert!(!is_compaction_request(&plain));
     // The prompt can follow the conversation's last words in the same text block.
     let joined = format!("and that was the last step.\n\n{PROMPT}");
     assert!(is_compaction_request(&compaction_body("m", &joined)));

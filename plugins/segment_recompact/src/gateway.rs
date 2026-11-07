@@ -413,21 +413,29 @@ fn passthrough(mut c: Conn, cfg: &Cfg, head: &Head, method: &str, target: &str, 
 
 // ------------------------------------------------------------------------------------ compaction
 
-/// Whether a Messages request body is Claude Code's compaction request.
+/// Whether a Messages request body is Claude Code's compaction request: its last user message
+/// holds the compaction prompt. Claude Code can send system notes after it (deferred tools,
+/// instructions), and in desktop app sessions it does; those are passed over.
 pub fn is_compaction_request(body: &Value) -> bool {
-    let Some(last) = body
-        .get("messages")
-        .and_then(|m| m.as_array())
-        .and_then(|m| m.last())
-    else {
+    let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
         return false;
     };
-    // Claude Code sends the prompt as the last user message, or (desktop app sessions, 2.1.317)
-    // as a closing system message.
-    if !matches!(last.get("role").and_then(|r| r.as_str()), Some("user" | "system")) {
-        return false;
+    for m in messages.iter().rev() {
+        let holds = message_texts(m)
+            .iter()
+            .any(|t| t.contains(COMPACT_PROMPT) && t.contains(COMPACT_REMINDER));
+        match m.get("role").and_then(|r| r.as_str()) {
+            Some("system") if holds => return true,
+            Some("system") => continue,
+            Some("user") => return holds,
+            _ => return false,
+        }
     }
-    let texts: Vec<&str> = match last.get("content") {
+    false
+}
+
+fn message_texts(m: &Value) -> Vec<&str> {
+    match m.get("content") {
         Some(Value::String(s)) => vec![s.as_str()],
         Some(Value::Array(blocks)) => blocks
             .iter()
@@ -435,12 +443,7 @@ pub fn is_compaction_request(body: &Value) -> bool {
             .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
             .collect(),
         _ => vec![],
-    };
-    // The prompt can share a text block with the conversation's last words, so it is found
-    // anywhere in the message, together with its closing reminder.
-    texts
-        .iter()
-        .any(|t| t.contains(COMPACT_PROMPT) && t.contains(COMPACT_REMINDER))
+    }
 }
 
 /// The session a compaction request is for, when the gateway serves it.
@@ -449,7 +452,7 @@ fn compaction_job(cfg: &Cfg, head: &Head, body: &[u8]) -> Option<Job> {
     if !is_compaction_request(&v) {
         if find(body, COMPACT_PROMPT.as_bytes()).is_some() {
             log(&format!(
-                "{}: a request quotes the compaction prompt but is not one (last message: {})",
+                "{}: a request quotes the compaction prompt but is not one (last messages, newest first: {})",
                 head.get("x-claude-code-session-id").unwrap_or("no session id"),
                 last_message_shape(&v)
             ));
@@ -492,18 +495,28 @@ pub fn is_desktop_session(path: &Path) -> bool {
     last.unwrap_or(false)
 }
 
-/// The role and block types of a request's last message, for the log (no content).
+/// The role, block types and whether it holds the prompt, of a request's last three messages,
+/// for the log (no content).
 fn last_message_shape(v: &Value) -> String {
-    let Some(last) = v.get("messages").and_then(|m| m.as_array()).and_then(|m| m.last()) else {
+    let Some(messages) = v.get("messages").and_then(|m| m.as_array()) else {
         return "none".into();
     };
-    let role = last.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-    let kinds: Vec<&str> = match last.get("content") {
-        Some(Value::String(_)) => vec!["string"],
-        Some(Value::Array(a)) => a.iter().map(|b| b.get("type").and_then(|t| t.as_str()).unwrap_or("?")).collect(),
-        _ => vec![],
-    };
-    format!("{role} [{}]", kinds.join(", "))
+    messages
+        .iter()
+        .rev()
+        .take(3)
+        .map(|m| {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+            let kinds: Vec<&str> = match m.get("content") {
+                Some(Value::String(_)) => vec!["string"],
+                Some(Value::Array(a)) => a.iter().map(|b| b.get("type").and_then(|t| t.as_str()).unwrap_or("?")).collect(),
+                _ => vec![],
+            };
+            let prompt = message_texts(m).iter().any(|t| t.contains(COMPACT_PROMPT));
+            format!("{role} [{}]{}", kinds.join(", "), if prompt { " has prompt" } else { "" })
+        })
+        .collect::<Vec<_>>()
+        .join(" < ")
 }
 
 fn serve_compaction(mut c: Conn, cfg: &Cfg, head: &Head, method: &str, target: &str, body: &[u8], job: Job) {
