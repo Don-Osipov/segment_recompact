@@ -1760,7 +1760,7 @@ pub fn cmd_prewarm(args: &[String]) -> i32 {
 
 /// ContinueOpts for a handoff: `--summarize-with` (default haiku; `mask` or `--mask` for none),
 /// `--target`, and the rest of continue's options.
-fn continue_opts(
+pub(crate) fn continue_opts(
     opts: &serde_json::Map<String, Value>,
     default_model: Option<&str>,
 ) -> ContinueOpts {
@@ -1809,6 +1809,14 @@ pub fn cmd_handoff(args: &[String]) -> i32 {
         return 2;
     };
     let kick = opts.contains_key("continue-after");
+    if served_by_gateway() {
+        println!(
+            "In the desktop app, recompact compacts through its gateway: type /compact, or let the \
+session reach its auto-compact size. The session keeps running, with its background shells, \
+monitors and agents."
+        );
+        return 0;
+    }
     if let Some(shell) = Shell::from_env() {
         if shell.is_own_claude() {
             let transcript = shell
@@ -2371,10 +2379,17 @@ struct Origin {
 
 /// `recompact shell [options] [claude arguments]`: run claude with compaction handled in place.
 pub fn cmd_shell(args: &[String]) -> i32 {
-    let (l, claude_args) = split_launcher_args(args);
-    let parsed = parse_claude_args(&claude_args);
+    let (l, mut claude_args) = split_launcher_args(args);
+    let mut parsed = parse_claude_args(&claude_args);
     if is_passthrough(&parsed) || !(l.interactive || std::io::stdin().is_terminal()) {
         return exec_claude(&l.bin, &claude_args);
+    }
+    // Recompact compacts these sessions itself, at its own size. Claude Code's own window stays
+    // at the model's tuned default here even when the user settings set `autoCompactWindow` for
+    // the sessions no launcher runs (desktop Code sessions, which the gateway compacts).
+    if flag_value(&parsed, &["--autocompact"]).is_none() {
+        claude_args.extend(["--autocompact".to_string(), "auto".to_string()]);
+        parsed = parse_claude_args(&claude_args);
     }
     if l.jobs {
         if let Some(code) = run_as_job(&l, &parsed, &claude_args) {
@@ -4011,11 +4026,18 @@ old setup until restarted. Check with `recompact doctor`; undo with `recompact u
     (true, lines)
 }
 
+/// A desktop app Code session on a computer that runs the gateway: its compaction (`/compact`, or
+/// Claude Code's own auto-compaction) is recompact's, in place.
+fn served_by_gateway() -> bool {
+    std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok_and(|e| e.starts_with("claude-desktop"))
+        && crate::gateway_installed()
+}
+
 /// Why this claude cannot compact in place, if it cannot, and what fixes it. `None` when it
 /// runs under the launcher or is a background job recompact drives (`managed`), or the user
 /// removed the setup on purpose.
 pub fn setup_gap(managed: bool) -> Option<String> {
-    if managed || recompact_home().join("declined").exists() {
+    if managed || served_by_gateway() || recompact_home().join("declined").exists() {
         return None;
     }
     if let Some(job) = Job::from_env() {
@@ -4317,6 +4339,9 @@ in plugins/segment_recompact first; continuing with the plugin update."
     let launcher = path.join("bin").join("recompact");
     println!("Installed segment-recompact {version}.");
     let _ = Command::new(&launcher).arg("install").status();
+    // The gateway runs the stable link, which `install` just repointed: restart it onto the new
+    // version.
+    crate::gateway_restart();
     Command::new(&launcher)
         .arg("doctor")
         .status()

@@ -44,6 +44,17 @@
           }
         ]
       }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT#claude-desktop}\" != \"$CLAUDE_CODE_ENTRYPOINT\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook pre-compact 2>/dev/null || true",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }

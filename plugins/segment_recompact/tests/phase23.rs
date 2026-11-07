@@ -102,7 +102,7 @@ fn claude_starts_in_the_background_and_this_terminal_attaches_to_it() {
     assert_eq!(calls.len(), 3, "{calls:?}");
     assert!(
         calls[0].starts_with(&format!("--bg --settings {}", env_dir.display()))
-            && calls[0].ends_with(" --model haiku"),
+            && calls[0].ends_with(" --model haiku --autocompact auto"),
         "{calls:?}"
     );
     assert_eq!(calls[1], "attach abcd1234");
@@ -146,6 +146,6 @@ fn a_users_own_appended_prompt_replaces_the_git_rules_line() {
     assert_eq!(cmd_shell(&args), 7);
     let calls = fs::read_to_string(dir.join("calls.log")).unwrap();
     let first = calls.lines().next().unwrap();
-    assert!(first.ends_with("--append-system-prompt be brief"), "{first}");
+    assert!(first.ends_with("--append-system-prompt be brief --autocompact auto"), "{first}");
     assert_eq!(first.matches("--append-system-prompt").count(), 1, "{first}");
 }
