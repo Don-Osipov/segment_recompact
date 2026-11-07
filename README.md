@@ -118,6 +118,10 @@ It needs the app in third-party mode with a gateway, at an `http://` endpoint:
    desktop sessions compact at that size. The launcher starts its own sessions with
    `--autocompact auto`, so they still compact on recompact's terms.
 
+The gateway knows which request is the compaction from recompact's PreCompact hook: Claude Code runs
+it right before it compacts and puts its output (a single-use marker) into that request. It does not
+depend on how Claude Code words or arranges its compaction request.
+
 `/compact` in a desktop session runs recompact too. When recompact cannot make a session smaller,
 the request goes on to the endpoint unchanged and Claude Code's own summary applies. The log is
 `~/.claude/recompact/gateway.log`.

@@ -13,6 +13,14 @@
 //! answers itself, with recompact's twin of the session rendered as the summary. Claude Code
 //! installs that text as the conversation so far, in the running process.
 //!
+//! The gateway does not guess which request is the compaction from its prompt or layout (both
+//! are Claude Code's internals and differ by version, output style and session). recompact's
+//! PreCompact hook, which Claude Code runs right before it compacts, prints a single-use marker,
+//! and Claude Code puts a PreCompact hook's output into the compaction request (documented). The
+//! hook records the marker with the session and transcript it got; the first request that
+//! carries an unclaimed marker is that compaction. Claude Code also keeps the hook's output in
+//! the conversation afterwards, so a marker is claimed once and never matches again.
+//!
 //! Each served session keeps its twin chain: the first compaction makes a twin of the session
 //! file; the next one appends what the session did since (the records after the summary this
 //! gateway gave it) to that twin and compacts the result, so later compactions build on
@@ -23,7 +31,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -34,16 +42,19 @@ use serde_json::{json, Map, Value};
 
 use crate::{
     content, continue_file, continue_opts, default_target, human_queued_text, is_human_queued,
-    load_jsonl, locate_session, preserved_uuids, rec_type, rec_uuid, recompact_home,
+    load_jsonl, preserved_uuids, rec_type, rec_uuid, recompact_home,
     select_active, tool_result_text, truthy, user_text,
 };
 
 /// The first line of every summary the gateway serves; `sync_into` finds its own summary by it.
 pub const GATEWAY_MARK: &str = "recompact-gateway";
-/// How Claude Code's compaction prompt starts (CLI 2.1.317 to 2.1.319). The request is otherwise
-/// an ordinary Messages request: the conversation, with this prompt as the last user text.
+/// What recompact's PreCompact hook prints, followed by a 32-hex-digit marker.
+pub const MARKER_PREFIX: &str = "recompact-gateway-request ";
+/// How long a marker waits for its compaction request. The hook runs right before it.
+const MARKER_TTL_SECS: i64 = 600;
+/// How Claude Code's compaction prompt starts; only used to log a compaction that came without a
+/// marker (the hook did not run).
 const COMPACT_PROMPT: &str = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.";
-const COMPACT_REMINDER: &str = "<analysis> block followed by a <summary> block";
 const DEFAULT_PORT: u16 = 62897;
 const LABEL: &str = "com.segment-recompact.gateway";
 const PING_EVERY: Duration = Duration::from_secs(5);
@@ -64,8 +75,6 @@ struct Cfg {
     host: String,
     port: u16,
     base: String,
-    /// Serve every session, not only desktop ones (tests, and anyone who wants it).
-    all: bool,
     at: usize,
 }
 
@@ -73,14 +82,11 @@ struct Cfg {
 struct Job {
     session: String,
     path: PathBuf,
-    /// The conversation the request carries, without its compaction prompt: a retry of the same
-    /// compaction (Claude Code rewords the prompt when it retries) has the same key.
-    key: u64,
 }
 
 // ------------------------------------------------------------------------------------ command
 
-/// `recompact gateway [--port P] [--upstream URL] [--all]`, or `gateway install|uninstall|status`.
+/// `recompact gateway [--port P] [--upstream URL]`, or `gateway install|uninstall|status`.
 pub fn cmd_gateway(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
         Some("install") => return gateway_install(&args[1..]),
@@ -106,7 +112,6 @@ pub fn cmd_gateway(args: &[String]) -> i32 {
         host,
         port: uport,
         base,
-        all: opts.contains_key("all"),
         at: std::env::var("RECOMPACT_AT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -327,7 +332,7 @@ fn handle(client: TcpStream, cfg: &Cfg) {
     }
     let _ = c.s.set_read_timeout(None);
     if method == "POST" && target.starts_with("/v1/messages") && !target.contains("count_tokens") {
-        if let Some(job) = compaction_job(cfg, &head, &body) {
+        if let Some(job) = compaction_job(&head, &body) {
             serve_compaction(c, cfg, &head, &method, &target, &body, job);
             return;
         }
@@ -413,110 +418,70 @@ fn passthrough(mut c: Conn, cfg: &Cfg, head: &Head, method: &str, target: &str, 
 
 // ------------------------------------------------------------------------------------ compaction
 
-/// Whether a Messages request body is Claude Code's compaction request: its last user message
-/// holds the compaction prompt. Claude Code can send system notes after it (deferred tools,
-/// instructions), and in desktop app sessions it does; those are passed over.
-pub fn is_compaction_request(body: &Value) -> bool {
-    let Some(messages) = body.get("messages").and_then(|m| m.as_array()) else {
-        return false;
-    };
-    for m in messages.iter().rev() {
-        let holds = message_texts(m)
-            .iter()
-            .any(|t| t.contains(COMPACT_PROMPT) && t.contains(COMPACT_REMINDER));
-        match m.get("role").and_then(|r| r.as_str()) {
-            Some("system") if holds => return true,
-            Some("system") => continue,
-            Some("user") => return holds,
-            _ => return false,
-        }
-    }
-    false
-}
-
-fn message_texts(m: &Value) -> Vec<&str> {
-    match m.get("content") {
-        Some(Value::String(s)) => vec![s.as_str()],
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
-            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
-            .collect(),
-        _ => vec![],
-    }
-}
-
-/// The session a compaction request is for, when the gateway serves it.
-fn compaction_job(cfg: &Cfg, head: &Head, body: &[u8]) -> Option<Job> {
-    let v: Value = serde_json::from_slice(body).ok()?;
-    if !is_compaction_request(&v) {
-        if find(body, COMPACT_PROMPT.as_bytes()).is_some() {
-            log(&format!(
-                "{}: a request quotes the compaction prompt but is not one (last messages, newest first: {})",
-                head.get("x-claude-code-session-id").unwrap_or("no session id"),
-                last_message_shape(&v)
-            ));
-        }
+/// recompact's PreCompact hook: in a desktop app session on a computer that runs the gateway,
+/// record a new marker for this session and return the line to print. `None` elsewhere.
+pub fn precompact_marker(input: &Value) -> Option<String> {
+    let desktop = std::env::var("CLAUDE_CODE_ENTRYPOINT").is_ok_and(|e| e.starts_with("claude-desktop"));
+    if !desktop || !gateway_installed() {
         return None;
     }
-    let Some(session) = head.get("x-claude-code-session-id").map(String::from) else {
-        log("a compaction request without X-Claude-Code-Session-Id passed through");
-        return None;
-    };
-    let Some(path) = locate_session(None, &session) else {
-        log(&format!("{session}: compaction passed through (no transcript found)"));
-        return None;
-    };
-    if !cfg.all && !is_desktop_session(&path) {
-        log(&format!("{session}: compaction passed through (not a desktop session)"));
-        return None;
-    }
-    let msgs = v.get("messages").and_then(|m| m.as_array())?;
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&Value::Array(msgs[..msgs.len() - 1].to_vec()).to_string(), &mut h);
-    Some(Job { session, path, key: std::hash::Hasher::finish(&h) })
+    let session = input.get("session_id").and_then(|s| s.as_str())?;
+    let transcript = input.get("transcript_path").and_then(|s| s.as_str())?;
+    let marker = crate::uuid_v4().replace('-', "");
+    let dir = recompact_home().join("gateway").join("pending");
+    fs::create_dir_all(&dir).ok()?;
+    let rec = json!({"session": session, "transcript": transcript, "at": crate::now_unix()});
+    fs::write(dir.join(format!("{marker}.json")), rec.to_string()).ok()?;
+    Some(format!("{MARKER_PREFIX}{marker}"))
 }
 
-/// A Code session the Claude desktop app runs now (`entrypoint` "claude-desktop",
-/// "claude-desktop-3p"). The latest record decides: a terminal session opened in the app is one.
-pub fn is_desktop_session(path: &Path) -> bool {
-    let Ok(f) = fs::File::open(path) else { return false };
-    let mut last = None;
-    for line in BufReader::new(f).lines().map_while(Result::ok) {
-        if !line.contains("\"entrypoint\"") {
-            continue;
-        }
-        if let Ok(r) = serde_json::from_str::<Value>(&line) {
-            if let Some(e) = r.get("entrypoint").and_then(|e| e.as_str()) {
-                last = Some(e.starts_with("claude-desktop"));
-            }
+/// The markers a request body carries.
+fn markers_in(body: &[u8]) -> Vec<String> {
+    let text = String::from_utf8_lossy(body);
+    let mut out = Vec::new();
+    for (i, _) in text.match_indices(MARKER_PREFIX) {
+        let tail = &text[i + MARKER_PREFIX.len()..];
+        let id: String = tail.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+        if id.len() == 32 && !out.contains(&id) {
+            out.push(id);
         }
     }
-    last.unwrap_or(false)
+    out
 }
 
-/// The role, block types and whether it holds the prompt, of a request's last three messages,
-/// for the log (no content).
-fn last_message_shape(v: &Value) -> String {
-    let Some(messages) = v.get("messages").and_then(|m| m.as_array()) else {
-        return "none".into();
-    };
-    messages
-        .iter()
-        .rev()
-        .take(3)
-        .map(|m| {
-            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("?");
-            let kinds: Vec<&str> = match m.get("content") {
-                Some(Value::String(_)) => vec!["string"],
-                Some(Value::Array(a)) => a.iter().map(|b| b.get("type").and_then(|t| t.as_str()).unwrap_or("?")).collect(),
-                _ => vec![],
-            };
-            let prompt = message_texts(m).iter().any(|t| t.contains(COMPACT_PROMPT));
-            format!("{role} [{}]{}", kinds.join(", "), if prompt { " has prompt" } else { "" })
-        })
-        .collect::<Vec<_>>()
-        .join(" < ")
+/// Claim an unclaimed, unexpired marker: the session and transcript its hook recorded.
+fn claim(marker: &str) -> Option<Job> {
+    let path = recompact_home().join("gateway").join("pending").join(format!("{marker}.json"));
+    let rec: Value = serde_json::from_str(&fs::read_to_string(&path).ok()?).ok()?;
+    // Removing the file is the claim: of two requests, one wins.
+    fs::remove_file(&path).ok()?;
+    let at = rec.get("at").and_then(|a| a.as_i64()).unwrap_or(0);
+    if crate::now_unix() - at > MARKER_TTL_SECS {
+        return None;
+    }
+    Some(Job {
+        session: rec.get("session")?.as_str()?.to_string(),
+        path: PathBuf::from(rec.get("transcript")?.as_str()?),
+    })
+}
+
+/// The session a compaction request is for: the one whose marker it carries.
+fn compaction_job(head: &Head, body: &[u8]) -> Option<Job> {
+    let markers = markers_in(body);
+    if let Some(job) = markers.iter().find_map(|m| claim(m)) {
+        if job.path.exists() {
+            return Some(job);
+        }
+        log(&format!("{}: compaction passed through (no transcript at {})", job.session, job.path.display()));
+        return None;
+    }
+    if find(body, COMPACT_PROMPT.as_bytes()).is_some() && markers.is_empty() {
+        log(&format!(
+            "{}: a compaction without recompact's marker passed through (did the PreCompact hook run?)",
+            head.get("x-claude-code-session-id").unwrap_or("a session")
+        ));
+    }
+    None
 }
 
 fn serve_compaction(mut c: Conn, cfg: &Cfg, head: &Head, method: &str, target: &str, body: &[u8], job: Job) {
@@ -630,12 +595,6 @@ fn fallback(w: &mut TcpStream, cfg: &Cfg, head: &Head, method: &str, target: &st
     let _ = write_chunk(w, b"");
 }
 
-/// The last compaction made for each session, so a retry of it gets the same twin.
-fn recent() -> &'static Mutex<HashMap<String, (u64, Instant, String, String)>> {
-    static RECENT: OnceLock<Mutex<HashMap<String, (u64, Instant, String, String)>>> = OnceLock::new();
-    RECENT.get_or_init(Default::default)
-}
-
 fn session_lock(session: &str) -> Arc<Mutex<()>> {
     static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
     let mut m = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
@@ -646,12 +605,6 @@ fn session_lock(session: &str) -> Arc<Mutex<()>> {
 fn compact_for_gateway(cfg: &Cfg, job: &Job) -> Result<(String, String), String> {
     let lock = session_lock(&job.session);
     let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((key, when, twin, text)) = recent().lock().unwrap_or_else(|e| e.into_inner()).get(&job.session) {
-        if *key == job.key && when.elapsed() < Duration::from_secs(1800) {
-            log(&format!("{}: the same compaction again; serving twin {twin} again", job.session));
-            return Ok((twin.clone(), text.clone()));
-        }
-    }
     let dir = job.path.parent().ok_or("the session file has no folder")?;
     let base = match read_state(&job.session) {
         Some(prev) if dir.join(format!("{prev}.jsonl")).exists() => {
@@ -684,10 +637,6 @@ fn compact_for_gateway(cfg: &Cfg, job: &Job) -> Result<(String, String), String>
         "<analysis>\nrecompact compacted this conversation; the summary below is its compacted copy.\n</analysis>\n\n<summary>\n{}\n</summary>",
         render_summary(&twin, &records)
     );
-    recent()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(job.session.clone(), (job.key, Instant::now(), twin.clone(), text.clone()));
     Ok((twin, text))
 }
 

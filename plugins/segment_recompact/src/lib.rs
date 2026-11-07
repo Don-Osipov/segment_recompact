@@ -62,7 +62,7 @@ queued for turn end under `shell`; otherwise compacts now and\n                 
 prints the resume command)\n  \
 recompact prewarm   <session> [--target T]  (summarize ahead into the cache)\n  \
 recompact job-handoff <job dir> <claude pid>  (a background job's in-place\n                      \
-handoff; its hooks start it)\n  recompact gateway   [--port P] --upstream URL [--all]  (compaction in place for\n                      desktop app sessions: answers Claude Code's own compaction\n                      request with the twin; `gateway install|uninstall|status`)\n  \
+handoff; its hooks start it)\n  recompact gateway   [--port P] --upstream URL  (compaction in place for\n                      desktop app sessions: answers Claude Code's own compaction\n                      request with the twin; `gateway install|uninstall|status`)\n  \
 recompact install   (make interactive `claude` run through `shell`, turn on plugin\n                      \
 auto-update; `uninstall` undoes the shell part)\n  \
 recompact update    (newest plugin version, binary, and setup, then `doctor`)\n  \
@@ -6131,6 +6131,13 @@ pub fn cmd_hook(args: &[String]) -> i32 {
     let Ok(v) = serde_json::from_str::<Value>(&input) else {
         return 0;
     };
+    if args.first().map(String::as_str) == Some("pre-compact") {
+        // Plain text: Claude Code puts a PreCompact hook's output into the compaction request.
+        if let Some(line) = precompact_marker(&v) {
+            println!("{line}");
+        }
+        return 0;
+    }
     let out = match args.first().map(String::as_str) {
         Some("session-start") => {
             on_session_start(&v);

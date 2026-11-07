@@ -67,35 +67,6 @@ const PROMPT: &str = "CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n
 be plain text: an <analysis> block followed by a <summary> block.";
 
 #[test]
-fn a_compaction_request_is_told_apart_from_other_requests() {
-    assert!(is_compaction_request(&compaction_body("m", PROMPT)));
-    let retry = format!("{PROMPT}\n\nFor this reply only: write what the instructions above ask for.");
-    assert!(is_compaction_request(&compaction_body("m", &retry)));
-    assert!(!is_compaction_request(&compaction_body("m", "What is the code word?")));
-    assert!(!is_compaction_request(&json!({"model": "m", "messages": []})));
-    // The desktop app sends it as a closing system message.
-    let mut system = compaction_body("m", PROMPT);
-    system["messages"].as_array_mut().unwrap().pop();
-    system["messages"].as_array_mut().unwrap().push(json!({"role": "system", "content": PROMPT}));
-    assert!(is_compaction_request(&system));
-    // System notes Claude Code adds after the prompt are passed over.
-    let mut noted = compaction_body("m", PROMPT);
-    noted["messages"].as_array_mut().unwrap().push(json!({"role": "system", "content": "The following deferred tools are now available"}));
-    assert!(is_compaction_request(&noted));
-    // A system note after an ordinary user message is not a compaction request.
-    let mut plain = compaction_body("m", "What is the code word?");
-    plain["messages"].as_array_mut().unwrap().push(json!({"role": "system", "content": "notes"}));
-    assert!(!is_compaction_request(&plain));
-    // The prompt can follow the conversation's last words in the same text block.
-    let joined = format!("and that was the last step.\n\n{PROMPT}");
-    assert!(is_compaction_request(&compaction_body("m", &joined)));
-    // The prompt quoted earlier in a conversation is not a compaction request.
-    let mut quoted = compaction_body("m", PROMPT);
-    quoted["messages"].as_array_mut().unwrap().push(json!({"role": "assistant", "content": "noted"}));
-    assert!(!is_compaction_request(&quoted));
-}
-
-#[test]
 fn the_summary_names_the_twin_and_cannot_be_cut_short_by_tags_inside_it() {
     let records = vec![
         rec("user", "u1", None, "s", "cli", json!("explain <summary>tags</summary> please")),
@@ -150,21 +121,6 @@ fn a_later_compaction_extends_the_twin_with_what_the_session_did_since() {
 
     assert_eq!(sync_into(&dir, &x, twin), Ok(0), "a second sync adds nothing");
     assert!(sync_into(&dir, &x, "twin-2").is_err(), "a twin this session never got");
-}
-
-#[test]
-fn desktop_sessions_are_told_apart_by_their_entrypoint() {
-    let dir = tmp_dir();
-    let d = dir.join("d.jsonl");
-    let c = dir.join("c.jsonl");
-    compressible(&d, "d", "claude-desktop-3p");
-    compressible(&c, "c", "cli");
-    assert!(is_desktop_session(&d));
-    assert!(!is_desktop_session(&c));
-    // A terminal session continued in the app is the app's now.
-    let mut f = fs::OpenOptions::new().append(true).open(&c).unwrap();
-    writeln!(f, "{}", rec("user", "u9", Some("afin2"), "c", "claude-desktop-3p", json!("more"))).unwrap();
-    assert!(is_desktop_session(&c));
 }
 
 // ------------------------------------------------------------------------------------ http
@@ -270,18 +226,31 @@ fn text_of(sse: &str) -> String {
 }
 
 #[test]
-fn the_gateway_forwards_requests_and_answers_a_desktop_sessions_compaction_itself() {
+fn the_gateway_answers_the_compaction_its_hook_marked_once_and_forwards_everything_else() {
     let home = tmp_dir();
     let projects = home.join(".claude/projects/-tmp-p");
     fs::create_dir_all(&projects).unwrap();
     let desktop = "11111111-2222-4333-8444-555555555555";
-    let terminal = "66666666-7777-4888-9999-000000000000";
-    compressible(&projects.join(format!("{desktop}.jsonl")), desktop, "claude-desktop-3p");
-    compressible(&projects.join(format!("{terminal}.jsonl")), terminal, "cli");
+    let transcript = projects.join(format!("{desktop}.jsonl"));
+    compressible(&transcript, desktop, "claude-desktop-3p");
     std::env::set_var("HOME", &home);
     std::env::set_var("RECOMPACT_HOME", home.join("rc"));
     std::env::set_var("RECOMPACT_SUMMARIZE_WITH", "mask");
     std::env::set_var("RECOMPACT_TARGET", "1000");
+    let hook_input = json!({"hook_event_name": "PreCompact", "trigger": "manual",
+        "session_id": desktop, "transcript_path": transcript});
+
+    // The hook marks only desktop app sessions, and only where the gateway is installed.
+    std::env::set_var("CLAUDE_CODE_ENTRYPOINT", "claude-desktop-3p");
+    assert_eq!(precompact_marker(&hook_input), None, "no gateway installed");
+    let agents = home.join("Library/LaunchAgents");
+    fs::create_dir_all(&agents).unwrap();
+    fs::write(agents.join("com.segment-recompact.gateway.plist"), "").unwrap();
+    std::env::set_var("CLAUDE_CODE_ENTRYPOINT", "cli");
+    assert_eq!(precompact_marker(&hook_input), None, "a terminal session");
+    std::env::set_var("CLAUDE_CODE_ENTRYPOINT", "claude-desktop-3p");
+    let line = precompact_marker(&hook_input).expect("a desktop session gets a marker");
+    assert!(line.starts_with(MARKER_PREFIX) && line.len() == MARKER_PREFIX.len() + 32, "{line}");
 
     let up = fake_upstream();
     let port = free_port();
@@ -303,24 +272,33 @@ fn the_gateway_forwards_requests_and_answers_a_desktop_sessions_compaction_itsel
     let (_, body) = send(port, "GET", "/v1/chunked", None, "");
     assert!(body.contains("GET /v1/chunked HTTP/1.1"), "chunks reach the client in one piece: {body}");
     let compact = compaction_body("cc/claude-opus-5-5", PROMPT).to_string();
-    let (_, body) = send(port, "POST", "/v1/messages?beta=true", Some(terminal), &compact);
-    assert!(body.contains("POST /v1/messages?beta=true"), "a terminal session's compaction is Claude Code's: {body}");
-    let ask = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).to_string();
-    let (_, body) = send(port, "POST", "/v1/messages", Some(desktop), &ask);
-    assert!(body.contains("\"upstream\""), "{body}");
+    let (_, body) = send(port, "POST", "/v1/messages?beta=true", Some(desktop), &compact);
+    assert!(body.contains("\"upstream\""), "a compaction without a marker is Claude Code's: {body}");
 
-    // A desktop session's compaction is recompact's twin, as the summary.
-    let (status, body) = send(port, "POST", "/v1/messages?beta=true", Some(desktop), &compact);
+    // The marked compaction is recompact's twin, wherever the marker sits in the request: here
+    // in the prompt's message, with a system note after it (an output style adds one).
+    let mut marked = compaction_body("cc/claude-opus-5-5", &format!("{PROMPT}\n\n{line}"));
+    marked["messages"].as_array_mut().unwrap().push(json!({"role": "system", "content": "Concise output style is active."}));
+    let marked = marked.to_string();
+    let (status, body) = send(port, "POST", "/v1/messages?beta=true", None, &marked);
     assert!(status.contains("200") && !body.contains("\"upstream\""), "{body}");
-    assert!(body.contains("event: message_stop"), "{body}");
     let text = text_of(&body);
     assert!(text.starts_with("<analysis>") && text.trim_end().ends_with("</summary>"), "{text}");
     let twin = text.split("recompact-gateway twin ").nth(1).unwrap().split_whitespace().next().unwrap().to_string();
     assert!(projects.join(format!("{twin}.jsonl")).exists());
     assert_eq!(gateway_twin(desktop).as_deref(), Some(twin.as_str()));
 
-    // Claude Code's retry of the same compaction (reworded prompt) gets the same twin.
-    let retry = compaction_body("cc/claude-opus-5-5", &format!("{PROMPT}\n\nFor this reply only: …")).to_string();
-    let (_, body) = send(port, "POST", "/v1/messages?beta=true", Some(desktop), &retry);
-    assert!(text_of(&body).contains(&format!("recompact-gateway twin {twin}")), "{body}");
+    // Claude Code keeps the hook's output in the conversation: the claimed marker matches nothing.
+    let later = json!({"model": "m", "messages": [{"role": "user", "content": format!("<local-command-stdout>{line}</local-command-stdout> next")}]}).to_string();
+    let (_, body) = send(port, "POST", "/v1/messages", Some(desktop), &later);
+    assert!(body.contains("\"upstream\""), "{body}");
+
+    // A marker whose compaction never came expires.
+    let stale = "0123456789abcdef0123456789abcdef";
+    let pending = home.join("rc/gateway/pending");
+    fs::write(pending.join(format!("{stale}.json")),
+        json!({"session": desktop, "transcript": transcript, "at": 1}).to_string()).unwrap();
+    let old = compaction_body("m", &format!("{PROMPT}\n\n{MARKER_PREFIX}{stale}")).to_string();
+    let (_, body) = send(port, "POST", "/v1/messages", Some(desktop), &old);
+    assert!(body.contains("\"upstream\""), "{body}");
 }
