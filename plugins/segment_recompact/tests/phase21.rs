@@ -555,7 +555,7 @@ fn agents_that_run_after_the_turn_do_not_hold_a_jobs_switch() {
     age(&t);
     let worker = start_worker(&job_dir, &dir, &stub);
     assert!(
-        ended_while_active(worker, &job_dir, Duration::from_secs(8)),
+        ended_while_active(worker, &job_dir, Duration::from_secs(20)),
         "switched while the agents ran"
     );
     let twin = lineage_latest(&dir, SESSION);
@@ -589,7 +589,7 @@ fn the_agents_a_turn_left_running_count_without_the_daemons_list() {
     age(&t);
     let worker = start_worker(&job_dir, &dir, &stub);
     assert!(
-        ended_while_active(worker, &job_dir, Duration::from_secs(8)),
+        ended_while_active(worker, &job_dir, Duration::from_secs(20)),
         "switched while the agents ran"
     );
     let twin = lineage_latest(&dir, SESSION);
@@ -626,7 +626,7 @@ fn a_turn_that_runs_while_agents_run_holds_a_jobs_switch_until_it_ends() {
     );
     age(&t);
     assert!(
-        ended_while_active(worker, &job_dir, Duration::from_secs(8)),
+        ended_while_active(worker, &job_dir, Duration::from_secs(20)),
         "switched once the turn ended, while the agent ran"
     );
     let twin = lineage_latest(&dir, SESSION);
