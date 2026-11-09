@@ -15,6 +15,8 @@ fn a_session_that_cannot_compact_in_place_says_why_and_setup_fixes_it() {
     std::env::set_var("SHELL", "/bin/zsh");
     std::env::remove_var("ZDOTDIR");
     std::env::remove_var("RECOMPACT_SHELL");
+    // Run from a background job, this process would count as one.
+    std::env::remove_var("CLAUDE_JOB_DIR");
     std::env::set_var("RECOMPACT_HOME", home.join(".claude/recompact"));
     let start = json!({"session_id": "s1", "source": "startup"});
 

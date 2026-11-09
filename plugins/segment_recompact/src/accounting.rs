@@ -115,12 +115,23 @@ pub fn visible_chars(r: &Value) -> usize {
             // model; approximate by payload. Types known never to render cost nothing.
             _ => match r.pointer("/attachment/type").and_then(|v| v.as_str()) {
                 Some(t) if NEVER_RENDERED.contains(&t) => 0,
-                _ => r
-                    .get("attachment")
-                    .map_or(0, |a| serde_json::to_string(a).map_or(0, |s| s.len())),
+                _ => r.get("attachment").map_or(0, payload_chars),
             },
         },
         _ => 0,
+    }
+}
+
+/// About the serialized size of an attachment payload, with each embedded image at its flat visual
+/// weight. Counting base64 as text made one pasted screenshot in a message typed mid-turn read as
+/// ~250k tokens, in 25 twins of 2 lineages.
+fn payload_chars(v: &Value) -> usize {
+    match v {
+        Value::String(s) => s.len() + 2,
+        Value::Array(a) => 2 + a.iter().map(|x| payload_chars(x) + 1).sum::<usize>(),
+        Value::Object(o) if o.get("type").and_then(|t| t.as_str()) == Some("image") => IMAGE_EST_CHARS,
+        Value::Object(o) => 2 + o.iter().map(|(k, x)| k.len() + 4 + payload_chars(x)).sum::<usize>(),
+        other => other.to_string().len(),
     }
 }
 

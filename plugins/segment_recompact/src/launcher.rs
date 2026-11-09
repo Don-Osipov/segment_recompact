@@ -1461,6 +1461,42 @@ fn thresholds(shell: &Shell, session: &str, model: &str, live: usize) -> (usize,
 }
 
 /// Stop: the turn is over and the transcript complete, the safe moment to hand off.
+/// Claude Code compacts on its own as well: at its threshold before a request (also mid-turn), and
+/// (2.1.299+) when a session of 200k+ tokens has sat idle for about 54 minutes, before its prompt
+/// cache expires. Its PreCompact hook names both "auto". Either would replace a session recompact
+/// manages with one prose summary, so in a session with auto-compaction on it is blocked. It only
+/// blocks: the Stop hook compacts at the turn's end, with its warnings and its waits for
+/// background work. A typed /compact ("manual") is the user's call and runs, and so does Claude
+/// Code's own near the window's end or under 200k (a small window filling up), rather than let the
+/// session overflow. Returns the reason to give Claude Code for blocking.
+pub fn on_pre_compact(input: &Value) -> Option<String> {
+    on_pre_compact_in(Shell::from_env(), input)
+}
+
+pub fn on_pre_compact_in(shell: Option<Shell>, input: &Value) -> Option<String> {
+    if input.get("trigger").and_then(|t| t.as_str()) != Some("auto") {
+        return None;
+    }
+    let shell = shell?;
+    let session = hook_session(input)?;
+    if !shell.tracks(session) || !auto_on(&shell.config, Some(session)) {
+        return None;
+    }
+    let transcript = hook_transcript(input)?;
+    let (live, model) = live_status(&transcript)?;
+    // Under 200k it may be the end of a small window (a 200k plan without RECOMPACT_WINDOW reads
+    // as 1M here); Claude Code's idle compaction never fires there at its default.
+    if live < 200_000 || live * 10 >= window_for(&model, live) * 9 {
+        return None;
+    }
+    let (at, _, _) = thresholds(&shell, session, &model, live);
+    Some(format!(
+        "recompact manages this session's compaction ({} now; it compacts at {} when a turn ends)",
+        fmt_k(live),
+        fmt_k(at)
+    ))
+}
+
 pub fn on_stop(input: &Value) -> Option<Value> {
     on_stop_in(Shell::from_env(), input)
 }
@@ -1591,8 +1627,9 @@ pub fn on_post_tool_use_in(shell: Option<Shell>, input: &Value) -> Option<Value>
     Some(
         json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": format!(
         "recompact: the context is at {} tokens. Reach a clean checkpoint: finish the step in progress \
-(do not start a new one), then end your turn with a short status: done, in progress, next. The session \
-is then compacted and resumed automatically, and you will be told to continue.", fmt_k(live))}}),
+(do not start a new one), then end your turn with a short status: done, in progress, and the exact next \
+step with the reason for it (the hypothesis or the planned change, and the evidence). The session is then \
+compacted and resumed automatically, and you will be told to continue.", fmt_k(live))}}),
     )
 }
 

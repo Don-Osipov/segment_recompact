@@ -50,7 +50,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "[ \"${CLAUDE_CODE_ENTRYPOINT#claude-desktop}\" != \"$CLAUDE_CODE_ENTRYPOINT\" ] && \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook pre-compact 2>/dev/null || true",
+            "command": "[ -n \"$RECOMPACT_SHELL$CLAUDE_JOB_DIR\" ] || [ \"${CLAUDE_CODE_ENTRYPOINT#claude-desktop}\" != \"$CLAUDE_CODE_ENTRYPOINT\" ] || exit 0; \"${CLAUDE_PLUGIN_ROOT}/bin/recompact\" hook pre-compact; [ $? -eq 2 ] && exit 2; exit 0",
             "timeout": 10
           }
         ]

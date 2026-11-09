@@ -182,6 +182,68 @@ Next, in evidence order:
 - [ ] Claim tags in the headless rubric parsed into the brief ("unverified claims").
 - [ ] Sub-goal epoch folds instead of time-based ones.
 
+## v1.12 (2026-11): what real sessions showed
+
+Driven by forensics over 141 twins and 60 compaction sources since v1.0 (2026-09-24), and the
+September to November 2026 literature.
+
+- [x] **Split points survive Claude Code 2.1.300+ transcripts.** Its request-replay records
+      (`api-request`, `-blob`, `-shape`) copy already-answered tool calls, so no split point
+      followed them (101 of 137 sources). Twins drop them; Claude Code ignores them on load.
+- [x] **Parallel tool calls keep their results.** Claude Code chains each next call of a batch off
+      the previous call record, so every result but the last hangs off the active path. They were
+      dropped (448 results in 54 of 60 sources), their calls deleted as unanswered, and no split
+      point followed. Measured with both fixes on the same 60 sources at a 120k target: planned
+      twin p50 198k to 119k tokens, fixed floor p50 187k to 104k.
+- [x] **Recall follows a switch in place.** The recall server outlives the switch and kept the old
+      session id: 51 of 158 real queries searched "0 records". It now resolves the live lineage
+      head on each call.
+- [x] **The summarizer summarizes.** Haiku followed instructions inside the transcript (a teammate
+      asking for a status report) and answered it instead, so whole batches fell back to masking:
+      every batch, both waves, in one real 28-unit run. The rubric is now the system prompt, the
+      units are fenced as data, and the reply is held to a JSON schema (`--json-schema`): 28 of 28.
+- [x] **Summarizer input keeps the ending.** Units over 8k chars were cut at the end, which holds
+      the outcome (115 of 4,630 units, 18% of all digest text). Digests now get 16k (epochs 24k)
+      and are thinned from the middle by priority: routine results, then tool calls, then older
+      prose; the ask and the closing words always stay.
+- [x] **Summaries inside one long turn consolidate.** An autonomous session is one turn, so all its
+      earlier summaries sat in the tail and piled up (374 summaries, 139k tokens, in one
+      19-generation chain). With epochs, parts beyond the tail budget consolidate from raw.
+- [x] **A screenshot typed mid-turn is an image, not 250k tokens.** Attachment payloads count
+      images at flat weight, and queued messages lose image bytes outside the tail.
+- [x] **Replies that answer by reference keep what they answer.** When the next user turn is
+      "option 2", "go ahead" or "items 2 and 7", the unit's closing message is carried verbatim
+      beneath its summary (20% of turn boundaries, ~1.2k chars each).
+- [x] **Claude Code's own compaction yields** in sessions with auto-compaction on: its idle
+      compaction (2.1.299+, sessions of 200k+ tokens idle ~54 minutes) and its automatic one are
+      blocked by the PreCompact hook; recompact still compacts at a turn's end. A typed /compact
+      still runs, and so does Claude Code's own near the window's end or under 200k (a small
+      window filling up).
+- [x] **Brief fixes.** Recent asks no longer quote `<system-reminder>` blocks; a period inside a
+      file name no longer ends a standing instruction; "Last check run" names a command that ran,
+      not a heredoc or quoted text that mentions a test runner (24 of 85 lines were wrong).
+- [x] **Rules as policy** (ARCBench, arXiv 2611.03223: kept rules were still violated 2.6x as often
+      after compaction, mostly when a later request read as permission). The brief says a later
+      request does not lift a standing instruction; scope and process instructions ("leave X
+      alone", "ask me before", "wait for") are captured (they drop 36% of the time, arXiv
+      2610.31778).
+- [x] **The next step survives** (Compact-Bench, arXiv 2610.31710; AutoCompact, arXiv 2610.02163).
+      The rubric asks for the planned next change, stated concretely, and attributes instructions
+      found in tool output to their source; the checkpoint request asks for the next step and the
+      evidence behind it.
+
+Next, in evidence order:
+- [ ] **Originals outlive Claude Code's 30-day cleanup.** 36 of 135 twins hold summaries whose
+      source is gone, so recall and consolidation lose them. Transcripts here run 8.5 GB per 30
+      days, so raising `cleanupPeriodDays` is costly; hard-linking the originals a live twin
+      references is the likely fix.
+- [ ] **Discard-and-rebuild churn.** 34 of 131 launcher twins were rebuilt because the session
+      moved on; 25 rebuilds reused cached summaries only, so the new growth stayed verbatim.
+- [ ] `recompact eval`: the zero-model retention score and post-resume refetch burden of
+      Compact-Bench and TRACE (arXiv 2610.08722), over every twin on disk, so each cycle measures
+      itself. The forensics scripts of this cycle are the starting point.
+- [ ] Overhead: the 35k system+tools default runs ~20k low for sessions with many MCP servers.
+
 ## Track C: confidence
 
 - [x] 30 integration tests over synthetic sessions covering every failure class identified in the
