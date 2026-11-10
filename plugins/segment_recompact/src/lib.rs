@@ -949,6 +949,7 @@ pub fn parse_opts(args: &[String]) -> (Vec<String>, Map<String, Value>) {
         "continue-after",
         "original",
         "tier0",
+        "probe",
     ];
     let mut positional = Vec::new();
     let mut opts = Map::new();

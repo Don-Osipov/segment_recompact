@@ -38,7 +38,8 @@ recompact eval points [project-dir ...] [--days 30] [--min 200k] [--max 850k] [-
 [--per-session 2] [--limit 40] [--out F] [--force]\n                        \
 (choose cut points in long sessions that ran on uncompacted)\n  \
 recompact eval run --arm NAME [--original] [--target 120k] [--summarize-with M | --mask]\n                        \
-[--model opus] [--tier0] [--only id,id] [--jobs 2] [--points F] [--out F]\n                        \
+[--model opus] [--tier0] [--samples 3] [--probe] [--only id,id] [--jobs 2]\n                        \
+[--points F] [--out F] [--save-to DIR]  (keep each point's prefix and context, to inspect)\n                        \
 (score one arm on every point; nothing the resumed model proposes runs)\n  \
 recompact eval report [results.jsonl ...]  (compare the arms on their shared points)";
 
@@ -395,6 +396,12 @@ struct Arm {
     copts: crate::ContinueOpts,
     model: String,
     tier0: bool,
+    /// `--save-to DIR`: keep each point's prefix and resumed context there, to see what a twin lost.
+    save_to: Option<PathBuf>,
+    /// `--samples K`: first-action samples per point (default 3).
+    samples: usize,
+    /// `--probe`: also ask for the files changed and the last check's result.
+    probe: bool,
 }
 
 fn eval_run(args: &[String]) -> i32 {
@@ -431,6 +438,9 @@ fn eval_run(args: &[String]) -> i32 {
         copts,
         model: opt_str(&opts, "model").unwrap_or("opus").to_string(),
         tier0: opts.contains_key("tier0"),
+        save_to: opt_str(&opts, "save-to").map(PathBuf::from),
+        samples: opt_str(&opts, "samples").and_then(|v| v.parse().ok()).unwrap_or(3usize).max(1),
+        probe: opts.contains_key("probe"),
     });
     let out = opt_str(&opts, "out")
         .map(PathBuf::from)
@@ -511,10 +521,10 @@ fn summary_line(row: &Value) -> String {
     );
     if let Some(n) = row.get("next").filter(|n| !n.is_null()) {
         s.push_str(&format!(
-            "; next action {} (real: {}, proposed: {})",
-            if n["same"] == json!(true) { "same" } else if n["same_tool"] == json!(true) { "same tool" } else { "different" },
+            "; first action same {:.0}% (real: {}, proposed: {})",
+            100.0 * share(&n["same"]),
             n["truth"].as_str().unwrap_or(""),
-            n["proposed"].as_str().unwrap_or("")
+            n["proposals"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(" / ")).unwrap_or_default()
         ));
     }
     s
@@ -570,9 +580,14 @@ fn write_session(path: &Path, records: &[Value], session_id: &str) -> Result<(),
 fn arm_cache(arm: &Arm, origin_dir: Option<&str>) -> Option<PathBuf> {
     let model = arm.copts.summarize.as_ref()?.model.clone();
     let path = eval_home().join(format!("summary-cache-{model}.json"));
-    if !path.exists() && model == "haiku" {
-        if let Some(seed) = origin_dir.map(|d| Path::new(d).join(".recompact-summary-cache.json")) {
-            let _ = fs::copy(seed, &path);
+    if model == "haiku" {
+        // Real compactions of this point's own session may have summarized the same units.
+        let seed = origin_dir
+            .map(|d| Path::new(d).join(".recompact-summary-cache.json"))
+            .and_then(|p| fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str::<Map<String, Value>>(&s).ok());
+        if let Some(seed) = seed {
+            let _ = write_cache_merged(&path, &seed);
         }
     }
     Some(path)
@@ -616,6 +631,11 @@ fn run_point(p: &Value, arm: &Arm) -> Result<Value, String> {
         twin
     };
     let ctx_file = scratch.project.join(format!("{ctx_id}.jsonl"));
+    if let Some(dir) = &arm.save_to {
+        let _ = fs::create_dir_all(dir);
+        let _ = fs::copy(scratch.project.join(format!("{prefix_id}.jsonl")), dir.join(format!("{id}.prefix.jsonl")));
+        let _ = fs::copy(&ctx_file, dir.join(format!("{id}.context.jsonl")));
+    }
     let (ctx, _) = select_active(load_jsonl(&ctx_file));
     let calib = calibrate_lineage(prefix);
     let mut row = json!({
@@ -633,48 +653,65 @@ fn run_point(p: &Value, arm: &Arm) -> Result<Value, String> {
         .flat_map(tool_uses)
         .map(|(_, name, input)| canonical(&name, &input))
         .collect();
-    let next = resume_call(&scratch, &ctx_id, &arm.model, &message)?;
-    let proposed = next.action.clone().unwrap_or_else(|| "text".into());
+    // Several samples of the first action: the later ones read the first one's cached prompt,
+    // so they cost a fraction of it, and each point says how often, not just whether.
+    let mut proposals: Vec<String> = Vec::new();
+    let (mut tools, mut cost, mut usage) = (HashSet::new(), 0.0, Vec::new());
+    for _ in 0..arm.samples {
+        let next = resume_call(&scratch, &ctx_id, &arm.model, &message)?;
+        proposals.push(next.action.clone().unwrap_or_else(|| "text".into()));
+        if proposals.len() == 1 {
+            row["next_text"] = json!(next.text.chars().take(600).collect::<String>());
+        }
+        tools.extend(next.tools);
+        cost += next.cost;
+        usage.push(next.usage);
+    }
+    let rate = |f: &dyn Fn(&String) -> bool| proposals.iter().filter(|p| f(p)).count() as f64 / proposals.len() as f64;
     row["next"] = json!({
         "truth": truth,
-        "proposed": proposed,
-        "same": proposed == truth,
-        "same_tool": tool_of(&proposed) == tool_of(&truth),
-        "repeat": next.action.as_ref().is_some_and(|a| prior.contains(a)),
+        "proposed": proposals[0],
+        "proposals": proposals,
+        "same": rate(&|p| *p == truth),
+        "same_tool": rate(&|p| tool_of(p) == tool_of(&truth)),
+        "repeat": rate(&|p| p != "text" && prior.contains(p)),
         "truth_repeat": truth != "text" && prior.contains(&truth),
-        "recall": proposed.contains("recall"),
-        "unavailable": truth != "text" && !next.tools.is_empty() && !next.tools.contains(tool_of(&truth))
-            && !(tool_of(&truth) == "Agent" && next.tools.contains("Task")),
-        "text": next.text.chars().take(600).collect::<String>(),
+        "recall": rate(&|p| p.contains("recall")),
+        "unavailable": truth != "text" && !tools.is_empty() && !tools.contains(tool_of(&truth))
+            && !(tool_of(&truth) == "Agent" && tools.contains("Task")),
     });
 
-    let probe = resume_call(&scratch, &ctx_id, &arm.model, PROBE_PROMPT)?;
-    let answer = extract_json_object(&probe.text);
-    let truth_files = files_changed(prefix);
-    let said: HashSet<String> = answer
-        .as_ref()
-        .and_then(|a| a.get("files_changed"))
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str()).map(path_key).collect())
-        .unwrap_or_default();
-    let check_said = answer
-        .as_ref()
-        .and_then(|a| a.get("last_check"))
-        .and_then(|c| c.get("result"))
-        .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_lowercase());
-    row["probe"] = json!({
-        "answered": answer.is_some(),
-        "action": probe.action,
-        "text": probe.text.chars().take(1500).collect::<String>(),
-        "files_truth": truth_files.len(),
-        "files_said": said.len(),
-        "files_hit": truth_files.intersection(&said).count(),
-        "check_truth": check_outcome(prefix),
-        "check_said": check_said,
-    });
-    row["cost_usd"] = json!(next.cost + probe.cost);
-    row["usage"] = json!([next.usage, probe.usage]);
+    if arm.probe {
+        let probe = resume_call(&scratch, &ctx_id, &arm.model, PROBE_PROMPT)?;
+        let answer = extract_json_object(&probe.text);
+        let truth_files = files_changed(prefix);
+        let said: HashSet<String> = answer
+            .as_ref()
+            .and_then(|a| a.get("files_changed"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str()).map(path_key).collect())
+            .unwrap_or_default();
+        let check_said = answer
+            .as_ref()
+            .and_then(|a| a.get("last_check"))
+            .and_then(|c| c.get("result"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase());
+        row["probe"] = json!({
+            "answered": answer.is_some(),
+            "action": probe.action,
+            "text": probe.text.chars().take(1500).collect::<String>(),
+            "files_truth": truth_files.len(),
+            "files_said": said.len(),
+            "files_hit": truth_files.intersection(&said).count(),
+            "check_truth": check_outcome(prefix),
+            "check_said": check_said,
+        });
+        cost += probe.cost;
+        usage.push(probe.usage);
+    }
+    row["cost_usd"] = json!(cost);
+    row["usage"] = json!(usage);
     Ok(row)
 }
 
@@ -872,11 +909,11 @@ struct Tally {
     kept: u64,
     total: u64,
     next_n: usize,
-    same: usize,
-    same_tool: usize,
-    repeat: usize,
+    same: f64,
+    same_tool: f64,
+    repeat: f64,
     truth_repeat: usize,
-    recall: usize,
+    recall: f64,
     unavailable: usize,
     files_truth: u64,
     files_hit: u64,
@@ -884,6 +921,19 @@ struct Tally {
     check_n: usize,
     check_ok: usize,
     cost: f64,
+}
+
+/// A per-point rate: a fraction of samples, or a boolean from single-sample rows.
+fn share(v: &Value) -> f64 {
+    v.as_f64().unwrap_or(if *v == json!(true) { 1.0 } else { 0.0 })
+}
+
+fn pctf(a: f64, b: usize) -> String {
+    if b == 0 {
+        "-".into()
+    } else {
+        format!("{:.0}%", 100.0 * a / b as f64)
+    }
 }
 
 fn pct(a: usize, b: usize) -> String {
@@ -950,11 +1000,11 @@ pub fn report_text(rows: &BTreeMap<String, BTreeMap<String, Value>>) -> String {
                 t.unavailable += 1;
             } else if !n.is_null() {
                 t.next_n += 1;
-                t.same += usize::from(n["same"] == json!(true));
-                t.same_tool += usize::from(n["same_tool"] == json!(true));
-                t.repeat += usize::from(n["repeat"] == json!(true));
+                t.same += share(&n["same"]);
+                t.same_tool += share(&n["same_tool"]);
+                t.repeat += share(&n["repeat"]);
                 t.truth_repeat += usize::from(n["truth_repeat"] == json!(true));
-                t.recall += usize::from(n["recall"] == json!(true));
+                t.recall += share(&n["recall"]);
             }
             let p = &v["probe"];
             if !p.is_null() {
@@ -981,9 +1031,9 @@ pub fn report_text(rows: &BTreeMap<String, BTreeMap<String, Value>>) -> String {
             t.n,
             if ok == 0 { 0 } else { t.tokens / ok as u64 / 1000 },
             pct64(t.kept, t.total),
-            pct(t.same, t.next_n),
-            pct(t.same_tool, t.next_n),
-            pct(t.repeat, t.next_n),
+            pctf(t.same, t.next_n),
+            pctf(t.same_tool, t.next_n),
+            pctf(t.repeat, t.next_n),
             pct64(t.files_hit, t.files_truth),
             pct(t.check_ok, t.check_n),
             t.failed,
@@ -1010,6 +1060,7 @@ pub fn report_text(rows: &BTreeMap<String, BTreeMap<String, Value>>) -> String {
         for other in &arms[1..] {
             for (label, f) in [
                 ("next action same", metric_same as fn(&Value) -> Option<f64>),
+                ("repeats a call", metric_repeat),
                 ("details kept", metric_details),
                 ("files named", metric_files),
             ] {
@@ -1043,7 +1094,12 @@ fn ok_row(v: &Value) -> Option<&Value> {
 
 fn metric_same(v: &Value) -> Option<f64> {
     let n = &ok_row(v)?["next"];
-    (!n.is_null() && n["unavailable"] != json!(true)).then(|| if n["same"] == json!(true) { 1.0 } else { 0.0 })
+    (!n.is_null() && n["unavailable"] != json!(true)).then(|| share(&n["same"]))
+}
+
+fn metric_repeat(v: &Value) -> Option<f64> {
+    let n = &ok_row(v)?["next"];
+    (!n.is_null() && n["unavailable"] != json!(true)).then(|| share(&n["repeat"]))
 }
 
 fn metric_details(v: &Value) -> Option<f64> {
