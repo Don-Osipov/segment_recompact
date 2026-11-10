@@ -413,7 +413,7 @@ fn an_oversized_final_turn_keeps_only_its_newest_parts_verbatim() {
         .iter()
         .map(|s| split_parts(&recs, s, DEFAULT_SPLIT_THRESHOLD))
         .collect();
-    apply_tail_budget(&recs, &segs, &mut plans, &parts, 20_000);
+    apply_tail_budget(&recs, &segs, &mut plans, &parts, 20_000, false);
     let tail = plans.last().unwrap();
     assert!(
         !tail.kept_verbatim && !tail.pinned_parts.is_empty(),

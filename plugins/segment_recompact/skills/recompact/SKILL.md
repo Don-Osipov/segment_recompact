@@ -31,7 +31,8 @@ the plugin's version; `recompact version` confirms it runs.
 | Make compaction automatic, like Claude Code's own | **The launcher: `recompact shell`** below |
 
 Inside Claude Code, commands that take a session default to the current one: Claude Code exports
-`CLAUDE_CODE_SESSION_ID` to Bash and to the recall server.
+`CLAUDE_CODE_SESSION_ID` to Bash and to the recall server. That id stays the one claude started
+with after a switch in place, so recall follows it to its newest compacted descendant.
 
 ## Compact this session
 

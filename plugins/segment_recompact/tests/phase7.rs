@@ -202,3 +202,44 @@ fn unresolvable_provenance_stays_verbatim() {
         "synthetics with dead provenance must survive verbatim, never be re-summarized"
     );
 }
+
+/// An autonomous session is one long turn: every earlier summary sits in the tail segment. Beyond
+/// the tail budget they consolidate like any older summaries, from raw.
+#[test]
+fn summaries_inside_one_long_turn_consolidate_beyond_the_tail_budget() {
+    let dir = tmp_dir();
+    let raw = gen0_raw(&dir);
+    let session = "auto-c";
+    let alpha = format!("OLD-SUMMARY-ALPHA about the widget. {}", "detail ".repeat(600));
+    let beta = format!("OLD-SUMMARY-BETA about polish. {}", "nuance ".repeat(600));
+    let records = vec![
+        user("u1", None, "keep going until the widget ships", session),
+        synthetic("syn1", "u1", &alpha, &raw, &["ra1", "ra2"], session),
+        synthetic("syn2", "syn1", &beta, &raw, &["ra3"], session),
+        assistant("a3", "syn2", &format!("REPORT {}", "verbose ".repeat(3000)), session),
+        assistant("a4", "a3", "done", session),
+        last_prompt("a4", "keep going until the widget ships", session),
+    ];
+    write_jsonl(&dir.join(format!("{session}.jsonl")), &records);
+    let stub = logging_summarizer(&dir);
+
+    let rc = cmd_continue(&[
+        dir.join(format!("{session}.jsonl")).to_string_lossy().into_owned(),
+        "--threshold".into(),
+        "1500".into(),
+        "--tail-budget".into(),
+        "2000".into(),
+        "--summarize-with".into(),
+        "stub-model".into(),
+        "--claude-bin".into(),
+        stub,
+    ]);
+    assert_eq!(rc, 0);
+    let latest = lineage_latest(&dir, session);
+    assert_ne!(latest, session);
+    let out = fs::read_to_string(dir.join(format!("{latest}.jsonl"))).unwrap();
+    assert!(!out.contains("OLD-SUMMARY-ALPHA"), "old summaries consolidated away");
+    assert!(out.contains("Epoch recap"));
+    let prompts = fs::read_to_string(dir.join("prompts.log")).unwrap();
+    assert!(prompts.contains("RAW-MARKER-ONE") && !prompts.contains("OLD-SUMMARY-ALPHA"));
+}

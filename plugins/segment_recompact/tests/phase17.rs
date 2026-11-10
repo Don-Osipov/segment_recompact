@@ -72,6 +72,9 @@ fn auto_compaction_is_off_by_default_and_switched_per_session() {
     let home = std::env::temp_dir().join(format!("recompact-switch-{}", uuid_v4()));
     fs::create_dir_all(&home).unwrap();
     std::env::set_var("RECOMPACT_HOME", &home);
+    // Run from a background job, this process would count as one.
+    std::env::remove_var("CLAUDE_JOB_DIR");
+    std::env::remove_var("RECOMPACT_SHELL");
     let ta = write_session(&home, A, 550_000);
     let tb = write_session(&home, B, 550_000);
     let (la, lb) = (launcher(&home, A, &ta), launcher(&home, B, &tb));

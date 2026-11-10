@@ -316,10 +316,9 @@ pub fn state_brief(records: &[Value]) -> Vec<String> {
                 user_text(r)
             }
         })
-        .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|t| {
-            !t.is_empty() && !t.starts_with("<command-name>") && !t.starts_with("<local-command")
-        })
+        .filter(|t| !t.starts_with("<command-name>") && !t.starts_with("<local-command"))
+        .map(|t| human_words(&t).split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|t| !t.is_empty())
         .collect();
     if !asks.is_empty() {
         let recent: Vec<String> = asks
@@ -806,6 +805,25 @@ const CONSTRAINT_OPENINGS: &[&str] = &[
     "we don't",
     "we dont",
     "no more",
+    "leave ",
+    "skip ",
+    "ask me ",
+    "ask before",
+    "check with me",
+    "wait for ",
+    "wait until",
+    "hold off",
+    "stick to",
+    "stay within",
+    "only touch",
+    "only change",
+    "don't touch",
+    "dont touch",
+    "do not touch",
+    "before you ",
+    "before merging",
+    "before pushing",
+    "before committing",
 ];
 
 /// Phrases that bind wherever they appear.
@@ -822,6 +840,15 @@ const CONSTRAINT_ANYWHERE: &[&str] = &[
     "don't ever",
     "dont ever",
     "never ever",
+    "out of scope",
+    "ask me before",
+    "check with me before",
+    "without checking with me",
+    "as a draft",
+    "leave it alone",
+    "leave that alone",
+    "don't touch",
+    "do not touch",
 ];
 
 const FILLER: &[&str] = &[
@@ -867,8 +894,19 @@ fn is_instruction(sentence: &str) -> bool {
 fn sentences(text: &str) -> Vec<(String, char)> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    for c in text.chars() {
-        if matches!(c, '\n' | '.' | '!' | '?') {
+    let chars: Vec<char> = text.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        let ends = match c {
+            '\n' => true,
+            // `team-request-access.ts`, `v1.2`, `example.com`: a period inside a word is not an
+            // end. Closing marks may follow one: `**Do not merge.** Run tests.`
+            '.' | '!' | '?' => chars[i + 1..]
+                .iter()
+                .find(|n| !matches!(n, '"' | '\'' | '*' | '`' | ')' | ']' | '_'))
+                .map_or(true, |n| n.is_whitespace()),
+            _ => false,
+        };
+        if ends {
             let t = cur.split_whitespace().collect::<Vec<_>>().join(" ");
             if !t.is_empty() {
                 out.push((t, c));
@@ -903,6 +941,28 @@ fn strip_tagged(text: &str, tag: &str) -> String {
     out
 }
 
+/// Blocks the harness or a command wraps around a user turn; none of them are the person's words.
+const INJECTED_TAGS: &[&str] = &[
+    "pasted_content",
+    "local-command-stdout",
+    "bash-stdout",
+    "bash-stderr",
+    "command-message",
+    "command-name",
+    "command-args",
+    "system-reminder",
+];
+
+/// A user turn's text without the blocks the harness injects into it. A slash command's
+/// arguments are the person's words, so they stay, unwrapped.
+pub fn human_words(text: &str) -> String {
+    let mut text = text.replace("<command-args>", " ").replace("</command-args>", " ");
+    for tag in INJECTED_TAGS {
+        text = strip_tagged(&text, tag);
+    }
+    text
+}
+
 /// The user's own words that bind future work, verbatim and in order. Constraint retention is the
 /// best-measured failure of compaction (one round of summarization took violations from 0% to
 /// 30%, four rounds to 78%; pinning the constraints restored 0%). Human turns already survive here
@@ -924,20 +984,7 @@ pub fn constraint_lane(records: &[Value]) -> Vec<String> {
         {
             continue;
         }
-        let mut text = raw;
-        for tag in [
-            "pasted_content",
-            "local-command-stdout",
-            "bash-stdout",
-            "bash-stderr",
-            "command-message",
-            "command-name",
-            "command-args",
-            "system-reminder",
-        ] {
-            text = strip_tagged(&text, tag);
-        }
-        let text: String = text.chars().take(6000).collect();
+        let text: String = human_words(&raw).chars().take(6000).collect();
         for (sentence, end) in sentences(&text) {
             if end == '?' || !(12..=400).contains(&sentence.len()) || !is_instruction(&sentence) {
                 continue;
@@ -995,7 +1042,102 @@ const CHECK_PATTERNS: &[&str] = &[
     "swift test",
     "xcodebuild test",
     "bun test",
+    "sideshift-test-pg",
 ];
+
+/// The commands a shell line runs: heredoc bodies dropped, split at `&&`, `||`, `;`, `|` and line
+/// breaks, with leading `VAR=value`, `time`, `timeout <n>`, `env`, `npx`, `bunx` and `pnpm exec`
+/// removed. A PR body or commit message that mentions a test runner is not a test run.
+fn commands_run(cmd: &str) -> Vec<String> {
+    let mut lines: Vec<&str> = Vec::new();
+    let mut heredoc_end: Option<String> = None;
+    for line in cmd.lines() {
+        if let Some(end) = &heredoc_end {
+            if line.trim() == end {
+                heredoc_end = None;
+            }
+            continue;
+        }
+        if let Some(at) = line.find("<<") {
+            let word: String = line[at + 2..]
+                .trim_start_matches('-')
+                .trim_start()
+                .trim_start_matches(['\'', '"'])
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+                .collect();
+            if !word.is_empty() {
+                heredoc_end = Some(word);
+            }
+        }
+        lines.push(line);
+    }
+    // Quoted text is data (a commit message, a jq filter, an echoed note), not commands.
+    let mut unquoted = String::new();
+    let (mut single, mut double, mut escaped, mut comment) = (false, false, false, false);
+    let mut prev = '\n';
+    for c in lines.join("\n").chars() {
+        // A comment (`# don't …`) is not code, and its apostrophe opens no quote.
+        if comment || (c == '#' && !single && !double && !escaped && prev.is_whitespace()) {
+            comment = c != '\n';
+            prev = c;
+            unquoted.push(if comment { ' ' } else { c });
+            continue;
+        }
+        prev = c;
+        let quoted = single || double;
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if !single => escaped = true,
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            _ => {}
+        }
+        unquoted.push(if quoted || single || double { ' ' } else { c });
+    }
+    let mut out = Vec::new();
+    for seg in unquoted.split(|c| matches!(c, ';' | '|' | '\n' | '&')) {
+        let mut words: Vec<&str> = seg.split_whitespace().collect();
+        loop {
+            match words.first() {
+                Some(w) if w.contains('=') && !w.starts_with('-') => {
+                    words.remove(0);
+                }
+                Some(&"time" | &"env" | &"npx" | &"bunx" | &"exec") => {
+                    words.remove(0);
+                }
+                Some(&"timeout") => {
+                    words.drain(..words.len().min(2));
+                }
+                Some(&"pnpm") if words.get(1) == Some(&"exec") => {
+                    words.drain(..2);
+                }
+                _ => break,
+            }
+        }
+        if !words.is_empty() {
+            out.push(words.join(" "));
+        }
+    }
+    out
+}
+
+fn is_check_command(cmd: &str) -> bool {
+    commands_run(cmd).iter().any(|c| {
+        // A runner may sit behind a launcher word or two: `uv run pytest`, `python -m pytest`,
+        // `yarn vitest`, `if cargo test`.
+        let words: Vec<&str> = c.split(' ').collect();
+        (0..words.len().min(3)).any(|start| {
+            let rest = words[start..].join(" ");
+            CHECK_PATTERNS.iter().any(|p| {
+                rest.starts_with(p)
+                    || p
+                        .strip_prefix("npx ")
+                        .map_or(false, |bare| rest.starts_with(bare))
+            })
+        })
+    })
+}
 
 /// The most recent validation command and how it ended — the one line a successor needs to know
 /// whether the tree was green, and the one that handoff notes most often dropped.
@@ -1013,7 +1155,7 @@ pub fn last_check(records: &[Value]) -> Option<String> {
                             .pointer("/input/command")
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
-                        if CHECK_PATTERNS.iter().any(|p| cmd.contains(p)) {
+                        if is_check_command(cmd) {
                             let id = b
                                 .get("id")
                                 .and_then(|v| v.as_str())
@@ -1148,7 +1290,7 @@ pub fn preamble_text(p: &PreambleInput) -> String {
     }
     if !p.constraints.is_empty() {
         s.push_str(
-            "\nStanding instructions from the user, verbatim, oldest first (a later one overrides an earlier one):\n",
+            "\nStanding instructions from the user, verbatim, oldest first. They stay in force: a later request is not permission to break one, and only the user's own later words change one (where two conflict, the later wins):\n",
         );
         for c in &p.constraints {
             s.push_str(&format!("- {c}\n"));

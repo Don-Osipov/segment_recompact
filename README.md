@@ -42,6 +42,8 @@ terminal and use claude as always:
   place and carries on, through as many handoffs as it takes; long autonomous turns are asked to
   reach a checkpoint first. Everything else stays untouched: automatic compaction is off by
   default. Set `RECOMPACT_WINDOW=200k` if your Opus or Sonnet plan has a 200k window.
+  In a session with auto-compaction on, Claude Code's own compaction (including the one it runs
+  after about an hour idle) yields to recompact. A typed `/compact` still runs Claude Code's.
 - Background shells, monitors, agents, and scheduled prompts (`/loop`) keep running: claude is
   not restarted, so nothing stops, and their notices arrive in the compacted session. Where
   claude must be restarted instead (no terminal, or `RECOMPACT_PTY=0`), compaction records them
