@@ -239,10 +239,38 @@ Next, in evidence order:
       references is the likely fix.
 - [ ] **Discard-and-rebuild churn.** 34 of 131 launcher twins were rebuilt because the session
       moved on; 25 rebuilds reused cached summaries only, so the new growth stayed verbatim.
-- [ ] `recompact eval`: the zero-model retention score and post-resume refetch burden of
-      Compact-Bench and TRACE (arXiv 2610.08722), over every twin on disk, so each cycle measures
-      itself. The forensics scripts of this cycle are the starting point.
+- [x] `recompact eval` (v1.13, below).
 - [ ] Overhead: the 35k system+tools default runs ~20k low for sessions with many MCP servers.
+
+## v1.13 (2026-11): measure before changing
+
+The research of the v1.12 cycle has no Claude result for twins of 100k to 250k on real coding
+work, so each design change needs a measurement on the owner's own sessions first.
+
+- [x] **`recompact eval`.** Cut points in long original sessions; for each arm, the details the
+      next three turns used that the resumed context still shows, the files the model says it
+      changed and the last check's result, and its first action on the real next message, which a
+      hook denies so nothing runs (the replay of TRACE, arXiv 2608.06503). Points keep a frozen
+      copy, and arms compare paired.
+- Baseline, 39 points from 33 sessions of the 30 days to 2026-11-10, Opus 5.5:
+
+  | arm | size | details kept | first action same | same tool | repeats a call |
+  |---|---|---|---|---|---|
+  | full history | 247k | 100% | 38% | 70% | 43% |
+  | v1.12 twin | 115k | 89% | 27% | 62% | 51% |
+
+  Paired: details kept -9 points (95% interval -12 to -5), first action same -11 (-26 to +4).
+  Even the full history repeats an earlier call 43% of the time: days have passed at replay, so
+  the model re-checks git, GitHub and Slack. The twin loses file paths and code names the next
+  turns use (18 of 39 points lost at least one), and re-reads Slack threads and git state more.
+  Cost at list prices: $60 for the twin arm, $112 for the full-history arm.
+
+Next, each tested against this baseline:
+- [ ] Find why the lost details were dropped (a compaction cannot see past the cut, so it has to
+      keep them for a reason it can see), change what the twin keeps, and test whether the
+      first-action gap closes.
+- [ ] Haiku against Sonnet as the summarizer on the same points.
+- [ ] Twin size: the same points at 80k, 120k, 200k.
 
 ## Track C: confidence
 
