@@ -18,6 +18,7 @@ use serde_json::{json, Map, Value};
 mod accounting;
 mod anchor;
 mod brief;
+mod eval;
 mod gateway;
 mod launcher;
 mod statusline;
@@ -25,6 +26,7 @@ mod term;
 pub use accounting::*;
 pub use anchor::*;
 pub use brief::*;
+pub use eval::{cmd_eval, EVAL_USAGE};
 pub use gateway::*;
 pub use launcher::*;
 pub use statusline::{
@@ -71,7 +73,9 @@ recompact auto      [on [300k] | off | status]  (the auto-compaction switch; ins
 claude: /recompact on, /recompact off, /recompact status)\n  \
 recompact version\n  \
 recompact resume    <session.jsonl | sessionId>\n  \
-recompact scan      [project-dir] [--estimate]\n\n\
+recompact scan      [project-dir] [--estimate]\n  \
+recompact eval      points | run | report  (score how well resumed twins carry on,\n                      \
+on cut points in your own past sessions; `recompact eval` for usage)\n\n\
   Token numbers are context tokens (what /context shows), calibrated from the\n  \
   transcript's own usage records when it has them.\n\n\
   --keep K       number of most-recent turns kept verbatim (default 1)\n  \
@@ -943,6 +947,8 @@ pub fn parse_opts(args: &[String]) -> (Vec<String>, Map<String, Value>) {
         "force",
         "mask",
         "continue-after",
+        "original",
+        "tier0",
     ];
     let mut positional = Vec::new();
     let mut opts = Map::new();

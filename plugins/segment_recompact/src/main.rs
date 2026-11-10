@@ -4,7 +4,7 @@ use std::env;
 use std::process::exit;
 
 use recompact::{
-    cmd_assemble, cmd_auto, cmd_continue, cmd_doctor, cmd_extract, cmd_gateway, cmd_handoff, cmd_hook, cmd_install, cmd_job_handoff, cmd_mcp, cmd_prewarm, cmd_probe, cmd_recall,
+    cmd_assemble, cmd_auto, cmd_continue, cmd_doctor, cmd_eval, cmd_extract, cmd_gateway, cmd_handoff, cmd_hook, cmd_install, cmd_job_handoff, cmd_mcp, cmd_prewarm, cmd_probe, cmd_recall,
     cmd_pty_leader, cmd_rehydrate, cmd_resume, cmd_scan, cmd_shell, cmd_statusline, cmd_uninstall, cmd_update, cmd_verify, USAGE,
 };
 
@@ -42,6 +42,7 @@ fn main() {
         "statusline" => cmd_statusline(&args[2..]),
         "resume" => cmd_resume(&args[2..]),
         "scan" => cmd_scan(&args[2..]),
+        "eval" => cmd_eval(&args[2..]),
         _ => {
             eprintln!("{USAGE}");
             2
