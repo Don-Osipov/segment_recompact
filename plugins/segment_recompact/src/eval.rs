@@ -38,7 +38,7 @@ recompact eval points [project-dir ...] [--days 30] [--min 200k] [--max 850k] [-
 [--per-session 2] [--limit 40] [--out F] [--force]\n                        \
 (choose cut points in long sessions that ran on uncompacted)\n  \
 recompact eval run --arm NAME [--original] [--target 120k] [--summarize-with M | --mask]\n                        \
-[--model opus] [--tier0] [--samples 3] [--probe] [--only id,id] [--jobs 2]\n                        \
+[--model opus] [--tier0] [--samples 1] [--probe] [--only id,id] [--jobs 2]\n                        \
 [--points F] [--out F] [--save-to DIR]  (keep each point's prefix and context, to inspect)\n                        \
 (score one arm on every point; nothing the resumed model proposes runs)\n  \
 recompact eval report [results.jsonl ...]  (compare the arms on their shared points)";
@@ -398,7 +398,7 @@ struct Arm {
     tier0: bool,
     /// `--save-to DIR`: keep each point's prefix and resumed context there, to see what a twin lost.
     save_to: Option<PathBuf>,
-    /// `--samples K`: first-action samples per point (default 3).
+    /// `--samples K`: first-action samples per point (default 1).
     samples: usize,
     /// `--probe`: also ask for the files changed and the last check's result.
     probe: bool,
@@ -439,7 +439,9 @@ fn eval_run(args: &[String]) -> i32 {
         model: opt_str(&opts, "model").unwrap_or("opus").to_string(),
         tier0: opts.contains_key("tier0"),
         save_to: opt_str(&opts, "save-to").map(PathBuf::from),
-        samples: opt_str(&opts, "samples").and_then(|v| v.parse().ok()).unwrap_or(3usize).max(1),
+        // One by default: a later sample reuses the first one's cached prompt only when both
+        // reach the same account, and through an account pool most did not.
+        samples: opt_str(&opts, "samples").and_then(|v| v.parse().ok()).unwrap_or(1usize).max(1),
         probe: opts.contains_key("probe"),
     });
     let out = opt_str(&opts, "out")
@@ -653,8 +655,7 @@ fn run_point(p: &Value, arm: &Arm) -> Result<Value, String> {
         .flat_map(tool_uses)
         .map(|(_, name, input)| canonical(&name, &input))
         .collect();
-    // Several samples of the first action: the later ones read the first one's cached prompt,
-    // so they cost a fraction of it, and each point says how often, not just whether.
+    // With several samples a point says how often, not just whether, the first action matches.
     let mut proposals: Vec<String> = Vec::new();
     let (mut tools, mut cost, mut usage) = (HashSet::new(), 0.0, Vec::new());
     for _ in 0..arm.samples {
