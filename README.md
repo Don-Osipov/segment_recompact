@@ -188,6 +188,28 @@ the originals behind a session's whole compaction lineage.
 Sizes are what the model is sent: visible text at the session model's measured tokenizer ratio,
 plus system and tool overhead. (The raw record size overstates a resumed twin by a median 3.6x.)
 
+## Measuring it
+
+`recompact eval` scores how well Claude carries on from a twin, on your own past sessions. It cuts
+a long session at a past user turn, builds the twin of everything before the cut, and compares
+what the resumed model does with what really happened next.
+
+```
+recompact eval points                          # once: choose cut points, keep a copy of each
+recompact eval run --arm full --original       # the ceiling: resume the full history
+recompact eval run --arm v1.12                 # the twin this version builds
+recompact eval run --arm big --target 200k --tier0    # a candidate, free check
+recompact eval report                          # each arm, and each against the first
+```
+
+Each point gets three scores: the details the next turns used that the context still shows (no
+model call); whether the resumed model names the files it changed and the last check's result;
+and whether its first action, given the real next message, matches the real one. That action is
+recorded by a hook that denies it and stops the run, so nothing the model proposes executes.
+The first score is free and exact, so use it after every change to what a twin keeps
+(`--tier0`). The two model scores cost about $2 a point for a twin arm at list prices, more for
+the full history; their first-action score is noisy, so compare arms over many points.
+
 ## Safety
 
 - The original session file is **never modified** — opened read-only; output is create-new-only in

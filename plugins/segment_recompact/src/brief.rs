@@ -31,7 +31,7 @@ struct PrState {
     order: usize,
 }
 
-fn tool_result_texts(r: &Value) -> Vec<(String, String, bool)> {
+pub(crate) fn tool_result_texts(r: &Value) -> Vec<(String, String, bool)> {
     let mut out = Vec::new();
     if let Some(blocks) = content(r).and_then(|c| c.as_array()) {
         for b in blocks {
@@ -411,6 +411,10 @@ fn git(cwd: &str, args: &[&str]) -> Option<String> {
 
 /// Live repo state for `cwd`, when it is a git checkout: branch, short HEAD, uncommitted count.
 pub fn git_snapshot(cwd: &str) -> Option<Value> {
+    // `recompact eval` builds twins for past moments; today's repository state would be wrong there.
+    if std::env::var_os("RECOMPACT_EVAL").is_some() {
+        return None;
+    }
     if cwd.is_empty() || !Path::new(cwd).is_dir() {
         return None;
     }
@@ -1048,7 +1052,7 @@ const CHECK_PATTERNS: &[&str] = &[
 /// The commands a shell line runs: heredoc bodies dropped, split at `&&`, `||`, `;`, `|` and line
 /// breaks, with leading `VAR=value`, `time`, `timeout <n>`, `env`, `npx`, `bunx` and `pnpm exec`
 /// removed. A PR body or commit message that mentions a test runner is not a test run.
-fn commands_run(cmd: &str) -> Vec<String> {
+pub(crate) fn commands_run(cmd: &str) -> Vec<String> {
     let mut lines: Vec<&str> = Vec::new();
     let mut heredoc_end: Option<String> = None;
     for line in cmd.lines() {

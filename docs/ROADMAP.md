@@ -239,34 +239,65 @@ Next, in evidence order:
       references is the likely fix.
 - [ ] **Discard-and-rebuild churn.** 34 of 131 launcher twins were rebuilt because the session
       moved on; 25 rebuilds reused cached summaries only, so the new growth stayed verbatim.
-- [ ] `recompact eval`: the zero-model retention score and post-resume refetch burden of
-      Compact-Bench and TRACE (arXiv 2610.08722), over every twin on disk, so each cycle measures
-      itself. The forensics scripts of this cycle are the starting point.
+- [x] `recompact eval` (v1.13, below).
 - [ ] Overhead: the 35k system+tools default runs ~20k low for sessions with many MCP servers.
 
-## Track C: confidence
+## v1.13 (2026-11): measure before changing
 
-- [x] 30 integration tests over synthetic sessions covering every failure class identified in the
-      research review (branches, compact boundaries, image-first turns, in-flight tool calls,
-      provenance round-trips, cache hits, ledger supersession, split seams, planner floors,
-      churn guard, dangling lineage).
-- [x] bench/smoke.sh: repeatable headless end-to-end proof (summarize-mode recall of a fact that
-      exists only in the synthetic summary; mask-mode continuity over elided records).
-- [ ] One iterated-lifecycle smoke scenario (compact, resume+continue, compact, probe planted
-      facts) so the multi-pass invariants are guarded by a live test.
-- [ ] Rubric hardening as practice: when a resumed session stumbles, rehydrate the segment, name
-      what was lost, amend the rubric (the ACON loop, arXiv 2510.00615, applied manually).
+The research of the v1.12 cycle has no Claude result for twins of 100k to 250k on real coding
+work, so each design change needs a measurement on the owner's own sessions first.
 
-## Descoped (deliberately, with reasons)
+- [x] **`recompact eval`.** Cut points in long original sessions; for each arm, the details the
+      next three turns used that the resumed context still shows, the files the model says it
+      changed and the last check's result, and its first action on the real next message, which a
+      hook denies so nothing runs (the replay of TRACE, arXiv 2608.06503). Points keep a frozen
+      copy, and arms compare paired.
+- Baseline, 39 points from 33 sessions of the 30 days to 2026-11-10, Opus 5.5:
 
-- **Published benchmark suite** (six-arm comparisons, decay curves as a function of pass count,
-  corpus-wide next-action-preservation): research deliverables, not tool deliverables. The
-  smoke bench keeps the empirical honesty; the rest is parked until the tool goal is met.
-- **Soft-prompt / gist-token / activation compression**: requires model weight access and
-  produces non-readable states; incompatible with a stock-CLI-resumable text artifact.
-- **Knowledge-graph memory** for single sessions: graphs pay off across many sessions, not inside
-  one transcript.
-- **Live/proxy operation**: offline hindsight is this tool's structural edge (future-file-overlap
-  salience is impossible live); live compaction has a different trust and failure surface.
-- **Queryable-original mode / symbolic state canvases / cross-session memory distillation**:
-  interesting, not on the critical path; rehydrate is the primitive the first would build on.
+  | arm | size | details kept | first action same | same tool | repeats a call |
+  |---|---|---|---|---|---|
+  | full history | 247k | 100% | 38% | 70% | 43% |
+  | v1.12 twin | 115k | 89% | 27% | 62% | 51% |
+
+  Paired: details kept -9 points (95% interval -12 to -5), first action same -11 (-26 to +4).
+  Even the full history repeats an earlier call 43% of the time: days have passed at replay, so
+  the model re-checks git, GitHub and Slack. The twin loses file paths and code names the next
+  turns use (18 of 39 points lost at least one), and re-reads Slack threads and git state more.
+  Cost at list prices: $60 for the twin arm, $112 for the full-history arm.
+
+- [x] **A summarized stretch keeps its tool lookups.** It dropped the ToolSearch exchanges that
+      loaded deferred tools (35 of 143 on the 200k points), so a resumed session had to look its
+      Slack or web tools up again. They stay now, like messages typed mid-turn.
+- [x] **The thread the human linked stays.** A fetch of a link the human typed is the task's own
+      source; twins re-read Slack threads 5 times in 36 resumes, the full history twice. The
+      newest four such results stay through summaries and masks, cut to 6,000 characters.
+- [x] **A hidden result names what it held.** The marker lists its paths, links and refs, up to
+      300 characters. With the two items above: details kept +1 to +2 points on both point
+      sets, size +1k.
+- [x] **Size, measured at the real operating point.** 40 points at 450k to 630k live tokens
+      (`points-450k.json`), where the launcher compacts:
+
+  | target | size | details kept | first action same | repeats a call |
+  |---|---|---|---|---|
+  | 80k | 108k | 79% | | |
+  | 120k (default) | 125k | 84% | 14% | 61% |
+  | 160k | 158k | 90% | | |
+  | 200k | 196k | 93% | 15% | 63% |
+
+  200k against 120k, paired, three samples a point: first action same +1 point (-5 to +7),
+  repeats +2 (-8 to +12). A 200k twin keeps more but did not change what the model did next,
+  so the default stays 120k.
+
+What the measurement can and cannot see:
+- Tier 0 is free, exact and repeatable (the same twin scores the same), so it is the regression
+  check for every change to what a twin keeps.
+- The first-action score is noisy: at 450k the model matches the real next action 15% of the
+  time from any twin, and the arms disagree on few points. A 5-point effect needs some 200
+  points. Through an account pool the repeat samples rarely reuse the first one's prompt cache,
+  so each sample costs a full cache write (the two 450k runs: $95 and $132 at list prices).
+  `--samples` defaults to 1.
+
+Next:
+- [ ] A cheaper behavior score: more scored items per point (probe questions about details the
+      next turns used, mined mechanically), so fewer points reach the same power.
+- [ ] Haiku against Sonnet as the summarizer, once that score exists.

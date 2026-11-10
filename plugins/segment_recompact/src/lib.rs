@@ -18,6 +18,7 @@ use serde_json::{json, Map, Value};
 mod accounting;
 mod anchor;
 mod brief;
+mod eval;
 mod gateway;
 mod launcher;
 mod statusline;
@@ -25,6 +26,7 @@ mod term;
 pub use accounting::*;
 pub use anchor::*;
 pub use brief::*;
+pub use eval::{cmd_eval, EVAL_USAGE};
 pub use gateway::*;
 pub use launcher::*;
 pub use statusline::{
@@ -71,7 +73,9 @@ recompact auto      [on [300k] | off | status]  (the auto-compaction switch; ins
 claude: /recompact on, /recompact off, /recompact status)\n  \
 recompact version\n  \
 recompact resume    <session.jsonl | sessionId>\n  \
-recompact scan      [project-dir] [--estimate]\n\n\
+recompact scan      [project-dir] [--estimate]\n  \
+recompact eval      points | run | report  (score how well resumed twins carry on,\n                      \
+on cut points in your own past sessions; `recompact eval` for usage)\n\n\
   Token numbers are context tokens (what /context shows), calibrated from the\n  \
   transcript's own usage records when it has them.\n\n\
   --keep K       number of most-recent turns kept verbatim (default 1)\n  \
@@ -645,6 +649,116 @@ const DELEGATION_TOOLS: &[&str] = &["Task", "Agent", "Workflow", "Skill"];
 /// A segment at or under the threshold stays a single part. threshold 0 disables splitting.
 /// Records this tool must never re-summarize or reshape: its own summaries, ledgers, and native
 /// compaction summaries.
+/// Characters of a source result a twin keeps (head and tail), and how many sources it keeps.
+pub const SOURCE_MAX_CHARS: usize = 6000;
+pub const SOURCE_MAX_CALLS: usize = 4;
+
+/// The calls that fetched what the human pointed at: a tool call whose input holds a link the
+/// human typed (`slack-read <link>`, a fetch of a pasted URL). Their results are the task's own
+/// source, so a twin keeps them through summaries and masks; the newest few only.
+pub fn human_sources(records: &[Value]) -> HashSet<String> {
+    let mut links: HashSet<String> = HashSet::new();
+    let mut ids = Vec::new();
+    for r in records {
+        let text = if is_genuine_user(r) {
+            user_text(r)
+        } else if is_human_queued(r) {
+            human_queued_text(r)
+        } else {
+            continue;
+        };
+        ids.clear();
+        identifiers(&text, &mut ids);
+        links.extend(ids.drain(..).filter(|t| t.starts_with("https://") || t.starts_with("http://")));
+    }
+    if links.is_empty() {
+        return HashSet::new();
+    }
+    let mut calls: Vec<String> = Vec::new();
+    for r in records {
+        if rec_type(r) != "assistant" {
+            continue;
+        }
+        for b in content(r).and_then(|c| c.as_array()).into_iter().flatten() {
+            if b.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+                continue;
+            }
+            let input = b.get("input").map(|i| i.to_string()).unwrap_or_default();
+            if links.iter().any(|l| input.contains(l.as_str())) {
+                calls.extend(b.get("id").and_then(|v| v.as_str()).map(String::from));
+            }
+        }
+    }
+    let skip = calls.len().saturating_sub(SOURCE_MAX_CALLS);
+    calls.into_iter().skip(skip).collect()
+}
+
+/// A record that only makes calls in `ids`, or only holds their results.
+fn is_exchange_of(r: &Value, ids: &HashSet<String>) -> bool {
+    if ids.is_empty() {
+        return false;
+    }
+    let (uses, results) = tool_ids(r);
+    match (uses.is_empty(), results.is_empty()) {
+        (false, true) => uses.iter().all(|id| ids.contains(*id)),
+        (true, false) => results.iter().all(|id| ids.contains(*id)),
+        _ => false,
+    }
+}
+
+/// Emit a source exchange record: verbatim, with a result over `SOURCE_MAX_CHARS` cut to its
+/// head and tail.
+fn emit_source(out: &mut Vec<Value>, r: &Value) {
+    let mut tmp = Vec::new();
+    emit_trimmed(&mut tmp, r, true, false);
+    for mut v in tmp {
+        let mut cut = false;
+        if let Some(blocks) = v.pointer_mut("/message/content").and_then(|c| c.as_array_mut()) {
+            for b in blocks.iter_mut() {
+                if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+                    continue;
+                }
+                let text = tool_result_text(b);
+                if text.chars().count() > SOURCE_MAX_CHARS {
+                    b["content"] = Value::String(truncate_head_tail(&text, SOURCE_MAX_CHARS, 0.6));
+                    cut = true;
+                }
+            }
+        }
+        if cut {
+            v["recompactMasked"] = Value::Bool(true);
+        }
+        out.push(v);
+    }
+}
+
+/// The ids of a record's tool-search calls, when every call it makes is one.
+fn tool_load_calls(r: &Value) -> Vec<&str> {
+    let (uses, _) = tool_ids(r);
+    let searches: Vec<&str> = content(r)
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|b| b.get("type").and_then(|v| v.as_str()) == Some("tool_use"))
+        .filter(|b| b.get("name").and_then(|v| v.as_str()) == Some("ToolSearch"))
+        .filter_map(|b| b.get("id").and_then(|v| v.as_str()))
+        .collect();
+    if rec_type(r) == "assistant" && !searches.is_empty() && searches.len() == uses.len() {
+        searches
+    } else {
+        Vec::new()
+    }
+}
+
+/// A tool-search call record, or the record holding only results of the calls in `loads`.
+fn is_tool_load(r: &Value, loads: &HashSet<&str>) -> bool {
+    if !tool_load_calls(r).is_empty() {
+        return true;
+    }
+    let (uses, results) = tool_ids(r);
+    rec_type(r) == "user" && uses.is_empty() && !results.is_empty() && results.iter().all(|id| loads.contains(id))
+}
+
 pub fn is_pinned_content(r: &Value) -> bool {
     truthy(r, "recompactSynthetic") || truthy(r, "recompactLedger") || truthy(r, "isCompactSummary")
 }
@@ -943,6 +1057,9 @@ pub fn parse_opts(args: &[String]) -> (Vec<String>, Map<String, Value>) {
         "force",
         "mask",
         "continue-after",
+        "original",
+        "tier0",
+        "probe",
     ];
     let mut positional = Vec::new();
     let mut opts = Map::new();
@@ -1613,6 +1730,8 @@ pub const MASK_ERROR_BUDGET: usize = 2000;
 pub const MASK_INPUT_FIELD_MAX: usize = 2000;
 /// Characters of a masked result's head kept in its marker.
 pub const MASK_PREVIEW_CHARS: usize = 60;
+/// Characters of the names (paths, URLs, refs, constants) a masked result's marker lists.
+pub const MASK_NAMES_CHARS: usize = 300;
 /// Non-error results at or under this length stay verbatim: a placeholder would not be smaller,
 /// and short results ("ok", a count, a path) are usually the load-bearing part of the exchange.
 pub const MASK_RESULT_MIN: usize = 500;
@@ -1630,6 +1749,28 @@ pub enum Masked {
 /// and elide the top-level toolUseResult duplicate (UI metadata, never sent to the API). Never
 /// rewrites prose, so it cannot hallucinate; it can only omit, and the untouched original session
 /// retains everything omitted.
+/// The names a masked result held, first seen first, up to `MASK_NAMES_CHARS`: a listing or a
+/// search result is mostly names, and the next step often acts on one of them.
+pub fn marker_names(text: &str, head: &str) -> String {
+    let mut ids = Vec::new();
+    identifiers(text, &mut ids);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = String::new();
+    for id in ids {
+        if head.contains(id.as_str()) || !seen.insert(id.clone()) {
+            continue;
+        }
+        if out.len() + id.len() + 2 > MASK_NAMES_CHARS {
+            break;
+        }
+        if !out.is_empty() {
+            out.push_str(", ");
+        }
+        out.push_str(&id);
+    }
+    out
+}
+
 pub fn mask_record(r: &Value) -> Masked {
     let mut m = r.clone();
     let mut changed = false;
@@ -1693,7 +1834,9 @@ pub fn mask_record(r: &Value) -> Masked {
                             .chars()
                             .take(MASK_PREVIEW_CHARS)
                             .collect();
-                        format!("[recompact: elided {chars}-char result, begins \"{head}…\"; rehydrate {sel} to recover it]")
+                        let names = marker_names(&text, &head);
+                        let names = if names.is_empty() { String::new() } else { format!("; names {names}") };
+                        format!("[recompact: elided {chars}-char result, begins \"{head}…\"{names}; rehydrate {sel} to recover it]")
                     };
                     if let Some(obj) = b.as_object_mut() {
                         obj.insert("content".into(), Value::String(replacement));
@@ -2784,6 +2927,7 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
     });
 
     let (mut n_provided, mut n_cache, mut n_mech) = (0usize, 0usize, 0usize);
+    let sources = human_sources(&records);
     for (s, seg) in segs.iter().enumerate() {
         if s == tail_start {
             if let Some(l) = ledger_pending.take() {
@@ -2824,7 +2968,12 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
             match treatment {
                 Treatment::Verbatim | Treatment::Mask => {
                     for &i in part {
-                        if keep_rec(i) {
+                        if !keep_rec(i) {
+                            continue;
+                        }
+                        if treatment == Treatment::Mask && is_exchange_of(&records[i], &sources) {
+                            emit_source(&mut out, &records[i]);
+                        } else {
                             emit_trimmed(&mut out, &records[i], !pinned, treatment == Treatment::Mask);
                         }
                     }
@@ -2844,6 +2993,16 @@ fn run_assemble(args: &[String]) -> Result<Option<(String, PathBuf)>, i32> {
                         if is_human_queued(&records[i]) {
                             let r = &records[i];
                             out.push(if outside { elide_images(r) } else { None }.unwrap_or_else(|| r.clone()));
+                        }
+                    }
+                    // Deferred tools the part loaded stay loaded: a tool is offered only while a
+                    // reference to it is in the history, so the lookups and their results stay.
+                    let loads: HashSet<&str> = part.iter().flat_map(|&i| tool_load_calls(&records[i])).collect();
+                    for &i in part {
+                        if !loads.is_empty() && is_tool_load(&records[i], &loads) {
+                            emit_trimmed(&mut out, &records[i], true, false);
+                        } else if is_exchange_of(&records[i], &sources) {
+                            emit_source(&mut out, &records[i]);
                         }
                     }
                 }
