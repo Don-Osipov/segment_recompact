@@ -3264,6 +3264,60 @@ fn job_claude_bin(l: &Launch) -> String {
 /// place. Its hooks start this, detached, for a ready request. It compacts while the job keeps
 /// working, waits for a pause, attaches, types `/resume <twin>`, and detaches. It takes requests
 /// until none is left, and stops when the job's claude does.
+/// `recompact job-compact <job id>`: what a typed `/recompact` does in a terminal, for a background
+/// job that something other than recompact's shell shows, such as Session Board. It compacts now,
+/// without a model turn, and the job switches to the compacted copy at the next pause.
+pub fn cmd_job_compact(args: &[String]) -> i32 {
+    let Some(short) = args.first().filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')) else {
+        eprintln!("usage: recompact job-compact <background job id>");
+        return 2;
+    };
+    let claude = home().join(".claude");
+    let Some(job) = Job::at(&claude.join("jobs").join(short)) else {
+        println!("recompact · {short} is not a background job");
+        return 1;
+    };
+    // The job's own claude: the running session Claude Code records under this job's id.
+    let sessions = claude.join("sessions");
+    let pid = fs::read_dir(&sessions)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.strip_suffix(".json")?.parse::<u32>().ok())
+        .find(|pid| pid_alive(*pid) && runs_job(&sessions, *pid, &job.short));
+    let Some(pid) = pid else {
+        println!("recompact · {short} is not running; open it, then type /recompact again");
+        return 1;
+    };
+    let shell = job_shell(&job, pid);
+    let Some(session) = tracked_session(&shell.dir).or_else(|| get_s(&job.state(), "sessionId").map(String::from)) else {
+        println!("recompact · {short} has no session yet");
+        return 1;
+    };
+    if shell.session().is_none() {
+        let transcript = locate_session(None, &session);
+        write_session(&shell, &json!({"session_id": session, "transcript_path": transcript}));
+    }
+    if in_flight(&shell, &session) {
+        println!("recompact · already compacting; switches at the next pause");
+        return 0;
+    }
+    // A session nobody has sent a message yet (a fresh fork) has no transcript on disk.
+    let on_disk = shell.session().and_then(|s| get_s(&s, "transcript").map(PathBuf::from)).is_some_and(|t| t.exists());
+    if !on_disk && locate_session(None, &session).is_none() {
+        println!("recompact · nothing to compact yet: {short} has no conversation on disk");
+        return 0;
+    }
+    let Some(req) = typed_request(&shell.dir, &session) else {
+        println!("recompact · {short}: could not find its transcript");
+        return 1;
+    };
+    write_json(&shell.dir.join("request.json"), &req);
+    wake(&shell);
+    println!("recompact · compacting in the background; switches to the compacted copy at the next pause");
+    0
+}
+
 pub fn cmd_job_handoff(args: &[String]) -> i32 {
     let (Some(dir), Some(pid)) = (
         args.first(),
