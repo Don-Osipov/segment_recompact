@@ -53,6 +53,9 @@ terminal and use claude as always:
   the moment of the switch. The job keeps its short id, and its background work keeps running.
   If the switch does not take, the compacted session starts as a new background job with the
   same name, and the old job is stopped.
+  An app that shows background jobs in its own terminal, such as Session Board, can do what a
+  typed `/recompact` does with `recompact job-compact <job id>`: it compacts now, without a model
+  turn, and the job switches to the compacted copy at the next pause.
 - Experimental, off by default: with `RECOMPACT_JOBS=1` (in one terminal, or exported in your
   shell startup file), `claude` starts every session as a background job and attaches your
   terminal to it, so switches follow Claude Code's own record of when a turn runs. Your
